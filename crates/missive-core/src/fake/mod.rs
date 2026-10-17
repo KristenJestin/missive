@@ -38,9 +38,14 @@
 //! TLS. The certificate is self-signed for `localhost` and `127.0.0.1` and marked as a CA
 //! (`basicConstraints CA:TRUE`), like Proton Mail Bridge's: a standard webpki client refuses it,
 //! a client pinning [`FakeServer::certificate_pem`] accepts it.
+//!
+//! [`FakeKeyring`] is the keyring's counterpart: a fake Secret Service on a private session bus.
 
 mod imap;
+mod keyring;
 mod smtp;
+
+pub use keyring::{FakeItem, FakeKeyring};
 
 use std::future::Future;
 use std::net::SocketAddr;
