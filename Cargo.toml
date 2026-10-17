@@ -1,0 +1,8 @@
+[package]
+name = "missive"
+version = "0.0.0"
+edition = "2024"
+description = "A mail client for Linux: background daemon, command line, event stream, and a window"
+license = "MIT"
+
+[dependencies]
