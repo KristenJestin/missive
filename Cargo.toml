@@ -1,8 +1,20 @@
-[package]
-name = "missive"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.0.0"
 edition = "2024"
-description = "A mail client for Linux: background daemon, command line, event stream, and a window"
 license = "MIT"
 
-[dependencies]
+# One async runtime for the whole workspace: tokio. TLS is rustls on ring, so the build needs no
+# C toolchain for a crypto library.
+[workspace.dependencies]
+missive-core = { path = "crates/missive-core" }
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
+base64 = "0.22"
+futures-util = "0.3"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

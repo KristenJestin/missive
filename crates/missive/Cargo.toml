@@ -1,0 +1,11 @@
+[package]
+name = "missive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A mail client for Linux: background daemon, command line, event stream, and a window"
+
+[dependencies]
+
+[dev-dependencies]
+missive-core = { workspace = true, features = ["fake"] }
