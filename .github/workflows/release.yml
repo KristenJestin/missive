@@ -1,0 +1,105 @@
+# The version of Missive, decided by what was merged.
+#
+# `Cargo.toml` stays at 0.0.0 and nobody edits a version by hand: the tag semantic-release puts on
+# `main` is the version, and the program is built with it (`MISSIVE_VERSION`, the tag with its
+# `v`, which `missive --version` prints). No plugin here writes a commit, so the history of a
+# branch is what was merged into it and nothing the pipeline added afterwards. The only secret is
+# the GITHUB_TOKEN of the run.
+#
+# Only `main` publishes: merging `dev` into `main` (a merge commit, never a squash) publishes
+# `vX.Y.Z`, read from the subjects of the squashed pull requests it brings. `dev` publishes
+# betas instead (beta.yml). Missive starts in `0.x`: a breaking change moves the minor, a 1.0 is
+# the maintainer's decision, not something a commit message brings about. semantic-release
+# numbers the very first release 1.0.0 unless an earlier `vX.Y.Z` tag is in the history of
+# `main`: the maintainer puts `v0.0.0` on the first commit of `main` once, before the first merge.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+
+# One release at a time, in the order of the pushes: two tags are never computed from the same
+# history.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Nothing by default: each job asks for what it does. Only the two that write to the repository
+# (the tag and the release it makes, the files attached to it) can; the compile cannot.
+permissions: {}
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # semantic-release is a Node tool and Missive is not a Node project: package.json and its
+      # lockfile exist only to pin it and its plugins (`npm ci` installs exactly those).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts
+      - name: Tag what was merged, and write the release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
+      # The release tag semantic-release just put on this commit, if it made one. A beta tag that
+      # came along with a fast-forward of `dev` is not a release: only X.Y.Z counts.
+      - name: The tag to build
+        id: tag
+        run: |
+          tag=$(git tag --points-at HEAD --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # The program, built from the tag on Linux x86_64, on Ubuntu 24.04 (glibc 2.39). No tag,
+  # nothing built. The compile only reads the repository; what it makes goes to the next job,
+  # which is the one that can write.
+  build:
+    needs: tag
+    if: needs.tag.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+          persist-credentials: false
+      - name: Build, which takes its version from the tag
+        run: MISSIVE_VERSION="$TAG" cargo build --release --locked -p missive
+      - name: Pack it with its checksum
+        run: tools/package.sh "$TAG" target/release "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-archive
+          path: ${{ runner.temp }}/dist/missive-*
+          if-no-files-found: error
+
+  # The archive and its checksum, attached to the release of the tag. If the build or this job
+  # fails the release exists without its archive: re-run the failed job.
+  attach:
+    needs: [tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-archive
+          path: dist
+      - name: Attach both to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.tag.outputs.tag }}
+        run: gh release upload "$TAG" dist/missive-*.tar.gz dist/missive-*.tar.gz.sha256 --clobber

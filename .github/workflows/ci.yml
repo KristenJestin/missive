@@ -14,7 +14,11 @@ jobs:
         with:
           fetch-depth: 0
       # The first push of a branch has no `before` (forty zeros): every commit it holds is checked.
+      # Not on `main`, nor on a pull request into it (the release, `dev` merged by a merge commit):
+      # it brings commits already judged as pull requests, and GitHub squashed them with ` (#n)`
+      # added to the subject, so one of them is past 72 characters for good.
       - name: Check the Angular commit convention
+        if: github.base_ref != 'main' && github.ref != 'refs/heads/main'
         run: |
           base="${{ github.event.pull_request.base.sha || github.event.before }}"
           head="${{ github.event.pull_request.head.sha || github.sha }}"
