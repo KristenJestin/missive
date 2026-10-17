@@ -5,5 +5,22 @@ edition.workspace = true
 license.workspace = true
 description = "What Missive's programs share: IMAP, SMTP, parsing, local copy, search, keyring, socket protocol"
 
+[features]
+# A fake IMAP and SMTP server on localhost, for tests only (see `fake`).
+fake = ["dep:base64", "dep:rcgen", "dep:tokio", "dep:tokio-rustls"]
+
 [dependencies]
+base64 = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
 rustls.workspace = true
+tokio = { workspace = true, optional = true, features = ["io-util", "macros", "net", "rt", "sync"] }
+tokio-rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The crate's own tests run against its fake server.
+missive-core = { path = ".", features = ["fake"] }
+async-imap.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio-rustls.workspace = true
