@@ -42,6 +42,13 @@ pub enum Event {
     },
     /// An action was applied on the server, is tried again later, or was refused.
     Action(ActionEvent),
+    /// The server took a message of the outbox.
+    Sent(Sent),
+    /// The server refused a message of the outbox for good: it is not sent again.
+    SendFailed(SendFailed),
+    /// The connection was lost after a message's end of data, before the server's answer: it
+    /// may have been sent, and is not sent again.
+    SendUncertain(SendUncertain),
     /// The watcher read too slowly: this many events were dropped for it.
     Lagged { missed: u64 },
     /// There is no daemon to listen to. Said by `missive watch`, never by the daemon.
@@ -98,6 +105,43 @@ pub struct ActionEvent {
     /// For `refused`: why, for people.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// A message the server took (`docs/events.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sent {
+    pub account: String,
+    /// Its number in the outbox, as `missive compose --json` printed it.
+    pub outbox: i64,
+    /// Its `Message-ID`, without angle brackets.
+    pub message_id: String,
+    /// What becomes of its copy in Sent: `append` (Missive appends it), `server` (the account
+    /// says its server keeps one) or `none` (the account has no Sent folder).
+    pub sent_copy: String,
+}
+
+/// A message the server refused for good (`docs/events.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendFailed {
+    pub account: String,
+    pub outbox: i64,
+    pub message_id: String,
+    /// The server's reply code (`5xx`).
+    pub code: u16,
+    /// `MAIL FROM`, `RCPT TO`, `DATA` or `end of data`.
+    pub step: String,
+    /// For people.
+    pub message: String,
+}
+
+/// A message that may or may not have been sent (`docs/events.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendUncertain {
+    pub account: String,
+    pub outbox: i64,
+    pub message_id: String,
+    /// For people.
+    pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +350,42 @@ mod tests {
         assert_eq!(
             retried.line(),
             r#"{"protocol":1,"event":"action","account":"alice","action":"move","outcome":"retried","messages":["alice/4/17/99"],"reason":"refused","attempts":2}"#
+        );
+    }
+
+    #[test]
+    fn the_send_events_read_as_documented() {
+        let sent = Event::Sent(Sent {
+            account: "alice".to_owned(),
+            outbox: 7,
+            message_id: "1f@example.org".to_owned(),
+            sent_copy: "append".to_owned(),
+        });
+        assert_eq!(
+            sent.line(),
+            r#"{"protocol":1,"event":"sent","account":"alice","outbox":7,"message_id":"1f@example.org","sent_copy":"append"}"#
+        );
+        let failed = Event::SendFailed(SendFailed {
+            account: "alice".to_owned(),
+            outbox: 7,
+            message_id: "1f@example.org".to_owned(),
+            code: 550,
+            step: "RCPT TO".to_owned(),
+            message: "refused".to_owned(),
+        });
+        assert_eq!(
+            failed.line(),
+            r#"{"protocol":1,"event":"send-failed","account":"alice","outbox":7,"message_id":"1f@example.org","code":550,"step":"RCPT TO","message":"refused"}"#
+        );
+        let uncertain = Event::SendUncertain(SendUncertain {
+            account: "alice".to_owned(),
+            outbox: 7,
+            message_id: "1f@example.org".to_owned(),
+            message: "lost".to_owned(),
+        });
+        assert_eq!(
+            uncertain.line(),
+            r#"{"protocol":1,"event":"send-uncertain","account":"alice","outbox":7,"message_id":"1f@example.org","message":"lost"}"#
         );
     }
 

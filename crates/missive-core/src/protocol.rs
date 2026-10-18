@@ -66,6 +66,50 @@ pub enum Command {
         #[serde(default)]
         permanently: bool,
     },
+    /// Writes a message into the account's outbox, to be sent as soon as its server can be
+    /// reached; answered once it is in the outbox.
+    Send(Send),
+}
+
+/// A message to send: addresses as `name@example.org` or `Name <name@example.org>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Send {
+    pub account: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub to: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cc: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bcc: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attached>,
+}
+
+/// A file attached to a message: its name, and its content in base64.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attached {
+    pub name: String,
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
+}
+
+mod base64_bytes {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Command {
@@ -76,6 +120,7 @@ impl Command {
             Command::Mark { .. } => "mark",
             Command::Move { .. } => "move",
             Command::Delete { .. } => "delete",
+            Command::Send(_) => "send",
         }
     }
 }
@@ -92,6 +137,12 @@ pub struct Answer {
     /// The messages an action was recorded for, by identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<String>>,
+    /// The number of a message put in the outbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbox: Option<i64>,
+    /// The `Message-ID` of a message put in the outbox, without angle brackets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     /// When not `ok`: `bad-request`, `unsupported-protocol`, `unknown-request`,
     /// `no-such-account`, `failed`, or why an action was refused (`docs/protocol.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,7 +202,7 @@ pub fn read_request(line: &str) -> Result<Request, Answer> {
     }
     let known = matches!(
         name,
-        Some("sync" | "subscribe" | "mark" | "move" | "delete")
+        Some("sync" | "subscribe" | "mark" | "move" | "delete" | "send")
     );
     serde_json::from_value(value).map_err(|_| {
         if known || name.is_none() {
@@ -246,6 +297,34 @@ mod tests {
         );
         assert_eq!(
             read_request(r#"{"protocol":1,"request":"move","messages":["a/1/2/3"]}"#)
+                .unwrap_err()
+                .error
+                .unwrap(),
+            "bad-request"
+        );
+    }
+
+    #[test]
+    fn a_send_request_reads_with_its_attachments_in_base64() {
+        let line = r#"{"protocol":1,"request":"send","account":"alice","to":["Zoé <zoe@example.com>"],"subject":"Hi","body":"Hello","attachments":[{"name":"a.bin","data":"AAH/"}]}"#;
+        let request = Request {
+            protocol: 1,
+            command: Command::Send(Send {
+                account: "alice".to_owned(),
+                to: vec!["Zoé <zoe@example.com>".to_owned()],
+                subject: Some("Hi".to_owned()),
+                body: "Hello".to_owned(),
+                attachments: vec![Attached {
+                    name: "a.bin".to_owned(),
+                    data: vec![0, 1, 255],
+                }],
+                ..Send::default()
+            }),
+        };
+        assert_eq!(read_request(line), Ok(request.clone()));
+        assert_eq!(serde_json::to_string(&request).unwrap(), line);
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"send","account":"a","attachments":[{"name":"x","data":"!"}]}"#)
                 .unwrap_err()
                 .error
                 .unwrap(),

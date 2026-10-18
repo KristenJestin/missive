@@ -12,6 +12,7 @@ pub mod events;
 pub mod fake;
 pub mod keyring;
 pub mod original;
+pub mod outbox;
 pub mod protocol;
 pub mod store;
 pub mod submit;

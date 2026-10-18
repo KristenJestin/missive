@@ -12,6 +12,12 @@
 //! pass over the folders and whenever it is woken, between syncs (see
 //! [`missive_core::actions`]).
 //!
+//! A message to send (`send`) is built and written to the copy's outbox by the connection that
+//! asked, and answered at once. Each account has a second worker for it, apart from the IMAP one
+//! so that mail goes out while the IMAP server is down: it submits the outbox in order, tries
+//! again after a backoff what the server did not take, and wakes the IMAP worker, which appends
+//! the copy to Sent (see [`missive_core::outbox`]).
+//!
 //! A connection that sends `subscribe` is a watcher: the daemon then writes it the events of the
 //! workers (`docs/events.md`). They travel on a bounded broadcast channel, so that a watcher that
 //! reads too slowly misses events, is told how many, and holds nothing else back.
@@ -26,16 +32,18 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use missive_core::account::{Account, AccountStore, Listing, Password};
 use missive_core::actions::{self, Kind, Outcome, Wanted};
+use missive_core::compose::{self, Attachment, Draft, Mailbox};
 use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap};
 use missive_core::copy::{Copy, MessageId};
-use missive_core::events::{ActionEvent, Event, Reader, Unread};
+use missive_core::events::{ActionEvent, Event, Reader, SendFailed, SendUncertain, Sent, Unread};
 use missive_core::keyring::{Keyring, KeyringError};
+use missive_core::outbox::{self, Copied, Tried};
 use missive_core::protocol::{
-    AccountState, Answer, Command, PROTOCOL, pid_path, read_request, runtime_dir, socket_path,
+    self, AccountState, Answer, Command, PROTOCOL, pid_path, read_request, runtime_dir, socket_path,
 };
 use missive_core::store::{SkippedFolder, Store};
 use missive_core::sync::{self, Capabilities, Changes, Folder, Skip, SyncError};
@@ -134,6 +142,7 @@ pub async fn run(options: Options) -> Result<(), String> {
         store,
         stopping,
         workers: Mutex::new(BTreeMap::new()),
+        senders: Mutex::new(BTreeMap::new()),
         tasks: Mutex::new(JoinSet::new()),
     });
     let accounts = daemon.reload();
@@ -278,6 +287,8 @@ struct Daemon {
     stopping: watch::Receiver<bool>,
     /// Where to send each account's requests, by identifier.
     workers: Mutex<BTreeMap<String, mpsc::UnboundedSender<Request>>>,
+    /// Where to wake each account's SMTP worker, by identifier.
+    senders: Mutex<BTreeMap<String, mpsc::UnboundedSender<()>>>,
     tasks: Mutex<JoinSet<()>>,
 }
 
@@ -329,11 +340,14 @@ impl Daemon {
         }
         self.forget_removed(&listing);
         let mut workers = locked(&self.workers);
+        let mut senders = locked(&self.senders);
         // An account whose settings cannot be read now keeps its worker: it was not removed.
-        workers.retain(|id, _| {
+        let kept = |id: &String| {
             listing.accounts.iter().any(|(a, _)| a == id)
                 || listing.skipped.iter().any(|(s, _)| s == id)
-        });
+        };
+        workers.retain(|id, _| kept(id));
+        senders.retain(|id, _| kept(id));
         for (id, account) in listing.accounts {
             if workers.contains_key(&id) {
                 continue;
@@ -369,8 +383,29 @@ impl Daemon {
             let Some(copy) = open_copy(&self.store) else {
                 continue;
             };
+            let sending = match Store::open(&self.store) {
+                Ok(store) => store,
+                Err(e) => {
+                    log!("cannot open the local copy for an account ({e})");
+                    continue;
+                }
+            };
             let (requests, receiver) = mpsc::unbounded_channel();
+            let (wake, woken) = mpsc::unbounded_channel();
+            let smtp = SmtpWorker {
+                id: id.clone(),
+                key,
+                account: account.clone(),
+                certificate: certificate.clone(),
+                store: sending,
+                wake: woken,
+                imap: requests.downgrade(),
+                stop: self.stopping.clone(),
+                events: self.events.clone(),
+            };
+            locked(&self.tasks).spawn(smtp.run());
             workers.insert(id.clone(), requests);
+            senders.insert(id.clone(), wake);
             let worker = Worker {
                 id,
                 key,
@@ -543,6 +578,101 @@ impl Daemon {
                 messages,
                 permanently,
             } => self.record(name, &messages, Wanted::Delete { permanently }),
+            Command::Send(send) => self.enqueue(send),
+        }
+    }
+
+    /// Builds a message and writes it to its account's outbox, then wakes the account's SMTP
+    /// worker. Answered once it is in the outbox: whether the server is reachable does not
+    /// matter here.
+    fn enqueue(&self, send: protocol::Send) -> Answer {
+        let name = "send";
+        self.reload();
+        let Some(sender) = locked(&self.senders).get(&send.account).cloned() else {
+            return Answer::error(
+                Some(name),
+                "no-such-account",
+                format!(
+                    "no account {} (missive account list shows them)",
+                    send.account
+                ),
+            );
+        };
+        let account = match AccountStore::from_env().and_then(|store| store.get(&send.account)) {
+            Ok(Some(account)) => account,
+            Ok(None) => {
+                return Answer::error(
+                    Some(name),
+                    "no-such-account",
+                    format!(
+                        "no account {} (missive account list shows them)",
+                        send.account
+                    ),
+                );
+            }
+            Err(e) => {
+                return Answer::error(
+                    Some(name),
+                    "failed",
+                    format!("the account's settings cannot be read ({})", e.kind()),
+                );
+            }
+        };
+        let mailboxes = |list: &[String]| -> Result<Vec<Mailbox>, String> {
+            list.iter().map(|text| Mailbox::parse(text)).collect()
+        };
+        let draft = (|| {
+            Ok::<_, String>(Draft {
+                to: mailboxes(&send.to)?,
+                cc: mailboxes(&send.cc)?,
+                bcc: mailboxes(&send.bcc)?,
+                subject: send.subject,
+                body: send.body,
+                attachments: send
+                    .attachments
+                    .into_iter()
+                    .map(|a| Attachment {
+                        name: a.name,
+                        data: a.data,
+                    })
+                    .collect(),
+            })
+        })();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let built = match draft.and_then(|draft| compose::build(&account, &draft, now)) {
+            Ok(built) => built,
+            Err(why) => return Answer::error(Some(name), "bad-request", why),
+        };
+        let queued = Store::open(&self.store).and_then(|store| {
+            let key = store.account(&send.account)?;
+            Ok((key, store.enqueue(key, &built, !account.server_saves_sent)?))
+        });
+        let (key, outbox) = match queued {
+            Ok(queued) => queued,
+            Err(e) => {
+                log!("cannot write a message to the outbox ({e})");
+                return Answer::error(
+                    Some(name),
+                    "failed",
+                    format!("the local copy could not be written ({e})"),
+                );
+            }
+        };
+        log!(
+            "account {key}: message {outbox} is in the outbox ({} recipients, {} bytes)",
+            built.recipients.len(),
+            built.raw.len()
+        );
+        let _ = sender.send(());
+        Answer {
+            protocol: PROTOCOL,
+            answer: Some(name.to_owned()),
+            ok: true,
+            outbox: Some(outbox),
+            message_id: Some(built.message_id),
+            ..Answer::default()
         }
     }
 
@@ -1095,6 +1225,47 @@ impl Worker {
         folders: &mut [Folder],
         pass: bool,
     ) -> Result<(), SyncError> {
+        let (copies, copied) = outbox::copy_sent(
+            session,
+            &mut self.store,
+            self.key,
+            self.options.action_timeout,
+        )
+        .await;
+        for copy in &copies.copied {
+            match copy {
+                Copied::Appended { id } => {
+                    log!("account {}: message {id} is in Sent", self.key);
+                }
+                Copied::Retried { id, attempts } => log!(
+                    "account {}: the copy of message {id} could not be appended to Sent \
+                     ({attempts} times so far)",
+                    self.key
+                ),
+                Copied::GivenUp { id, why } => log!(
+                    "account {}: the copy of message {id} is not in Sent: {why}",
+                    self.key
+                ),
+            }
+        }
+        match copied {
+            Ok(()) => {}
+            Err(error) if copies.timed_out => return Err(error),
+            Err(error @ SyncError::Connection(_)) => {
+                log!(
+                    "account {}: the copies for Sent stopped ({})",
+                    self.key,
+                    kind(&error)
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        if let Some(id) = copies.resync
+            && let Some(folder) = folders.iter_mut().find(|f| f.row.id == id)
+        {
+            // A folder skipped here is told by the next pass.
+            let _ = self.folder(session, folder).await?;
+        }
         if self.queue_waits && !pass {
             return Ok(());
         }
@@ -1322,6 +1493,238 @@ impl Worker {
         }
     }
 }
+
+/// Submits an account's outbox: see [`missive_core::outbox`]. It never talks to the IMAP
+/// server; it wakes the IMAP worker when a copy is to be appended to Sent.
+struct SmtpWorker {
+    id: String,
+    /// The account's number in the copy, which the log names it by.
+    key: i64,
+    account: Account,
+    certificate: Option<CertificateDer<'static>>,
+    store: Store,
+    /// A message was written to the outbox.
+    wake: mpsc::UnboundedReceiver<()>,
+    /// The account's IMAP worker; weak, so that it still ends when its account is removed.
+    imap: mpsc::WeakUnboundedSender<Request>,
+    stop: watch::Receiver<bool>,
+    events: Arc<Events>,
+}
+
+impl SmtpWorker {
+    async fn run(mut self) {
+        match self.store.sending_left(self.key) {
+            Ok(left) => {
+                for left in left {
+                    log!(
+                        "account {}: message {} was being sent when the daemon stopped: it is \
+                         uncertain",
+                        self.key,
+                        left.id
+                    );
+                    self.events.send(Event::SendUncertain(SendUncertain {
+                        account: self.id.clone(),
+                        outbox: left.id,
+                        message_id: left.message_id,
+                        message: UNCERTAIN_LEFT.to_owned(),
+                    }));
+                }
+            }
+            Err(e) => log!("account {}: cannot read the outbox ({e})", self.key),
+        }
+        let tls = client_config(self.certificate.clone());
+        let mut password: Option<Password> = None;
+        let mut backoff = Backoff::default();
+        loop {
+            while self.wake.try_recv().is_ok() {}
+            match self.store.next_to_send(self.key) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if !self.wait(None).await {
+                        return;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    log!("account {}: cannot read the outbox ({e})", self.key);
+                    if !self.wait(Some(backoff.next())).await {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            if password.is_none() {
+                password = self.password().await;
+            }
+            let Some(login) = &password else {
+                log!(
+                    "account {}: no password in the keyring, so the outbox waits",
+                    self.key
+                );
+                if !self.wait(Some(backoff.next())).await {
+                    return;
+                }
+                continue;
+            };
+            let tried = tokio::select! {
+                tried = outbox::send_next(
+                    &mut self.store,
+                    self.key,
+                    &self.account,
+                    login,
+                    tls.clone(),
+                ) => tried,
+                // What is written is whole: the outbox says where the message stopped.
+                _ = stopped(&mut self.stop) => return,
+            };
+            let tried = match tried {
+                Ok(Some(tried)) => tried,
+                Ok(None) => continue,
+                Err(e) => {
+                    log!("account {}: cannot write the outbox ({e})", self.key);
+                    if !self.wait(Some(backoff.next())).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            let again = match &tried {
+                Tried::Again { .. } => true,
+                Tried::Login { error, .. } => {
+                    if *error == ConnectError::AuthRefused {
+                        password = None;
+                    }
+                    true
+                }
+                Tried::Sent { .. } | Tried::Failed { .. } | Tried::Uncertain { .. } => false,
+            };
+            self.tell(tried);
+            if again {
+                // The next try waits for its time, whatever is written meanwhile, as a worker
+                // that cannot connect does.
+                if !self.wait(Some(backoff.next())).await {
+                    return;
+                }
+            } else {
+                backoff = Backoff::default();
+            }
+        }
+    }
+
+    /// The account's password from the keyring, read as the IMAP worker reads it. `&mut`
+    /// although only read: the copy is not `Sync`, and the future must be `Send`.
+    async fn password(&mut self) -> Option<Password> {
+        let found = match Keyring::open().await {
+            Ok(keyring) => keyring.password(&self.id).await,
+            Err(e) => Err(e),
+        };
+        found.unwrap_or_else(|_| {
+            log!("account {}: the keyring cannot be read", self.key);
+            None
+        })
+    }
+
+    /// Waits for `timeout`, or with none for a message written to the outbox. `false` when the
+    /// daemon stops or the account was removed.
+    async fn wait(&mut self, timeout: Option<Duration>) -> bool {
+        let sleep = async {
+            match timeout {
+                Some(timeout) => tokio::time::sleep(timeout).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                woken = self.wake.recv() => match woken {
+                    Some(()) if timeout.is_none() => return true,
+                    Some(()) => {}
+                    None => return false,
+                },
+                _ = &mut sleep => return true,
+                _ = stopped(&mut self.stop) => return false,
+            }
+        }
+    }
+
+    /// Logs what came of a try, and tells the watchers.
+    fn tell(&self, tried: Tried) {
+        let account = self.id.clone();
+        match tried {
+            Tried::Sent {
+                id,
+                message_id,
+                sent_copy,
+            } => {
+                log!(
+                    "account {}: message {id} sent (copy in Sent: {sent_copy})",
+                    self.key
+                );
+                if sent_copy == "append"
+                    && let Some(imap) = self.imap.upgrade()
+                {
+                    let _ = imap.send(Request::Actions);
+                }
+                self.events.send(Event::Sent(Sent {
+                    account,
+                    outbox: id,
+                    message_id,
+                    sent_copy: sent_copy.to_owned(),
+                }));
+            }
+            Tried::Again { id, reason } => {
+                log!("account {}: message {id} not sent yet: {reason}", self.key);
+            }
+            Tried::Login { id, error } => {
+                log!(
+                    "account {}: message {id} not sent yet: the SMTP login failed ({})",
+                    self.key,
+                    error.state()
+                );
+            }
+            Tried::Failed {
+                id,
+                message_id,
+                code,
+                step,
+            } => {
+                log!(
+                    "account {}: message {id} refused for good ({code} to {step})",
+                    self.key
+                );
+                self.events.send(Event::SendFailed(SendFailed {
+                    account,
+                    outbox: id,
+                    message_id,
+                    code,
+                    step: step.to_owned(),
+                    message: format!(
+                        "the server refused the message for good (it answered {code} to \
+                         {step}): it is not sent again"
+                    ),
+                }));
+            }
+            Tried::Uncertain {
+                id,
+                message_id,
+                reason,
+            } => {
+                log!("account {}: message {id} uncertain: {reason}", self.key);
+                self.events.send(Event::SendUncertain(SendUncertain {
+                    account,
+                    outbox: id,
+                    message_id,
+                    message: format!(
+                        "{reason}: the message may have been sent, so it is not sent again"
+                    ),
+                }));
+            }
+        }
+    }
+}
+
+const UNCERTAIN_LEFT: &str = "the daemon stopped while the message was being sent: it may have \
+                              been sent, so it is not sent again";
 
 /// The kind of a sync error, for the log.
 fn kind(error: &SyncError) -> String {

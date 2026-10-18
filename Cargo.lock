@@ -989,6 +989,7 @@ dependencies = [
  "async-imap",
  "clap",
  "futures-util",
+ "mail-parser",
  "missive-core",
  "rpassword",
  "rusqlite",
