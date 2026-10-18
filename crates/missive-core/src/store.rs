@@ -263,7 +263,7 @@ fn insert(transaction: &Transaction, folder: i64, message: &NewMessage) -> rusql
             mailboxes(parsed.and_then(|m| m.to())),
             mailboxes(parsed.and_then(|m| m.cc())),
             parsed.and_then(|m| m.message_id()),
-            parsed.is_some_and(|m| m.attachment_count() > 0),
+            parsed.is_some_and(crate::body::has_attachments),
         ],
         |r| r.get(0),
     )?;
@@ -341,7 +341,7 @@ fn mark_attachments(transaction: &Transaction) -> rusqlite::Result<()> {
         let raw: Vec<u8> = row.get(1)?;
         if MessageParser::default()
             .parse(&raw)
-            .is_some_and(|m| m.attachment_count() > 0)
+            .is_some_and(|m| crate::body::has_attachments(&m))
         {
             transaction.execute(
                 "UPDATE message SET has_attachments = 1 WHERE id = ?1",
