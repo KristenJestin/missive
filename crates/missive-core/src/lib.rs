@@ -7,4 +7,5 @@ pub mod connect;
 pub mod fake;
 pub mod keyring;
 pub mod store;
+pub mod sync;
 pub mod tls;
