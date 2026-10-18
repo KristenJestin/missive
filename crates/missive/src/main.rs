@@ -1,4 +1,5 @@
 mod daemon;
+mod read;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -44,6 +45,22 @@ enum Command {
     /// Run the daemon in the foreground: it keeps the local copy of every account up to date.
     /// SIGTERM or SIGINT stops it.
     Daemon(DaemonArgs),
+    /// Say each account's connection state, last sync and number of messages, and whether the
+    /// daemon runs. Reads the local copy only.
+    Status {
+        /// One JSON object on standard output (see docs/cli.md).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Count the unread messages, by account and folder. Reads the local copy only.
+    Unread {
+        /// One JSON object on standard output (see docs/cli.md).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search the sender, recipients, subject and text of the messages, newest first. Reads the
+    /// local copy only.
+    Search(read::SearchArgs),
 }
 
 #[derive(Args)]
@@ -156,6 +173,9 @@ async fn main() -> ExitCode {
         })
         .await
         .map_err(Failure),
+        Command::Status { json } => read::status(json).map_err(Failure),
+        Command::Unread { json } => read::unread(json).map_err(Failure),
+        Command::Search(args) => read::search(args).map_err(Failure),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
