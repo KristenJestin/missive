@@ -9,6 +9,8 @@ use missive_core::account::{Password, Security, Server};
 use missive_core::connect::{ConnectError, client_config};
 use missive_core::fake::{FakeServer, SmtpMessage};
 use missive_core::submit::{Outgoing, Submitted, submit};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 
 const USER: &str = "alice@example.org";
 const PASSWORD: &str = "correct horse battery staple";
@@ -208,4 +210,71 @@ async fn a_wrong_password_is_refused_before_anything_is_sent() {
 
     assert_eq!(submitted, Err(ConnectError::AuthRefused));
     assert!(!sending);
+}
+
+/// A server that offers STARTTLS, answers `answer` to it, and returns every byte the client sent
+/// after that answer.
+async fn starttls_answered(answer: &'static str) -> (SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let served = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut io = BufReader::new(stream);
+        io.write_all(b"220 fake.example.org ESMTP\r\n")
+            .await
+            .unwrap();
+        loop {
+            let mut line = String::new();
+            if io.read_line(&mut line).await.unwrap() == 0 {
+                return Vec::new();
+            }
+            if line.to_ascii_uppercase().starts_with("EHLO") {
+                io.write_all(b"250-fake.example.org\r\n250 STARTTLS\r\n")
+                    .await
+                    .unwrap();
+            } else if line.to_ascii_uppercase().starts_with("STARTTLS") {
+                io.write_all(format!("{answer}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
+        let mut after = Vec::new();
+        let _ = io.read_to_end(&mut after).await;
+        after
+    });
+    (address, served)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starttls_answered_with_anything_but_220_aborts_before_auth() {
+    for answer in [
+        "454 4.7.0 TLS not available now",
+        "502 5.5.1 not implemented",
+        "250 2.0.0 OK",
+    ] {
+        let (address, served) = starttls_answered(answer).await;
+        let recipients = recipients();
+
+        let submitted = submit(
+            &server(address, Security::Starttls),
+            USER,
+            &Password::new(PASSWORD.to_owned()),
+            client_config(None),
+            Outgoing {
+                sender: USER,
+                recipients: &recipients,
+                raw: RAW,
+            },
+            || Ok(()),
+        )
+        .await;
+
+        assert!(
+            matches!(submitted, Err(ConnectError::Unreachable(_))),
+            "{answer}: {submitted:?}"
+        );
+        // Nothing went in clear after the refusal: no AUTH, so no password.
+        assert_eq!(served.await.unwrap(), b"", "{answer}");
+    }
 }
