@@ -66,6 +66,13 @@ enum Command {
     /// Search the sender, recipients, subject and text of the messages, newest first. Reads the
     /// local copy only.
     Search(read::SearchArgs),
+    /// List the messages of a folder, newest first [default: the inbox of each account]. Reads
+    /// the local copy only.
+    List(read::ListArgs),
+    /// Show one message: its headers, its text and its attachments, or with --raw exactly what the
+    /// server sent. The HTML is never interpreted. Reads the local copy only; exits with 3 when
+    /// the identifier names no message.
+    Show(read::ShowArgs),
 }
 
 #[derive(Args)]
@@ -182,6 +189,15 @@ async fn main() -> ExitCode {
         Command::Status { json } => read::status(json).map_err(Failure),
         Command::Unread { json } => read::unread(json).map_err(Failure),
         Command::Search(args) => read::search(args).map_err(Failure),
+        Command::List(args) => read::list(args).map_err(Failure),
+        Command::Show(args) => match read::show(args) {
+            Ok(()) => Ok(()),
+            Err(read::ShowError::NotFound(message)) => {
+                eprintln!("missive: {message}");
+                return ExitCode::from(read::NOT_FOUND);
+            }
+            Err(read::ShowError::Failed(message)) => Err(Failure(message)),
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

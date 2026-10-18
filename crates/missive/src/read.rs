@@ -1,12 +1,14 @@
-//! `missive status`, `unread` and `search`: answers from the local copy alone. They open it read
+//! `missive status`, `unread`, `search`, `list` and `show`: answers from the local copy alone. They open it read
 //! only and never create it; they touch neither the network, nor the keyring, nor the daemon's
 //! socket, so they answer with the daemon stopped and the network down.
 
 use std::fs::{File, TryLockError};
+use std::io::Write;
 
 use clap::{Args, ValueEnum};
 use missive_core::account::{AccountStore, Listing};
-use missive_core::copy::{Copy, FolderRef, Hit, Search};
+use missive_core::body::{self, Attachment};
+use missive_core::copy::{Copy, FolderRef, Hit, List, NotFound, Person, Search};
 use missive_core::protocol::pid_path;
 use missive_core::store::Store;
 use serde::Serialize;
@@ -53,6 +55,54 @@ pub struct SearchArgs {
     /// The most messages to list, the newest first.
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..))]
     limit: u64,
+}
+
+#[derive(Args)]
+pub struct ListArgs {
+    /// One JSON array on standard output (see docs/cli.md).
+    #[arg(long)]
+    json: bool,
+    /// Only this account's messages, by identifier, as `account list` shows it.
+    #[arg(long)]
+    account: Option<String>,
+    /// A folder, by role (`inbox`, `sent`…) or by the name the server gives it
+    /// [default: the inbox of each account].
+    #[arg(long, value_name = "ROLE OR NAME")]
+    folder: Option<String>,
+    /// Only the unread messages.
+    #[arg(long)]
+    unread: bool,
+    /// The most messages to list, the newest first.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..))]
+    limit: u64,
+}
+
+#[derive(Args)]
+pub struct ShowArgs {
+    /// The message's identifier, as `search` and `list` print it.
+    #[arg(value_name = "MESSAGE ID")]
+    id: String,
+    /// One JSON object on standard output (see docs/cli.md).
+    #[arg(long, conflicts_with = "raw")]
+    json: bool,
+    /// The message exactly as the server sent it, on standard output.
+    #[arg(long)]
+    raw: bool,
+}
+
+/// The exit status of `show` when the identifier names no message.
+pub const NOT_FOUND: u8 = 3;
+
+/// Why `show` failed: the identifier names no message, or something else went wrong.
+pub enum ShowError {
+    NotFound(String),
+    Failed(String),
+}
+
+impl<E: std::fmt::Display> From<E> for ShowError {
+    fn from(error: E) -> Self {
+        ShowError::Failed(error.to_string())
+    }
 }
 
 type Result<T> = std::result::Result<T, String>;
@@ -252,16 +302,22 @@ pub fn unread(json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn search(args: SearchArgs) -> Result<()> {
-    let mut accounts = configured()?;
-    if let Some(account) = &args.account {
-        if !accounts.contains(account) {
-            return Err(format!(
-                "no account {account} (missive account list shows them)"
-            ));
-        }
-        accounts = vec![account.clone()];
+/// The accounts to read: the one asked for, else every configured one.
+fn selected(account: Option<&String>) -> Result<Vec<String>> {
+    let accounts = configured()?;
+    let Some(account) = account else {
+        return Ok(accounts);
+    };
+    if !accounts.contains(account) {
+        return Err(format!(
+            "no account {account} (missive account list shows them)"
+        ));
     }
+    Ok(vec![account.clone()])
+}
+
+pub fn search(args: SearchArgs) -> Result<()> {
+    let accounts = selected(args.account.as_ref())?;
     let hits = match open()? {
         Some(copy) => copy
             .search(&Search {
@@ -288,6 +344,12 @@ pub fn search(args: SearchArgs) -> Result<()> {
 
 /// A hit for people: its identifier, date, sender and subject, separated by tabs.
 fn line(hit: &Hit) -> String {
+    let (date, from, subject) = columns(hit);
+    format!("{}\t{date}\t{from}\t{subject}", hit.id)
+}
+
+/// The date, the first sender and the subject of a hit, ready to be a column each.
+fn columns(hit: &Hit) -> (String, String, String) {
     let from = hit
         .from
         .first()
@@ -302,7 +364,168 @@ fn line(hit: &Hit) -> String {
     let subject = hit.subject.as_deref().unwrap_or("(no subject)");
     // A tab or a line break in a header would break the columns.
     let clean = |text: &str| text.replace(|c: char| c.is_control(), " ");
-    format!("{}\t{date}\t{}\t{}", hit.id, clean(from), clean(subject))
+    (date, clean(from), clean(subject))
+}
+
+pub fn list(args: ListArgs) -> Result<()> {
+    let accounts = selected(args.account.as_ref())?;
+    let (role, name) = match &args.folder {
+        Some(folder) => (Some(folder.to_ascii_lowercase()), Some(folder.clone())),
+        None => (Some("inbox".to_owned()), None),
+    };
+    let listed = match open()? {
+        Some(copy) => {
+            let matches = |folder: &FolderRef| {
+                folder.role.is_some() && folder.role == role || Some(&folder.name) == name.as_ref()
+            };
+            if let Some(folder) = &args.folder
+                && !copy
+                    .unread()
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .any(|f| accounts.contains(&f.account) && matches(&f.folder))
+            {
+                return Err(format!("no folder {folder} (missive unread shows them)"));
+            }
+            copy.list(&List {
+                accounts,
+                role,
+                name,
+                unread: args.unread,
+                limit: args.limit as usize,
+            })
+            .map_err(|e| e.to_string())?
+        }
+        None => Vec::new(),
+    };
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&listed).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    for message in &listed {
+        let (date, from, subject) = columns(&message.hit);
+        let flag = |on: bool, letter: char| if on { letter } else { '.' };
+        println!(
+            "{}\t{}{}{}{}\t{date}\t{from}\t{subject}",
+            message.hit.id,
+            flag(message.hit.unread, 'u'),
+            flag(message.flagged, 'f'),
+            flag(message.answered, 'a'),
+            flag(message.has_attachments, '@'),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct Shown {
+    #[serde(flatten)]
+    hit: Hit,
+    flagged: bool,
+    answered: bool,
+    size: u64,
+    cc: Vec<Person>,
+    reply_to: Vec<Person>,
+    message_id: Option<String>,
+    text: Option<String>,
+    html: Option<String>,
+    attachments: Vec<Attachment>,
+}
+
+pub fn show(args: ShowArgs) -> std::result::Result<(), ShowError> {
+    let configured = configured()?;
+    let Some(copy) = open()? else {
+        return Err(ShowError::NotFound(
+            "no such message in the local copy".to_owned(),
+        ));
+    };
+    let stored = match copy.message(&args.id)? {
+        // A removed account's mail may stay in the copy: it is not shown, as `list` does not.
+        Ok(stored) if configured.contains(&stored.hit.account) => stored,
+        Ok(_) => return Err(ShowError::NotFound(NotFound::Unknown.to_string())),
+        Err(not_found) => return Err(ShowError::NotFound(not_found.to_string())),
+    };
+    if args.raw {
+        std::io::stdout().write_all(&stored.raw)?;
+        return Ok(());
+    }
+    let body = body::read(&stored.raw);
+    if args.json {
+        let shown = Shown {
+            hit: stored.hit,
+            flagged: stored.flagged,
+            answered: stored.answered,
+            size: stored.size,
+            cc: stored.cc,
+            reply_to: body.reply_to,
+            message_id: stored.message_id,
+            text: body.text,
+            html: body.html,
+            attachments: body.attachments,
+        };
+        println!("{}", serde_json::to_string(&shown)?);
+        return Ok(());
+    }
+    // A header or a body can hold anything: no escape sequence reaches the terminal, only the
+    // line breaks and tabs of the text.
+    let clean = |text: &str| text.replace(|c: char| c.is_control(), " ");
+    let people = |label: &str, people: &[Person]| {
+        if !people.is_empty() {
+            let people: Vec<String> = people
+                .iter()
+                .map(|p| match (p.name.as_deref(), p.address.as_deref()) {
+                    (Some(name), Some(address)) if !name.is_empty() => {
+                        format!("{name} <{address}>")
+                    }
+                    (_, Some(address)) => address.to_owned(),
+                    (name, None) => name.unwrap_or_default().to_owned(),
+                })
+                .collect();
+            println!("{label}: {}", clean(&people.join(", ")));
+        }
+    };
+    people("From", &stored.hit.from);
+    people("To", &stored.hit.to);
+    people("Cc", &stored.cc);
+    people("Reply-To", &body.reply_to);
+    if let Some(date) = stored.hit.date {
+        println!("Date: {}", utc(date));
+    }
+    println!(
+        "Subject: {}",
+        clean(stored.hit.subject.as_deref().unwrap_or("(no subject)"))
+    );
+    if let Some(id) = &stored.message_id {
+        println!("Message-ID: {}", clean(id));
+    }
+    if !body.attachments.is_empty() {
+        let attachments: Vec<String> = body
+            .attachments
+            .iter()
+            .map(|a| {
+                let size = match a.size {
+                    1 => "1 byte".to_owned(),
+                    n => format!("{n} bytes"),
+                };
+                format!(
+                    "{} ({}, {size})",
+                    a.name.as_deref().unwrap_or("(unnamed)"),
+                    a.media_type
+                )
+            })
+            .collect();
+        println!("Attachments: {}", clean(&attachments.join(", ")));
+    }
+    let readable = body.readable.replace("\r\n", "\n");
+    let readable: String = readable
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect();
+    println!("\n{readable}");
+    Ok(())
 }
 
 /// A time in seconds since the epoch as `2026-10-17 07:30 UTC`.
