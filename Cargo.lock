@@ -987,6 +987,7 @@ name = "missive"
 version = "0.0.0"
 dependencies = [
  "async-imap",
+ "base64 0.22.1",
  "clap",
  "futures-util",
  "mail-parser",
