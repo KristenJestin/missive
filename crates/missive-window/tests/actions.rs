@@ -239,14 +239,14 @@ async fn delete_in_the_trash_asks_first_and_deletes_for_good_only_once_confirmed
 }
 
 #[tokio::test]
-async fn without_a_trash_delete_is_for_good_and_asks_first() {
+async fn without_a_trash_delete_is_never_for_good() {
+    // The daemon refuses it (`no-trash`), and the refusal shows as a notice.
     let mail = Mail::new(mailbox()).await;
     let mut model = mail.model();
     let id = open(&mut model, "Plan 3");
     model.delete();
-    assert!(model.confirm.is_some());
-    model.confirm_delete();
-    assert_eq!(requests(&mut model), [deleted(&id, true)]);
+    assert!(model.confirm.is_none());
+    assert_eq!(requests(&mut model), [deleted(&id, false)]);
 }
 
 #[tokio::test]

@@ -528,8 +528,8 @@ impl Model {
         self.choose_folder();
     }
 
-    /// `Delete`: moves the open message to the trash. In the trash, or in an account that has
-    /// none, it is deleted for good, and only once the user confirms it.
+    /// `Delete`: moves the open message to the trash. In the trash, it is deleted for good, and
+    /// only once the user confirms it.
     pub fn delete(&mut self) {
         if self.modal() {
             return;
@@ -548,17 +548,10 @@ impl Model {
         });
     }
 
-    /// Whether `Delete` deletes the open message for good: it is in the trash, or its account
-    /// has none.
+    /// Whether `Delete` deletes the open message for good: only in the trash. In an account
+    /// that has none, the daemon refuses the move (`no-trash`), and the notice says so.
     pub fn deletes_for_good(&self) -> bool {
-        let Reader::Open(opened) = &self.reader else {
-            return false;
-        };
-        opened.folder.role.as_deref() == Some("trash")
-            || !self
-                .folders_of(&opened.id)
-                .iter()
-                .any(|f| f.role.as_deref() == Some("trash"))
+        matches!(&self.reader, Reader::Open(opened) if opened.folder.role.as_deref() == Some("trash"))
     }
 
     /// The user confirmed deleting a message for good.
