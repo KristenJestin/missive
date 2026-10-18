@@ -37,6 +37,9 @@ use tokio::task::JoinSet;
 /// IDLE is re-issued after this long at most: RFC 2177 lets a server drop a client idle for 30
 /// minutes, and asks clients to re-issue it every 29.
 const IDLE_RENEWAL: Duration = Duration::from_secs(25 * 60);
+/// How long a server is given to start IDLE, and to end it. A server that advertises IDLE but
+/// refuses it (`NO`) is not heard from again by `async-imap`, which goes on reading.
+const IDLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a worker in the middle of a sync is given to finish it when the daemon stops.
 const STOP_GRACE: Duration = Duration::from_secs(3);
 /// The longest wait between two connections to an unreachable server.
@@ -236,6 +239,7 @@ impl Daemon {
                 requests: receiver,
                 stop: self.stopping.clone(),
                 waiting: Vec::new(),
+                idle_refused: false,
             };
             locked(&self.tasks).spawn(worker.run());
         }
@@ -326,6 +330,9 @@ enum Ended {
     Stopped,
     /// The connection failed, or the copy could not be written: connect again later.
     Lost(SyncError),
+    /// The server did not start IDLE although it advertises it: the connection is dropped, and
+    /// the next one does without IDLE.
+    IdleRefused,
 }
 
 /// What ended a wait between two syncs.
@@ -367,6 +374,8 @@ struct Worker {
     stop: watch::Receiver<bool>,
     /// The requests the next sync answers.
     waiting: Vec<Waiter>,
+    /// Whether the server refused IDLE: the inbox is then checked with the other folders.
+    idle_refused: bool,
 }
 
 impl Worker {
@@ -397,6 +406,17 @@ impl Worker {
             let retry = match opened {
                 Ok(session) => match self.connected(session, &mut backoff).await {
                     Ended::Stopped => return,
+                    Ended::IdleRefused => {
+                        log!(
+                            "account {}: the server refuses IDLE, so the inbox is checked every \
+                             {} s with the other folders",
+                            self.key,
+                            self.options.check_interval.as_secs()
+                        );
+                        self.idle_refused = true;
+                        // Not unreachable: connect again at once.
+                        Some(Duration::ZERO)
+                    }
                     // Answered and recorded now: a session lost at the same point at every
                     // pass would otherwise leave the requests waiting, and the state `syncing`,
                     // for ever.
@@ -591,7 +611,7 @@ impl Worker {
             let next_check = Instant::now() + self.options.check_interval;
             loop {
                 let left = next_check.saturating_duration_since(Instant::now());
-                let wake = match (capabilities.idle, inbox) {
+                let wake = match (capabilities.idle && !self.idle_refused, inbox) {
                     (true, Some(inbox)) => {
                         let changes = check!(self.folder(&mut session, &mut folders[inbox]).await);
                         if changes != Changes::default() {
@@ -604,10 +624,10 @@ impl Worker {
                                 changes.flags
                             );
                         }
-                        let (wake, idled) = self.idle(session, left.min(IDLE_RENEWAL)).await;
-                        session = match idled {
-                            Ok(session) => session,
-                            Err(error) => return (Ended::Lost(error), None),
+                        let wake;
+                        (wake, session) = match self.idle(session, left.min(IDLE_RENEWAL)).await {
+                            Ok(idled) => idled,
+                            Err(ended) => return (ended, None),
                         };
                         wake
                     }
@@ -675,10 +695,12 @@ impl Worker {
         &mut self,
         session: ImapSession,
         timeout: Duration,
-    ) -> (Wake, Result<ImapSession, SyncError>) {
+    ) -> Result<(Wake, ImapSession), Ended> {
         let mut handle = session.idle();
-        if let Err(error) = handle.init().await {
-            return (Wake::Stop, Err(error.into()));
+        match tokio::time::timeout(IDLE_COMMAND_TIMEOUT, handle.init()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(Ended::Lost(error.into())),
+            Err(_) => return Err(Ended::IdleRefused),
         }
         let (result, asked) = {
             // The wait's own timeout only counts silence, and a server's keepalives
@@ -720,11 +742,14 @@ impl Worker {
             Ok(IdleResponse::NewData(_)) => asked.unwrap_or(Wake::Inbox),
             Ok(IdleResponse::Timeout) => asked.unwrap_or(Wake::Renew),
             Ok(IdleResponse::ManualInterrupt) => asked.unwrap_or(Wake::Sync),
-            Err(error) => return (Wake::Stop, Err(error.into())),
+            Err(error) => return Err(Ended::Lost(error.into())),
         };
-        match handle.done().await {
-            Ok(session) => (wake, Ok(session)),
-            Err(error) => (wake, Err(error.into())),
+        match tokio::time::timeout(IDLE_COMMAND_TIMEOUT, handle.done()).await {
+            Ok(Ok(session)) => Ok((wake, session)),
+            Ok(Err(error)) => Err(Ended::Lost(error.into())),
+            Err(_) => Err(Ended::Lost(SyncError::Connection(
+                ConnectError::Unreachable("the IMAP server did not end IDLE".to_owned()),
+            ))),
         }
     }
 }

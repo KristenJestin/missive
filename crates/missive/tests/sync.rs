@@ -1003,6 +1003,32 @@ async fn a_session_lost_at_every_pass_answers_the_sync_and_records_unreachable()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_advertises_idle_but_refuses_it_does_not_block_the_worker() {
+    let server = mailbox().refuse("IDLE").start().await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "1"]).await;
+    succeeded(&env.sync().await);
+
+    // Asked while the worker waits for the server to start IDLE, which it never does.
+    succeeded(&sync_soon(&env).await);
+
+    // The periodic check goes on, and IDLE is not asked again.
+    let uid = server.deliver("Sent", message(8));
+    eventually(20, "the new sent message", || {
+        env.uids("Sent").contains(&uid)
+    })
+    .await;
+    let idles = || server.imap_log().iter().filter(|c| *c == "IDLE").count();
+    assert_eq!(idles(), 1);
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(env.state("alice").as_deref(), Some("ready"));
+    assert_eq!(idles(), 1);
+    assert!(env.logs().contains("refuses IDLE"), "{}", env.logs());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn idle_keepalives_do_not_keep_the_other_folders_from_being_checked() {
     let server = mailbox()
         .idle_keepalive(Duration::from_millis(200))
