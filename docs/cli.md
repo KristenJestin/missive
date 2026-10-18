@@ -84,6 +84,10 @@ keyring. With `--json`, standard output is one JSON array, one object per accoun
 Without accounts, it prints `[]`. The array is printed on one line; the layout above is only for
 reading.
 
+An account whose `account.toml` cannot be read or is invalid does not stop the others: it is
+left out, and one line on standard error names its folder and the kind of error (never the
+content of the file). Standard output stays valid, and the exit status is still success.
+
 ### `missive account remove <id>`
 
 Removes the account's keyring entry, then its settings and certificate. The keyring goes first:
