@@ -969,6 +969,61 @@ async fn a_watcher_whose_standard_output_is_closed_exits_without_a_panic() {
     server.deliver("INBOX", message(7));
 }
 
+/// `missive watch | head -1`: the reader takes what it wants, leaves, and nothing is written
+/// afterwards. The watcher has to notice by itself.
+async fn leaves_when_its_reader_does(watcher: Watcher) {
+    let Watcher { mut child, lines } = watcher;
+    drop(lines);
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("the watcher exits soon after its reader left")
+        .unwrap();
+    assert!(status.success(), "{status:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watcher_with_a_daemon_exits_when_its_reader_leaves_without_waiting_for_an_event() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    let _daemon = idling(&server, &env).await;
+    let mut watcher = env.watch();
+    watcher.snapshot(1).await;
+
+    leaves_when_its_reader_does(watcher).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watcher_without_a_daemon_exits_when_its_reader_leaves_without_polling_for_ever() {
+    let env = Env::new().await;
+    let mut watcher = env.watch();
+    watcher.expect("gone").await;
+
+    leaves_when_its_reader_does(watcher).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watcher_writing_to_a_regular_file_keeps_going() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    let _daemon = idling(&server, &env).await;
+    let file = env.home.path().join("watch.out");
+    let mut child = env
+        .command(&["watch"])
+        .stdout(std::fs::File::create(&file).unwrap())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // A file has no reader to lose: the stream goes on into it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(child.try_wait().unwrap().is_none(), "the watcher left");
+    server.deliver("INBOX", message(7));
+    eventually(10, "the new message in the file", || {
+        std::fs::read_to_string(&file).is_ok_and(|out| out.contains("new-message"))
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn no_subject_or_address_reaches_the_daemon_log_through_the_event_code() {
     let server = mailbox().start().await;

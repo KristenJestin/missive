@@ -7,11 +7,13 @@
 //! to polling. Lines from the daemon are passed on as they are.
 
 use std::io::ErrorKind;
+use std::os::fd::AsFd;
 use std::time::Duration;
 
 use missive_core::events::Event;
 use missive_core::protocol::{Answer, Command, PROTOCOL, Request, socket_path};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Interest, Stdout};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -33,9 +35,33 @@ pub async fn run() -> Result<(), String> {
     let mut stdout = tokio::io::stdout();
     tokio::select! {
         result = stream(&mut stdout) => result,
+        _ = reader_left() => Ok(()),
         _ = terminate.recv() => Ok(()),
         _ = interrupt.recv() => Ok(()),
     }
+}
+
+/// Resolves when whoever reads standard output has gone. A write finds that out too, but only
+/// when there is something to write: `missive watch | head -1` would stay for as long as the
+/// daemon is quiet, or gone. The kernel reports it on a pipe or a socket as an error condition on
+/// the descriptor.
+async fn reader_left() {
+    // A copy of the descriptor: the one registered is closed with its `AsyncFd`, standard output
+    // must stay open.
+    // `with_interest` is deprecated for the `unsafe` `register_with_interest`, whose contract an
+    // `OwnedFd` that nothing else touches meets: the crate has no `unsafe` and does not need one.
+    #[allow(deprecated)]
+    let registered = std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .and_then(|fd| AsyncFd::with_interest(fd, Interest::READABLE | Interest::ERROR));
+    // `epoll` refuses a regular file or `/dev/null`: there is no reader to lose there.
+    if let Ok(fd) = registered
+        && fd.ready(Interest::ERROR).await.is_ok()
+    {
+        return;
+    }
+    std::future::pending::<()>().await;
 }
 
 async fn stream(out: &mut Stdout) -> Result<(), String> {

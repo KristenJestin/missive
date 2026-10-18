@@ -108,8 +108,9 @@ stream goes on (starting, as every subscription does, with the present state). W
 stops, `watch` says `gone` again and goes back to waiting. Several `watch` may run at once.
 
 SIGTERM or SIGINT (Ctrl-C) stops it, and so does the closing of standard output (a program that
-stops reading, as `missive watch | head -1` does): neither is an error, and the exit status is
-success. The status is 1 when the daemon refuses the subscription (it speaks another protocol
+stops reading, as `missive watch | head -1` does), noticed at once and not at the next line it
+would write: neither is an error, and the exit status is success. (Standard output sent to a
+regular file has no reader to lose: the stream goes on.) The status is 1 when the daemon refuses the subscription (it speaks another protocol
 version, say) or the socket cannot be reached for another reason than the daemon's absence.
 
 ## The local copy
