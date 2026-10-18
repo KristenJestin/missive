@@ -903,6 +903,31 @@ async fn the_subscribe_request_is_answered_then_events_follow_on_the_same_connec
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_watcher_that_closes_only_its_writing_side_keeps_receiving_events() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    let _daemon = idling(&server, &env).await;
+    let mut raw = env.connect().await;
+
+    // `echo '{"protocol":1,"request":"subscribe"}' | socat - UNIX-CONNECT:…` does this: the
+    // request, then the end of what it has to say, while it goes on listening.
+    raw.send(SUBSCRIBE).await;
+    raw.write.shutdown().await.unwrap();
+
+    assert_eq!(raw.next().await["answer"], "subscribe");
+    assert_eq!(raw.next().await["event"], "state");
+    assert_eq!(raw.next().await["event"], "unread");
+    let uid = server.deliver("INBOX", message(7));
+    loop {
+        let line = raw.next().await;
+        if line["event"] == "new-message" {
+            assert_eq!(line["message"], env.inbox_message_id("alice", uid));
+            break;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_subscription_does_not_hold_other_connections_back() {
     let server = mailbox().start().await;
     let env = Env::new().await;

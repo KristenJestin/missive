@@ -375,7 +375,10 @@ impl Daemon {
             }
         }
         if let Some(forwarder) = forwarder {
-            forwarder.abort();
+            // The end of what the peer has to say is not the end of what it wants to hear: a
+            // client may close its writing side after `subscribe` and go on reading. The stream
+            // ends when a write fails, which is the peer closing the connection, or when the
+            // daemon stops.
             let _ = forwarder.await;
             log!(
                 "a watcher left ({} subscribed now)",

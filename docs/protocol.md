@@ -97,8 +97,10 @@ events. A request that takes time (a `sync` waits for the end of the sync) delay
 after it, not the events, and never another connection. Asking to subscribe on a connection that
 already has, is answered `ok: false`, `error: "failed"`, and changes nothing.
 
-A subscription ends with the connection. Events are not kept for a client that is not there: one
-that connects later starts from the present.
+A subscription ends with the connection, when the client closes it or a write to it fails. A
+client that only closes its writing side after the request (`echo '{…subscribe…}' | socat -
+UNIX-CONNECT:…` does) is still listening, and keeps receiving events. Events are not kept for a
+client that is not there: one that connects later starts from the present.
 
 A watcher that reads more slowly than the daemon writes is never waited for. The daemon keeps at
 most 256 events behind a watcher on top of what the socket holds; past that the oldest are dropped
