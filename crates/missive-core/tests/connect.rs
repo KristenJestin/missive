@@ -88,3 +88,101 @@ fn each_error_names_its_state() {
         "certificate-refused"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn imap_no_unavailable_at_login_gives_unreachable_not_auth_refused() {
+    let fake = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .imap_login_unavailable()
+        .start()
+        .await;
+    let tls = client_config(Some(fake.certificate_der()));
+
+    let refused = check_imap(
+        &server(fake.imap_tls_addr(), Security::Tls),
+        USER,
+        &password(PASSWORD),
+        tls,
+    )
+    .await;
+
+    assert!(
+        matches!(refused, Err(ConnectError::Unreachable(_))),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn imap_no_authenticationfailed_at_login_still_gives_auth_refused() {
+    let fake = FakeServer::builder().user(USER, PASSWORD).start().await;
+    let tls = client_config(Some(fake.certificate_der()));
+
+    let refused = check_imap(
+        &server(fake.imap_tls_addr(), Security::Tls),
+        USER,
+        &password("wrong"),
+        tls,
+    )
+    .await;
+
+    assert_eq!(refused, Err(ConnectError::AuthRefused));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn smtp_auth_login_refused_at_the_user_name_step_gives_auth_refused() {
+    let fake = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .smtp_login_only()
+        .start()
+        .await;
+    let tls = client_config(Some(fake.certificate_der()));
+
+    let refused = check_smtp(
+        &server(fake.smtp_tls_addr(), Security::Tls),
+        "nobody@example.org",
+        &password(PASSWORD),
+        tls,
+    )
+    .await;
+
+    assert_eq!(refused, Err(ConnectError::AuthRefused));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn smtp_auth_login_refused_at_the_password_step_gives_auth_refused() {
+    let fake = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .smtp_login_only()
+        .start()
+        .await;
+    let tls = client_config(Some(fake.certificate_der()));
+
+    let refused = check_smtp(
+        &server(fake.smtp_tls_addr(), Security::Tls),
+        USER,
+        &password("wrong"),
+        tls,
+    )
+    .await;
+
+    assert_eq!(refused, Err(ConnectError::AuthRefused));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn smtp_auth_login_alone_logs_in() {
+    let fake = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .smtp_login_only()
+        .start()
+        .await;
+    let tls = client_config(Some(fake.certificate_der()));
+
+    check_smtp(
+        &server(fake.smtp_tls_addr(), Security::Tls),
+        USER,
+        &password(PASSWORD),
+        tls,
+    )
+    .await
+    .unwrap();
+}

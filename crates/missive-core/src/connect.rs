@@ -128,12 +128,37 @@ pub async fn check_imap(
             .login(user, password.expose())
             .await
             .map_err(|(error, _)| match error {
-                async_imap::error::Error::No(_) => ConnectError::AuthRefused,
+                async_imap::error::Error::No(text) => login_refusal(&text),
                 error => imap_error(error),
             })?;
         session.logout().await.map_err(imap_error)
     })
     .await
+}
+
+/// A `NO` to `LOGIN` is a refusal of the credentials when it has no response code, or the code
+/// says so (RFC 5530: `AUTHENTICATIONFAILED`, `AUTHORIZATIONFAILED`). Any other code
+/// (`UNAVAILABLE`, which a bridge answers while it starts, for one) says the server cannot log
+/// anyone in right now, which asking for the password again would not mend.
+fn login_refusal(text: &str) -> ConnectError {
+    // async-imap puts the answer in a string: `code:` holds a code it knows, and a code it does
+    // not know stays at the start of `info:`.
+    let code = match text.strip_prefix("code: None, info: Some(\"[") {
+        Some(rest) => rest
+            .split(']')
+            .next()
+            .and_then(|c| c.split_whitespace().next()),
+        None if text.starts_with("code: None") => None,
+        None => Some("a code"),
+    };
+    match code.map(str::to_ascii_uppercase).as_deref() {
+        None | Some("AUTHENTICATIONFAILED" | "AUTHORIZATIONFAILED") => ConnectError::AuthRefused,
+        Some(_) => ConnectError::Unreachable(
+            "the IMAP server cannot log in now (it refused with a code other than a wrong \
+             user name or password)"
+                .to_owned(),
+        ),
+    }
 }
 
 async fn greeting<S>(client: &mut async_imap::Client<S>) -> Result<()>
@@ -196,9 +221,15 @@ pub async fn check_smtp(
             reply(&mut smtp).await?.0
         } else if mechanisms.contains(&"LOGIN") {
             command(&mut smtp, "AUTH LOGIN", 334).await?;
-            command(&mut smtp, &STANDARD.encode(user), 334).await?;
-            send(&mut smtp, &STANDARD.encode(password)).await?;
-            reply(&mut smtp).await?.0
+            send(&mut smtp, &STANDARD.encode(user)).await?;
+            // Some servers refuse an unknown user name here, before asking for a password.
+            match reply(&mut smtp).await?.0 {
+                334 => {
+                    send(&mut smtp, &STANDARD.encode(password)).await?;
+                    reply(&mut smtp).await?.0
+                }
+                code => code,
+            }
         } else {
             return Err(ConnectError::Unreachable(
                 "the SMTP server offers no login Missive knows (PLAIN or LOGIN)".to_owned(),

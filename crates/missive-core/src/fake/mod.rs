@@ -31,8 +31,8 @@
 //! UIDVALIDITY is disconnected with `BYE`.
 //!
 //! The SMTP side serves `EHLO`/`HELO`, `STARTTLS`, `AUTH PLAIN` and `AUTH LOGIN` (offered only
-//! over TLS), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP` and `QUIT`, and records each message it
-//! accepted ([`FakeServer::smtp_messages`]).
+//! over TLS; [`Builder::smtp_login_only`] drops `PLAIN`), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP`
+//! and `QUIT`, and records each message it accepted ([`FakeServer::smtp_messages`]).
 //!
 //! Both sides listen twice: once in clear with STARTTLS (no login before TLS), once with implicit
 //! TLS. The certificate is self-signed for `localhost` and `127.0.0.1` and marked as a CA
@@ -182,6 +182,8 @@ pub struct Builder {
     users: Vec<(String, String)>,
     folders: Vec<Folder>,
     without_condstore: bool,
+    imap_login_unavailable: bool,
+    smtp_login_only: bool,
 }
 
 impl Builder {
@@ -201,6 +203,20 @@ impl Builder {
     /// Serves without CONDSTORE, like a server that lacks it.
     pub fn without_condstore(mut self) -> Self {
         self.without_condstore = true;
+        self
+    }
+
+    /// Answers every IMAP `LOGIN` `NO [UNAVAILABLE]` (RFC 5530), as a bridge does while it is
+    /// starting, whatever the credentials.
+    pub fn imap_login_unavailable(mut self) -> Self {
+        self.imap_login_unavailable = true;
+        self
+    }
+
+    /// Offers only `AUTH LOGIN` on SMTP, not `PLAIN`. As some servers do, it then refuses an
+    /// unknown user name (`535`) at the user name step, before asking for a password.
+    pub fn smtp_login_only(mut self) -> Self {
+        self.smtp_login_only = true;
         self
     }
 
@@ -250,6 +266,8 @@ impl Builder {
             }),
             changes: watch::channel(()).0,
             condstore: !self.without_condstore,
+            imap_login_unavailable: self.imap_login_unavailable,
+            smtp_login_only: self.smtp_login_only,
         });
 
         let mut listeners = Vec::new();
@@ -409,6 +427,8 @@ struct Shared {
     /// Signalled after each change made by a test or a client, so that idling sessions look.
     changes: watch::Sender<()>,
     condstore: bool,
+    imap_login_unavailable: bool,
+    smtp_login_only: bool,
 }
 
 impl Shared {
@@ -423,6 +443,10 @@ impl Shared {
         let result = change(&mut self.state());
         self.changes.send_modify(|_| {});
         result
+    }
+
+    fn knows(&self, user: &str) -> bool {
+        self.state().users.iter().any(|(u, _)| u == user)
     }
 
     fn authenticate(&self, user: &str, password: &str) -> bool {
