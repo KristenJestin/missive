@@ -45,7 +45,10 @@
 //!
 //! The SMTP side serves `EHLO`/`HELO`, `STARTTLS`, `AUTH PLAIN` and `AUTH LOGIN` (offered only
 //! over TLS; [`Builder::smtp_login_only`] drops `PLAIN`), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP`
-//! and `QUIT`, and records each message it accepted ([`FakeServer::smtp_messages`]).
+//! and `QUIT`, and records each message it accepted ([`FakeServer::smtp_messages`]). It can
+//! answer a chosen reply to `MAIL`, `RCPT`, `DATA` or the end of data
+//! ([`FakeServer::smtp_answer`]), or take a message and drop the connection before answering its
+//! end of data ([`FakeServer::smtp_cut_after_data`]), until [`FakeServer::heal`].
 //!
 //! Both sides listen twice: once in clear with STARTTLS (no login before TLS), once with implicit
 //! TLS. The certificate is self-signed for `localhost` and `127.0.0.1` and marked as a CA
@@ -208,6 +211,7 @@ pub struct Builder {
     idle_keepalive: Duration,
     rules: Vec<Rule>,
     refused_uids: Vec<u32>,
+    smtp_rules: Vec<SmtpRule>,
 }
 
 impl Builder {
@@ -317,6 +321,12 @@ impl Builder {
         self
     }
 
+    /// Starts as [`FakeServer::smtp_answer`] would leave it.
+    pub fn smtp_answer(mut self, command: &str, reply: &str) -> Self {
+        self.smtp_rules.push(SmtpRule::answer(command, reply));
+        self
+    }
+
     /// Starts as [`FakeServer::refuse_uid`] would leave it.
     pub fn refuse_uid(mut self, uid: u32) -> Self {
         self.refused_uids.push(uid);
@@ -368,6 +378,7 @@ impl Builder {
                 smtp_messages: Vec::new(),
                 rules: self.rules,
                 refused_uids: self.refused_uids,
+                smtp_rules: self.smtp_rules,
             }),
             changes: watch::channel(()).0,
             condstore: !self.without_condstore,
@@ -582,6 +593,28 @@ impl FakeServer {
         let mut state = self.shared.state();
         state.rules.clear();
         state.refused_uids.clear();
+        state.smtp_rules.clear();
+    }
+
+    /// Answers `reply` (`451 4.3.0 try again later`, `550 5.1.1 no such user`…) to every SMTP
+    /// command that starts with `command` (`MAIL`, `RCPT`, `DATA`, in any case), without running
+    /// it, or with `"."` to every end of data: the message is then not taken. Until
+    /// [`FakeServer::heal`].
+    pub fn smtp_answer(&self, command: &str, reply: &str) {
+        self.shared
+            .state()
+            .smtp_rules
+            .push(SmtpRule::answer(command, reply));
+    }
+
+    /// Takes every message whose data ends, as a server does, then drops the connection before
+    /// answering its end of data: the client cannot know it was taken. Until
+    /// [`FakeServer::heal`].
+    pub fn smtp_cut_after_data(&self) {
+        self.shared.state().smtp_rules.push(SmtpRule {
+            command: ".".to_owned(),
+            reply: None,
+        });
     }
 
     /// Every message the SMTP side accepted, in order.
@@ -637,6 +670,17 @@ impl Shared {
             .map(|rule| rule.action)
     }
 
+    /// What a test asked the SMTP side to answer to this command line (`.` for the end of
+    /// data): `Some(None)` to drop the connection.
+    fn smtp_rule(&self, line: &str) -> Option<Option<String>> {
+        let line = line.to_ascii_uppercase();
+        self.state()
+            .smtp_rules
+            .iter()
+            .find(|rule| line.starts_with(&rule.command))
+            .map(|rule| rule.reply.clone())
+    }
+
     fn knows(&self, user: &str) -> bool {
         self.state().users.iter().any(|(u, _)| u == user)
     }
@@ -656,6 +700,25 @@ struct State {
     smtp_messages: Vec<SmtpMessage>,
     rules: Vec<Rule>,
     refused_uids: Vec<u32>,
+    smtp_rules: Vec<SmtpRule>,
+}
+
+/// What a test asked the SMTP side to answer to the commands that start with `command`.
+#[derive(Debug)]
+struct SmtpRule {
+    /// In upper case; `.` is the end of data.
+    command: String,
+    /// `None`: the connection is dropped, after the message was taken.
+    reply: Option<String>,
+}
+
+impl SmtpRule {
+    fn answer(command: &str, reply: &str) -> Self {
+        SmtpRule {
+            command: command.to_ascii_uppercase(),
+            reply: Some(reply.to_owned()),
+        }
+    }
 }
 
 /// A misbehaviour a test asked for: what to do with the commands that start with `command`.

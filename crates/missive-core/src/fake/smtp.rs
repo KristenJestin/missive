@@ -30,7 +30,16 @@ pub(super) async fn serve(
             return;
         };
         let (verb, argument) = line.split_once(' ').unwrap_or((&line, ""));
-        let answer = match verb.to_ascii_uppercase().as_str() {
+        let verb = verb.to_ascii_uppercase();
+        if matches!(verb.as_str(), "MAIL" | "RCPT" | "DATA")
+            && let Some(Some(answer)) = shared.smtp_rule(&line)
+        {
+            if reply(&mut io, &answer).await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let answer = match verb.as_str() {
             "EHLO" => {
                 let mut lines = vec![HOST.to_owned()];
                 if tls {
@@ -113,8 +122,18 @@ pub(super) async fn serve(
                     to: std::mem::take(&mut session.to),
                     data,
                 };
-                shared.state().smtp_messages.push(message);
-                "250 2.0.0 OK queued".to_owned()
+                match shared.smtp_rule(".") {
+                    Some(Some(answer)) => answer,
+                    Some(None) => {
+                        shared.state().smtp_messages.push(message);
+                        let _ = io.shutdown().await;
+                        return;
+                    }
+                    None => {
+                        shared.state().smtp_messages.push(message);
+                        "250 2.0.0 OK queued".to_owned()
+                    }
+                }
             }
             "RSET" => {
                 session.from = None;

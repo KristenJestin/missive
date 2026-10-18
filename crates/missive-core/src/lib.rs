@@ -14,5 +14,6 @@ pub mod keyring;
 pub mod original;
 pub mod protocol;
 pub mod store;
+pub mod submit;
 pub mod sync;
 pub mod tls;
