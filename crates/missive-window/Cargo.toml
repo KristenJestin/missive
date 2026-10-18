@@ -27,3 +27,5 @@ gpui-kit = { version = "=0.7.3", default-features = false, features = ["test-sup
 missive-core = { workspace = true, features = ["fake"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The password the daemon reads, written to the fake Secret Service (`tests/daemon.rs`).
+zbus.workspace = true

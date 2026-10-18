@@ -1,6 +1,10 @@
 //! The window: three panes over the [`Model`]. Accounts and folders on the left, the messages of
 //! the selected folder in the middle, the open message on the right. Colours follow the system's
 //! light or dark appearance; the text is the system's own font.
+//!
+//! What the user does to mail, from the keys or the reader's buttons, the model turns into
+//! requests: the window hands them to its [`Asker`] off its own thread, one at a time and in
+//! order, and gives the answers back to the model.
 
 use std::sync::Arc;
 
@@ -13,25 +17,42 @@ use gpui_kit::{
 };
 use missive_core::copy::{Person, local_time};
 use missive_core::opener::followable;
+use missive_core::protocol::{Answer, Command};
 
 use crate::images::MessageImages;
 use crate::model::{Body, Daemon, Model, Opened, Reader};
 
 actions!(
     missive_window,
-    [SelectPrevious, SelectNext, OpenSelected, Back]
+    [
+        SelectPrevious,
+        SelectNext,
+        OpenSelected,
+        Back,
+        MarkUnread,
+        ToggleFlag,
+        Archive,
+        MoveTo,
+        Delete
+    ]
 );
 
 /// The key context of the window.
 const CONTEXT: &str = "MissiveWindow";
 
-/// Up and down in the list, Enter to open, Escape back.
+/// Up and down in the list, Enter to open, Escape back; U, S, A, M and Delete act on the open
+/// message. In the folder picker and the confirmation, up, down, Enter and Escape are theirs.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("up", SelectPrevious, Some(CONTEXT)),
         KeyBinding::new("down", SelectNext, Some(CONTEXT)),
         KeyBinding::new("enter", OpenSelected, Some(CONTEXT)),
         KeyBinding::new("escape", Back, Some(CONTEXT)),
+        KeyBinding::new("u", MarkUnread, Some(CONTEXT)),
+        KeyBinding::new("s", ToggleFlag, Some(CONTEXT)),
+        KeyBinding::new("a", Archive, Some(CONTEXT)),
+        KeyBinding::new("m", MoveTo, Some(CONTEXT)),
+        KeyBinding::new("delete", Delete, Some(CONTEXT)),
     ]);
 }
 
@@ -47,6 +68,10 @@ pub enum Opening {
 /// Hands an [`Opening`] to the system (see `main.rs`), or to a test.
 pub type Opener = Arc<dyn Fn(Opening) + Send + Sync>;
 
+/// Asks the daemon (see `ask.rs`), or a test, and gives its answer or why it could not be asked.
+/// Called off the window's thread: it may wait for the daemon to start.
+pub type Asker = Arc<dyn Fn(Command) -> Result<Answer, String> + Send + Sync>;
+
 pub struct MailWindow {
     pub model: Model,
     focus: FocusHandle,
@@ -54,12 +79,22 @@ pub struct MailWindow {
     /// The images of the open message.
     images: Arc<MessageImages>,
     opener: Opener,
+    asker: Asker,
+    /// Whether a request waits for the daemon's answer: the next one waits for it, so that the
+    /// daemon records them in the order they were asked.
+    asking: bool,
     /// The system's sans-serif family, when it is installed.
     font: Option<SharedString>,
 }
 
 impl MailWindow {
-    pub fn new(model: Model, opener: Opener, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        model: Model,
+        opener: Opener,
+        asker: Asker,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         cx.observe_window_appearance(window, |this, window, cx| {
@@ -77,12 +112,40 @@ impl MailWindow {
             focus,
             list: UniformListScrollHandle::new(),
             opener,
+            asker,
+            asking: false,
         }
     }
 
-    /// After the model changed: the open message is reduced off this thread, the images follow
-    /// it, the list follows the cursor.
+    /// After the model changed: the open message is reduced off this thread, its read timer
+    /// starts, the next request goes to the daemon, the images follow the message, the list
+    /// follows the cursor.
     pub fn changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(timer) = self.model.take_read_timer() {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(timer.after).await;
+                this.update(cx, |this, cx| {
+                    this.model.read_timer_elapsed(timer);
+                    this.changed(cx);
+                })
+            })
+            .detach();
+        }
+        if !self.asking
+            && let Some(command) = self.model.take_request()
+        {
+            self.asking = true;
+            let asker = self.asker.clone();
+            cx.spawn(async move |this, cx| {
+                let answer = cx.background_spawn(async move { asker(command) }).await;
+                this.update(cx, |this, cx| {
+                    this.asking = false;
+                    this.model.answered(answer);
+                    this.changed(cx);
+                })
+            })
+            .detach();
+        }
         if let Some(reduction) = self.model.take_reduction() {
             cx.spawn(async move |this, cx| {
                 let reduced = cx.background_spawn(async move { reduction.run() }).await;
@@ -101,17 +164,57 @@ impl MailWindow {
     }
 
     fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
-        self.model.move_cursor(-1);
+        self.step(-1);
         self.changed(cx);
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        self.model.move_cursor(1);
+        self.step(1);
         self.changed(cx);
     }
 
+    /// Up and down: in the picker when it is open, else in the list.
+    fn step(&mut self, by: isize) {
+        if self.model.picker.is_some() {
+            self.model.picker_move(by);
+        } else if self.model.confirm.is_none() {
+            self.model.move_cursor(by);
+        }
+    }
+
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
-        self.model.open_cursor();
+        if self.model.picker.is_some() {
+            self.model.choose_folder();
+        } else if self.model.confirm.is_some() {
+            self.model.confirm_delete();
+        } else {
+            self.model.open_cursor();
+        }
+        self.changed(cx);
+    }
+
+    fn mark_unread(&mut self, _: &MarkUnread, _: &mut Window, cx: &mut Context<Self>) {
+        self.model.mark_unread();
+        self.changed(cx);
+    }
+
+    fn toggle_flag(&mut self, _: &ToggleFlag, _: &mut Window, cx: &mut Context<Self>) {
+        self.model.toggle_flag();
+        self.changed(cx);
+    }
+
+    fn archive(&mut self, _: &Archive, _: &mut Window, cx: &mut Context<Self>) {
+        self.model.archive();
+        self.changed(cx);
+    }
+
+    fn move_to(&mut self, _: &MoveTo, _: &mut Window, cx: &mut Context<Self>) {
+        self.model.pick_folder();
+        self.changed(cx);
+    }
+
+    fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        self.model.delete();
         self.changed(cx);
     }
 
@@ -205,6 +308,11 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::open_selected))
             .on_action(cx.listener(Self::back))
+            .on_action(cx.listener(Self::mark_unread))
+            .on_action(cx.listener(Self::toggle_flag))
+            .on_action(cx.listener(Self::archive))
+            .on_action(cx.listener(Self::move_to))
+            .on_action(cx.listener(Self::delete))
             .size_full()
             .flex()
             .flex_col()
@@ -215,6 +323,18 @@ impl Render for MailWindow {
             .children(banner.map(|text| {
                 div()
                     .id("banner")
+                    .px_4()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(palette.line)
+                    .bg(palette.pane)
+                    .text_color(palette.warning)
+                    .child(text)
+            }))
+            .children(self.model.notice.clone().map(|text| {
+                div()
+                    .id("notice")
+                    .debug_selector(|| "notice".to_owned())
                     .px_4()
                     .py_1()
                     .border_b_1()
@@ -431,25 +551,15 @@ impl MailWindow {
             Reader::Open(opened) => {
                 let raw = opened.raw.clone();
                 let opener = self.opener.clone();
-                pane.child(headers(opened, palette).child(
-                    div()
-                        .id("view-original")
-                        .debug_selector(|| "view-original".to_owned())
-                        .mt_2()
-                        .px_3()
-                        .py_1()
-                        .w_auto()
-                        .flex_none()
-                        .self_start()
-                        .border_1()
-                        .border_color(palette.line)
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |_, _, _, _| {
+                pane.child(headers(opened, palette).child(self.buttons(opened, palette, cx).child(
+                    button("view-original", "View original", None, palette).on_click(
+                        cx.listener(move |_, _, _, _| {
                             opener(Opening::Original(raw.clone()));
-                        }))
-                        .child("View original"),
-                ))
+                        }),
+                    ),
+                )))
+                .children(self.picker(palette, cx))
+                .children(self.confirmation(palette, cx))
                 .child(
                     div()
                         .id("body")
@@ -501,6 +611,161 @@ impl MailWindow {
             }
         }
     }
+}
+
+impl MailWindow {
+    /// The reader's buttons, each with its key.
+    fn buttons(&self, opened: &Opened, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::Div {
+        let act = |f: fn(&mut Model)| {
+            cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| {
+                f(&mut this.model);
+                this.changed(cx);
+            })
+        };
+        let (flag, flag_label) = if opened.flagged {
+            ("flag", "Unflag")
+        } else {
+            ("flag", "Flag")
+        };
+        let forever = self.model.deletes_for_good();
+        div()
+            .mt_2()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .when(!opened.unread, |row| {
+                row.child(
+                    button("mark-unread", "Mark unread", Some("U"), palette)
+                        .on_click(act(Model::mark_unread)),
+                )
+            })
+            .child(button(flag, flag_label, Some("S"), palette).on_click(act(Model::toggle_flag)))
+            .when(self.model.can_archive(), |row| {
+                row.child(
+                    button("archive", "Archive", Some("A"), palette).on_click(act(Model::archive)),
+                )
+            })
+            .child(
+                button("move-to", "Move to…", Some("M"), palette).on_click(act(Model::pick_folder)),
+            )
+            .child(
+                button(
+                    "delete",
+                    if forever {
+                        "Delete for good…"
+                    } else {
+                        "Delete"
+                    },
+                    Some("Delete"),
+                    palette,
+                )
+                .on_click(act(Model::delete)),
+            )
+    }
+
+    /// The folder picker of "Move to…", under the reader's header.
+    fn picker(&self, palette: Palette, cx: &mut Context<Self>) -> Option<gpui_kit::Div> {
+        let picker = self.model.picker.as_ref()?;
+        let mut list = div()
+            .px_6()
+            .py_2()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(palette.line)
+            .bg(palette.pane)
+            .child(
+                div()
+                    .text_color(palette.muted)
+                    .child("Move to (Enter to move, Escape to cancel):"),
+            );
+        for (at, folder) in picker.folders.iter().enumerate() {
+            let label = match &folder.role {
+                Some(role) => role_label(role).to_owned(),
+                None => folder.name.clone(),
+            };
+            list = list.child(
+                div()
+                    .id(ElementId::Name(format!("pick-{at}").into()))
+                    .debug_selector(move || format!("pick-{at}"))
+                    .px_2()
+                    .py_1()
+                    .rounded(px(4.))
+                    .when(picker.cursor == at, |row| row.bg(palette.selected))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model.choose_folder_at(at);
+                        this.changed(cx);
+                    }))
+                    .child(label),
+            );
+        }
+        Some(list)
+    }
+
+    /// The question before a message is deleted for good: nothing else asks first.
+    fn confirmation(&self, palette: Palette, cx: &mut Context<Self>) -> Option<gpui_kit::Div> {
+        self.model.confirm.as_ref()?;
+        Some(
+            div()
+                .px_6()
+                .py_2()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .border_b_1()
+                .border_color(palette.line)
+                .bg(palette.pane)
+                .child(
+                    div()
+                        .text_color(palette.warning)
+                        .child("Delete this message for good? It cannot be undone."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            button("confirm-delete", "Delete for good", Some("Enter"), palette)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.model.confirm_delete();
+                                    this.changed(cx);
+                                })),
+                        )
+                        .child(
+                            button("cancel-delete", "Cancel", Some("Escape"), palette).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.model.dismiss();
+                                    this.changed(cx);
+                                }),
+                            ),
+                        ),
+                ),
+        )
+    }
+}
+
+/// A button of the reader, with the key that does the same.
+fn button(
+    id: &'static str,
+    label: &'static str,
+    key: Option<&'static str>,
+    palette: Palette,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .px_3()
+        .py_1()
+        .flex()
+        .flex_none()
+        .gap_2()
+        .border_1()
+        .border_color(palette.line)
+        .rounded(px(6.))
+        .cursor_pointer()
+        .child(label)
+        .children(key.map(|key| div().text_color(palette.muted).child(key)))
 }
 
 /// A line of the message list.

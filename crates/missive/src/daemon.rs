@@ -40,6 +40,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use missive_core::account::{Account, AccountStore, Listing, Password};
 use missive_core::actions::{self, Kind, Outcome, Wanted};
+use missive_core::client;
 use missive_core::compose::{self, Attachment, Draft, Mailbox};
 use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap};
 use missive_core::copy::{Copy, MessageId};
@@ -2121,77 +2122,9 @@ fn kind(error: &SyncError) -> String {
     }
 }
 
-/// `$XDG_STATE_HOME/missive/daemon.log`, or `~/.local/state/missive/daemon.log`: where a daemon
-/// started on demand writes its log.
-pub fn log_path() -> Result<PathBuf, String> {
-    let state = match std::env::var_os("XDG_STATE_HOME").map(PathBuf::from) {
-        Some(path) if path.is_absolute() => path,
-        _ => match std::env::var_os("HOME") {
-            Some(home) if !home.is_empty() => PathBuf::from(home).join(".local/state"),
-            _ => return Err("neither XDG_STATE_HOME nor HOME is set".to_owned()),
-        },
-    };
-    Ok(state.join("missive").join("daemon.log"))
-}
-
-/// Connects to the daemon, starting one when none answers.
+/// Connects to the daemon, starting one when none answers (see [`client::connect`]).
 pub async fn connect() -> Result<UnixStream, String> {
     let socket = socket_path().map_err(|e| e.to_string())?;
-    match UnixStream::connect(&socket).await {
-        Ok(stream) => return Ok(stream),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) => {}
-        Err(e) => {
-            return Err(format!(
-                "cannot reach the daemon at {}: {e}",
-                socket.display()
-            ));
-        }
-    }
-    let log = log_path()?;
-    let mut child = start(&log)?;
-    let started = Instant::now();
-    loop {
-        if let Ok(stream) = UnixStream::connect(&socket).await {
-            return Ok(stream);
-        }
-        // Another `sync` may have started one first: this one then stops, and that one answers.
-        let exited = child.try_wait().ok().flatten().is_some();
-        if (exited && started.elapsed() > Duration::from_secs(2))
-            || started.elapsed() > Duration::from_secs(10)
-        {
-            return Err(format!(
-                "the daemon did not start (its log is {})",
-                log.display()
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Starts `missive daemon` in its own process group, so that the terminal's Ctrl-C does not reach
-/// it, logging to `log`.
-fn start(log: &Path) -> Result<std::process::Child, String> {
-    use std::os::unix::process::CommandExt;
-    if let Some(parent) = log.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .map_err(|e| format!("cannot open {}: {e}", log.display()))?;
     let program = std::env::current_exe().map_err(|e| e.to_string())?;
-    std::process::Command::new(program)
-        .arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(file)
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("cannot start the daemon: {e}"))
+    client::connect(&socket, &program).await
 }

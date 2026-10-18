@@ -19,7 +19,7 @@ use gpui_kit::{
 };
 use missive_core::fake::{FakeServer, Folder};
 use missive_window::images::MessageImages;
-use missive_window::view::{self, MailWindow, Opener, Opening, Palette};
+use missive_window::view::{self, Asker, MailWindow, Opener, Opening, Palette};
 
 /// An HTTP client that really connects, so that a fetch would show on the listener. GPUI's own
 /// has none (it fails every request): this one stands for any client a later version could
@@ -225,7 +225,10 @@ fn window<'a>(
         cx.set_http_client(Arc::new(Connecting));
     });
     let model = mail.model();
-    let (_, cx) = cx.add_window_view(move |window, cx| MailWindow::new(model, opener, window, cx));
+    // Nothing here acts on mail: a request would be a defect.
+    let asker: Asker = Arc::new(|command| panic!("asked the daemon: {command:?}"));
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| MailWindow::new(model, opener, asker, window, cx));
     cx.run_until_parked();
     cx
 }
