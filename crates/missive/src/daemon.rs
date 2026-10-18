@@ -968,9 +968,10 @@ impl Worker {
             Ok(messages) => {
                 for message in messages {
                     self.events.send(Event::NewMessage(message));
-                    // The daemon runs on one thread: without this, a burst of mail would
-                    // fill the channel before any watcher, however quick, could take its
-                    // events out of it.
+                    // The daemon runs on one thread: without this the whole burst is put in the
+                    // channel before any watcher task runs, and the channel's room is all a
+                    // watcher has. Giving the watchers a turn after each event lets those that
+                    // are keeping up take theirs; one that is not still lags, and is told.
                     tokio::task::yield_now().await;
                 }
             }
