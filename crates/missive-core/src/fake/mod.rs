@@ -35,8 +35,9 @@
 //! A server can also misbehave on purpose, from the start ([`Builder::refuse`], [`Builder::cut`])
 //! or from a point of the test on ([`FakeServer::refuse`], [`FakeServer::cut`], until
 //! [`FakeServer::heal`]): it answers `NO` to a chosen command, drops the client in the middle
-//! of an answer, ends an answer short but with its `OK` ([`FakeServer::truncate`]), or refuses
-//! one message ([`FakeServer::refuse_uid`]).
+//! of an answer, ends an answer short but with its `OK` ([`FakeServer::truncate`]), refuses
+//! one message ([`FakeServer::refuse_uid`]), answers nothing ([`Builder::stall`]) or a bare
+//! `BAD` ([`Builder::bare_bad`]).
 //!
 //! The SMTP side serves `EHLO`/`HELO`, `STARTTLS`, `AUTH PLAIN` and `AUTH LOGIN` (offered only
 //! over TLS; [`Builder::smtp_login_only`] drops `PLAIN`), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP`
@@ -269,6 +270,21 @@ impl Builder {
     /// Starts as [`FakeServer::truncate`] would leave it.
     pub fn truncate(mut self, command: &str, lines: usize) -> Self {
         self.rules.push(Rule::new(command, Action::Truncate(lines)));
+        self
+    }
+
+    /// Answers nothing to every IMAP command that starts with `command`, as a half-dead
+    /// connection does: the command is logged, the connection stays open, and the server reads
+    /// the next command as usual. Until [`FakeServer::heal`].
+    pub fn stall(mut self, command: &str) -> Self {
+        self.rules.push(Rule::new(command, Action::Stall));
+        self
+    }
+
+    /// Answers `{tag} BAD`, with no text after it, to every IMAP command that starts with
+    /// `command`, without running it. Until [`FakeServer::heal`].
+    pub fn bare_bad(mut self, command: &str) -> Self {
+        self.rules.push(Rule::new(command, Action::BareBad));
         self
     }
 
@@ -610,6 +626,8 @@ impl Rule {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Refuse,
+    Stall,
+    BareBad,
     Cut(usize),
     Truncate(usize),
 }
