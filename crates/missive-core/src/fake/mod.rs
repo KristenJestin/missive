@@ -50,7 +50,8 @@
 //! answer a chosen reply to `AUTH`, `MAIL`, `RCPT`, `DATA` or the end of data
 //! ([`FakeServer::smtp_answer`]), or take a message and drop the connection before answering its
 //! end of data ([`FakeServer::smtp_cut_after_data`]), or wait before answering a command
-//! ([`FakeServer::smtp_delay`]), until [`FakeServer::heal`].
+//! ([`FakeServer::smtp_delay`]), until [`FakeServer::heal`]. The end of data is `CRLF . CRLF`
+//! only, as on a real server.
 //!
 //! Both sides listen twice: once in clear with STARTTLS (no login before TLS), once with implicit
 //! TLS. The certificate is self-signed for `localhost` and `127.0.0.1` and marked as a CA

@@ -945,3 +945,26 @@ async fn uid_search_finds_a_message_by_a_header() {
         .unwrap();
     assert_eq!(found.into_iter().collect::<Vec<_>>(), [3]);
 }
+
+#[tokio::test]
+async fn smtp_ends_the_data_only_at_crlf_dot_crlf() {
+    let server = server().await;
+    let mut smtp = Smtp::implicit(&server).await;
+    smtp.send("EHLO client.example.org").await;
+    let auth = smtp
+        .send(&format!(
+            "AUTH PLAIN {}",
+            base64(&format!("\0{USER}\0{PASSWORD}"))
+        ))
+        .await;
+    assert!(auth.starts_with("235"), "{auth}");
+
+    // A lone dot ended by a bare LF, and one after a line ended by a bare LF, end nothing.
+    smtp.deliver("Subject: Dots\r\n\r\none\n.\ntwo\n.\r\nthree\r\n")
+        .await;
+
+    assert_eq!(
+        server.smtp_messages()[0].data,
+        b"Subject: Dots\r\n\r\none\n\ntwo\n\r\nthree\r\n"
+    );
+}
