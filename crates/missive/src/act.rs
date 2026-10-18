@@ -143,7 +143,7 @@ async fn run(command: Command, json: bool, asked: usize, done: &str) -> Result<(
 }
 
 /// Sends one request to the daemon, starting it when none answers, and reads its answer.
-async fn ask(command: Command) -> Result<Answer, ActError> {
+pub async fn ask(command: Command) -> Result<Answer, ActError> {
     let stream = daemon::connect().await.map_err(ActError::Failed)?;
     let (read, mut write) = stream.into_split();
     let mut line = serde_json::to_string(&Request {

@@ -1,4 +1,5 @@
 mod act;
+mod compose;
 mod daemon;
 mod open;
 mod read;
@@ -89,6 +90,9 @@ enum Command {
     /// the local copy at once, applied on the server when the account is connected; starts the
     /// daemon when none runs.
     Delete(act::DeleteArgs),
+    /// Write a message, with files attached, and with --send send it: it goes into the outbox at
+    /// once and is sent as soon as the server can be reached; starts the daemon when none runs.
+    Compose(compose::ComposeArgs),
 }
 
 #[derive(Args)]
@@ -233,6 +237,7 @@ async fn main() -> ExitCode {
         Command::Mark(args) => acted(act::mark(args).await),
         Command::Move(args) => acted(act::move_to(args).await),
         Command::Delete(args) => acted(act::delete(args).await),
+        Command::Compose(args) => acted(compose::run(args).await),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -509,11 +509,35 @@ async fn account_list_json_follows_the_documented_format() {
             "user": USER,
             "imap": { "host": "127.0.0.1", "port": imap_port, "security": "starttls" },
             "smtp": { "host": "localhost", "port": smtp_port, "security": "tls" },
+            "server_saves_sent": false,
             "certificate": true,
         }])
     );
     let text = stdout(&setup.run(&["account", "list"]).await);
     assert!(text.contains(USER), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_added_with_server_saves_sent_says_so() {
+    let setup = Setup::new().await;
+    let certificate = setup.certificate_file();
+
+    succeeded(
+        &setup
+            .add(
+                &[
+                    "--certificate",
+                    certificate.to_str().unwrap(),
+                    "--server-saves-sent",
+                ],
+                PASSWORD,
+            )
+            .await,
+    );
+
+    let output = setup.run(&["account", "list", "--json"]).await;
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(listed[0]["server_saves_sent"], true);
 }
 
 #[tokio::test(flavor = "multi_thread")]
