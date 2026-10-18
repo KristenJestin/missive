@@ -819,20 +819,25 @@ async fn a_watcher_that_does_not_read_is_told_it_lagged_and_slows_neither_the_da
     })
     .await;
 
+    // 500 messages of about 5 KB, in groups of 20 (what a sync announces at most): far more than
+    // the buffers can hold for a watcher that reads nothing, whatever the speed of the machine.
+    // The other watcher takes each group before the next is delivered, so that nothing depends
+    // on how fast it reads either.
     let started = Instant::now();
-    for n in 100..600 {
-        server.deliver("INBOX", big_message(n));
-    }
-    // The other watcher gets every message, and in time.
-    let mut subjects = 0;
-    while subjects < 500 {
-        let event = fast.next().await;
-        assert_ne!(
-            event["event"], "lagged",
-            "a watcher that reads was told it lagged"
-        );
-        if event["event"] == "new-message" {
-            subjects += 1;
+    for group in 0..25 {
+        for n in 0..20 {
+            server.deliver("INBOX", big_message(100 + group * 20 + n));
+        }
+        let mut subjects = 0;
+        while subjects < 20 {
+            let event = fast.next().await;
+            assert_ne!(
+                event["event"], "lagged",
+                "a watcher that reads was told it lagged"
+            );
+            if event["event"] == "new-message" {
+                subjects += 1;
+            }
         }
     }
     // The daemon itself still answers, and its copy holds them all.
