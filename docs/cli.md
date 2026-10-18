@@ -5,7 +5,7 @@ is a contract read by other programs: fields are only ever added, never renamed,
 removed without a new major version.
 
 Errors go to standard error, prefixed `missive: `, and the exit status is 1 (2 for a usage
-error).
+error, 3 for `missive show` of a message that does not exist).
 
 ## Accounts
 
@@ -155,7 +155,8 @@ shows a subject, an address or a message.
 
 ## Reading the local copy
 
-`missive status`, `missive unread` and `missive search` answer from the local copy alone: they
+`missive status`, `missive unread`, `missive search`, `missive list` and `missive show` answer from
+the local copy alone: they
 open it read only, never create it, and touch neither the network, the keyring nor the daemon's
 socket. They work with the daemon stopped and the network down, in a few milliseconds, even
 while the daemon is writing.
@@ -334,3 +335,148 @@ too). It is *contentless*: it keeps the words and where they are, not the text, 
 from the raw message when it is written, so no text is stored twice. A copy of version 1 is
 indexed in one pass when the daemon first opens it, from the raw messages it holds. The
 tokenizer is `unicode61 remove_diacritics 2`.
+
+### `missive list [--json] [--account <id>] [--folder <role or name>] [--unread] [--limit <n>]`
+
+The messages of a folder, **newest first** (the message's `Date`, else the server's internal
+date). By default the inbox of each account, merged into one list, newest first.
+
+- `--folder` takes a role (`inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`; capitals do not
+  matter) or a folder's name as the server gives it (`unread` shows them, in modified UTF-7):
+  the folders of the accounts shown that have that role *or* that name. A name or role that no
+  folder of those accounts has is an error; an account that lacks the folder is not, while
+  another has it. So `--folder sent` is every account's Sent folder, whatever its name there,
+  and `--folder Projects` is that folder.
+- `--unread` keeps the messages `unread` counts: without `\Seen`, and not marked `\Deleted`.
+- `--account` takes an identifier (an unknown one is an error); `--limit` defaults to 50, over
+  all the accounts together.
+- A list that finds nothing prints `[]` (with `--json`) or nothing, and succeeds.
+- A copy made before the attachment marker existed (by an earlier build) can be read by every
+  other command but cannot be listed until the daemon has started once: `list` says so and
+  fails.
+
+```json
+[
+  {
+    "id": "alice/1/1745112/4",
+    "account": "alice",
+    "folder": { "id": 1, "name": "INBOX", "role": "inbox" },
+    "uidvalidity": 1745112,
+    "uid": 4,
+    "date": 1792220640,
+    "subject": "Plan 4",
+    "from": [{ "name": "Carol Sender", "address": "carol.sender@example.com" }],
+    "to": [{ "name": "Dave Recipient", "address": "dave.recipient@example.net" }],
+    "unread": true,
+    "flagged": false,
+    "answered": false,
+    "size": 2214,
+    "has_attachments": true
+  }
+]
+```
+
+Each message has the fields of a `search` hit, with the same meaning (`id`, `account`, `folder`,
+`uidvalidity`, `uid`, `date`, `subject`, `from`, `to`, `unread`), and:
+
+| Field | Type | |
+|---|---|---|
+| `flagged` | boolean | the `\Flagged` flag |
+| `answered` | boolean | the `\Answered` flag |
+| `size` | number | the size the server gives, in bytes |
+| `has_attachments` | boolean | the message has a part the reader counts as an attachment (a file, a nested message, an image shown inside the text). A message in text and HTML versions has none |
+
+`has_attachments` is decided when the daemon writes the message to the copy (and, for the
+messages a copy already holds, when it first opens the copy under this version), and kept in
+the copy: a list of a big folder does not parse a single message.
+
+For people, one line per message, separated by tabs: the identifier, four flags (`u` unread, `f`
+flagged, `a` answered, `@` has attachments; a dot for each that is not set), the date in UTC, the
+first sender (its name, else its address) and the subject.
+
+```
+alice/1/1745112/4	u..@	2026-10-17 07:04 UTC	Carol Sender	Plan 4
+```
+
+### `missive show <message id> [--json | --raw]`
+
+One message, by the identifier `search` and `list` print (`<account>/<folder id>/<uidvalidity>/<uid>`).
+
+```json
+{
+  "id": "alice/1/1745112/4",
+  "account": "alice",
+  "folder": { "id": 1, "name": "INBOX", "role": "inbox" },
+  "uidvalidity": 1745112,
+  "uid": 4,
+  "date": 1792220640,
+  "subject": "Plan 4",
+  "from": [{ "name": "Carol Sender", "address": "carol.sender@example.com" }],
+  "to": [{ "name": "Dave Recipient", "address": "dave.recipient@example.net" }],
+  "unread": true,
+  "flagged": false,
+  "answered": false,
+  "size": 2214,
+  "cc": [{ "name": "Erin Copy", "address": "erin.copy@example.org" }],
+  "reply_to": [],
+  "message_id": "4@example.com",
+  "text": "The report is attached.",
+  "html": "<p>The report is <b>attached</b>.</p>",
+  "attachments": [
+    { "name": "report.pdf", "media_type": "application/pdf", "size": 1532, "part": 2 }
+  ]
+}
+```
+
+It has the fields of a `list` message (but `has_attachments`: the list of `attachments` says it),
+and:
+
+| Field | Type | |
+|---|---|---|
+| `cc`, `reply_to` | array | objects with `name` and `address`, each a string or `null`, as `from` |
+| `message_id` | string or `null` | the `Message-ID` header, without its angle brackets |
+| `text` | string or `null` | the message's text parts, one after the other, decoded to UTF-8 from the charset they declare; `null` when it has none |
+| `html` | string or `null` | its HTML parts **as the sender wrote them** (decoded to UTF-8): tags, styles, scripts and remote addresses included. Nothing interprets them; whoever shows them must make them safe and must not fetch what they point to without being allowed to |
+| `attachments` | array | `name` (string or `null`), `media_type`, `size` in bytes once decoded, and `part`: the part's number in the message (0 is the message itself, parts are numbered in the order they appear), which is how a later command will name the attachment |
+
+A message with only HTML has `text` `null`, and one in two versions has both: the JSON does not
+make a text out of HTML. A message that cannot be read, or only in part, gives what can be read
+and `null`, `[]` or empty arrays for the rest; it is never an error. Its headers are those that
+`list` shows.
+
+Without `--json`, the message is written for a terminal: its headers (`From`, `To`, `Cc`,
+`Reply-To`, `Date` in UTC, `Subject`, `Message-ID` and `Attachments`, each when the message has
+it, but the subject, which reads `(no subject)` when there is none), an empty line, then its
+text: the text part, else the HTML reduced to its text (markup, styles and scripts left out; the
+paragraphs and line breaks stay, the addresses links go to do not: they are in `html`). The HTML
+is never interpreted. Control characters (the escape sequences that could move a terminal's
+cursor or change its title) are left out of the headers and the text.
+
+```
+From: Carol Sender <carol.sender@example.com>
+To: Dave Recipient <dave.recipient@example.net>
+Date: 2026-10-17 07:04 UTC
+Subject: Plan 4
+Message-ID: 4@example.com
+Attachments: report.pdf (application/pdf, 1532 bytes)
+
+The report is attached.
+```
+
+`--raw` writes the message exactly as the server sent it (every byte as stored) on standard
+output, and nothing else; it cannot be combined with `--json`.
+
+**Not found.** An identifier that names no message in the copy is an error with exit status 3
+(not 1: a program can tell "that message is not there" from "the copy could not be read"), and
+nothing on standard output. It says which of three it is:
+
+- it is not an identifier (not `<account>/<folder>/<uidvalidity>/<uid>`, with each number written
+  without sign or leading zeros);
+- the account, the folder or the UID is not in the copy: the message has been expunged, or never
+  was, or its account was removed from the configuration (such mail is kept in the copy but is
+  neither listed nor shown);
+- the folder is in the copy under another UIDVALIDITY (*renumbered*): the server gave its UIDs
+  anew, and the UID of the identifier may now be another message, which is not shown. `list`
+  gives the current identifiers.
+
+With no local copy yet, `show` says so (as the other commands do) and exits with 3.

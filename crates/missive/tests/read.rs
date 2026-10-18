@@ -1,4 +1,4 @@
-//! `missive status`, `unread` and `search`, which answer from the local copy alone. The copy is
+//! `missive status`, `unread`, `search`, `list` and `show`, which answer from the local copy alone. The copy is
 //! filled by a daemon from the fake IMAP server; the reading commands then run with the daemon
 //! stopped, the server gone and no session bus at all, so that whatever they would ask of the
 //! network or the keyring fails. Everything lives in temporary folders.
@@ -198,13 +198,22 @@ impl Env {
     /// The daemon fills the copy from the fake server, then stops, and the server goes: what
     /// follows is a machine with the network down and no daemon.
     async fn filled() -> Env {
+        Env::filled_with(vec![("alice", mailbox())]).await
+    }
+
+    /// As [`Env::filled`], for these accounts, each with its own fake server.
+    async fn filled_with(accounts: Vec<(&str, missive_core::fake::Builder)>) -> Env {
         let env = Env::new().await;
-        let server = mailbox().start().await;
-        env.add_account("alice", &server).await;
+        let mut servers = Vec::new();
+        for (id, builder) in accounts {
+            let server = builder.start().await;
+            env.add_account(id, &server).await;
+            servers.push(server);
+        }
         let mut daemon = env.daemon(&[]).await;
         succeeded(&env.sync().await);
         daemon.stop().await;
-        drop(server);
+        drop(servers);
         env
     }
 }
@@ -769,4 +778,712 @@ async fn a_copy_from_before_the_search_index_can_be_counted_and_asks_for_the_dae
     let mut daemon = env.daemon(&["--check-interval", "3600"]).await;
     daemon.stop().await;
     assert_eq!(found(&env, &["anything"]).await, []);
+}
+
+// ---- `missive list` and `missive show` ----
+
+/// The raw message that is none: not a header, not a line, bytes that are not UTF-8.
+const MALFORMED: &[u8] = b"\x00\x01\xff\xfe this is not a mail\r\n\x80\x81";
+
+/// A message with a text part and a PDF of twelve bytes once decoded.
+fn with_attachment() -> Message {
+    Message::new(format!(
+        "From: Carol Sender <{SENDER}>\r\nTo: Dave Recipient <{RECIPIENT}>\r\n\
+         Subject: Plan 3\r\nMessage-ID: <3@example.com>\r\n\
+         Date: Sat, 17 Oct 2026 09:03:00 +0200\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=\"b1\"\r\n\r\n\
+         --b1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nThe report is attached.\r\n\
+         --b1\r\nContent-Type: application/pdf; name=\"report.pdf\"\r\n\
+         Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8gd29ybGQh\r\n--b1--\r\n"
+    ))
+}
+
+fn html_only() -> Message {
+    Message::new(format!(
+        "From: Carol Sender <{SENDER}>\r\nSubject: Plan 4\r\nMessage-ID: <4@example.com>\r\n\
+         Date: Sat, 17 Oct 2026 09:04:00 +0200\r\nContent-Type: text/html; charset=utf-8\r\n\
+         \r\n<html><head><style>.hidden {{ color: red }}</style></head><body>\
+         <script>alert('never run')</script><p>The <b>Quokka</b> waits.</p>\
+         <p>Second paragraph.</p><a href=\"https://example.net/read\">read it</a>\
+         </body></html>\r\n"
+    ))
+}
+
+fn alternative() -> Message {
+    Message::new(format!(
+        "From: Carol Sender <{SENDER}>\r\nTo: Dave Recipient <{RECIPIENT}>\r\n\
+         Cc: Erin Copy <erin.copy@example.org>\r\nReply-To: Carol Elsewhere <carol.elsewhere@example.com>\r\n\
+         Subject: Plan 5\r\nMessage-ID: <5@example.com>\r\n\
+         Date: Sat, 17 Oct 2026 09:05:00 +0200\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/alternative; boundary=\"b2\"\r\n\r\n\
+         --b2\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlain version.\r\n\
+         --b2\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+         <p>HTML <b>version</b>.</p>\r\n--b2--\r\n"
+    ))
+}
+
+/// A body in ISO-8859-1, a subject in an encoded word of the same charset.
+fn latin1_raw() -> Vec<u8> {
+    let mut raw = format!(
+        "From: Carol Sender <{SENDER}>\r\nSubject: =?iso-8859-1?Q?Caf=E9?=\r\n\
+         Message-ID: <6@example.com>\r\nDate: Sat, 17 Oct 2026 09:06:00 +0200\r\n\
+         Content-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: 8bit\r\n\r\n"
+    )
+    .into_bytes();
+    raw.extend_from_slice(b"Un caf\xe9 cr\xe8me, s'il vous pla\xeet.\r\n");
+    raw
+}
+
+/// alice: INBOX holds seven messages (1 seen; 2 flagged and answered; 3 with an attachment; 4 only
+/// HTML; 5 in two versions; 6 in Latin-1; 7 not a message, with no `Date` and the newest internal
+/// date), Sent one seen message, and Projects (a folder of the user's own) two.
+fn alice() -> missive_core::fake::Builder {
+    FakeServer::builder()
+        .user(USER, PASSWORD)
+        .folder(
+            Folder::new("INBOX")
+                .message(plan(1, "", "Nothing special.").flag("\\Seen"))
+                .message(
+                    plan(2, "", "Flagged and answered.")
+                        .flag("\\Flagged")
+                        .flag("\\Answered"),
+                )
+                .message(with_attachment())
+                .message(html_only())
+                .message(alternative())
+                .message(Message::new(latin1_raw()))
+                .message(Message::new(MALFORMED).internal_date("20-Oct-2026 10:00:00 +0000")),
+        )
+        .folder(
+            Folder::new("Sent")
+                .special_use(SpecialUse::Sent)
+                .message(plan(8, "", "Sent.").flag("\\Seen")),
+        )
+        .folder(
+            Folder::new("Projects")
+                .message(plan(9, "", "Nothing special.").uid(5))
+                .message(plan(10, "", "Nothing special.").uid(9)),
+        )
+}
+
+/// bob: one message in the inbox, dated between alice's.
+fn bob() -> missive_core::fake::Builder {
+    FakeServer::builder()
+        .user(USER, PASSWORD)
+        .folder(Folder::new("INBOX").message(plan(11, "", "From bob's side.")))
+}
+
+/// What a list answered, as `(account, folder name, uid)` in order.
+fn listed(output: &Output) -> Vec<(String, String, u64)> {
+    json(output)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| {
+            (
+                message["account"].as_str().unwrap().to_owned(),
+                message["folder"]["name"].as_str().unwrap().to_owned(),
+                message["uid"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn in_alice(folder: &str, uid: u64) -> (String, String, u64) {
+    ("alice".to_owned(), folder.to_owned(), uid)
+}
+
+/// The identifier `list` gives to a message of alice's inbox.
+async fn inbox_id(env: &Env, uid: u64) -> String {
+    let all = json(&env.read(&["list", "--json", "--limit", "100"]).await);
+    all.as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["account"] == "alice" && m["uid"] == uid)
+        .unwrap_or_else(|| panic!("no message {uid} in the inbox: {all}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+async fn show(env: &Env, uid: u64) -> Value {
+    let id = inbox_id(env, uid).await;
+    json(&env.read(&["show", "--json", &id]).await)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_gives_the_inbox_newest_first_by_date_else_internal_date() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let output = env.read(&["list", "--json"]).await;
+
+    // 7 has no Date: its internal date (20 October) puts it first. The others follow their Date,
+    // minute by minute.
+    assert_eq!(
+        listed(&output),
+        [7, 6, 5, 4, 3, 2, 1].map(|uid| in_alice("INBOX", uid))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listed_message_carries_what_search_prints_and_more() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let list = json(&env.read(&["list", "--json"]).await);
+    let flagged = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["uid"] == 2)
+        .unwrap();
+    let plain = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["uid"] == 1)
+        .unwrap();
+    let hits = json(&env.read(&["search", "--json", "special"]).await);
+
+    // The very fields of a search hit, so that one reader reads both.
+    let hit = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["uid"] == 1)
+        .unwrap();
+    for field in [
+        "id",
+        "account",
+        "folder",
+        "uidvalidity",
+        "uid",
+        "date",
+        "subject",
+        "from",
+        "to",
+    ] {
+        assert_eq!(plain[field], hit[field], "{field}");
+    }
+    assert_eq!(plain["subject"], "Plan 1");
+    assert_eq!(
+        plain["from"],
+        json!([{ "name": "Carol Sender", "address": SENDER }])
+    );
+    // 17 October 2026, 09:01 at +0200.
+    assert_eq!(plain["date"], 1_792_220_460);
+    assert_eq!(plain["unread"], false);
+    assert_eq!(plain["flagged"], false);
+    assert_eq!(plain["answered"], false);
+    assert_eq!(plain["has_attachments"], false);
+    assert!(plain["size"].as_u64().unwrap() > 100, "{plain}");
+    assert_eq!(flagged["unread"], true);
+    assert_eq!(flagged["flagged"], true);
+    assert_eq!(flagged["answered"], true);
+    let with = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["uid"] == 3)
+        .unwrap();
+    assert_eq!(with["has_attachments"], true);
+    // A message in two versions, or in HTML, is not an attachment.
+    for uid in [4, 5] {
+        let message = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["uid"] == uid)
+            .unwrap();
+        assert_eq!(message["has_attachments"], false, "{message}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_can_keep_the_unread_messages_only() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let output = env.read(&["list", "--json", "--unread"]).await;
+
+    assert_eq!(
+        listed(&output),
+        [7, 6, 5, 4, 3, 2].map(|uid| in_alice("INBOX", uid))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_stops_at_the_limit_with_the_newest() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let output = env.read(&["list", "--json", "--limit", "3"]).await;
+
+    assert_eq!(listed(&output), [7, 6, 5].map(|uid| in_alice("INBOX", uid)));
+    // A limit of nothing is a usage error, as in `search`.
+    assert_eq!(
+        env.read(&["list", "--limit", "0"]).await.status.code(),
+        Some(2)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_takes_a_folder_by_role_or_by_name() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let by_role = env.read(&["list", "--json", "--folder", "sent"]).await;
+    let by_name = env.read(&["list", "--json", "--folder", "Sent"]).await;
+    let own = env.read(&["list", "--json", "--folder", "Projects"]).await;
+
+    assert_eq!(listed(&by_role), [in_alice("Sent", 1)]);
+    assert_eq!(listed(&by_name), [in_alice("Sent", 1)]);
+    // Newest first: Plan 10 (UID 9), then Plan 9 (UID 5).
+    assert_eq!(
+        listed(&own),
+        [in_alice("Projects", 9), in_alice("Projects", 5)]
+    );
+    // The inbox, by its name as well.
+    let inbox = env.read(&["list", "--json", "--folder", "INBOX"]).await;
+    assert_eq!(listed(&inbox).len(), 7);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_of_a_folder_that_does_not_exist_is_an_error() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let output = env.read(&["list", "--folder", "Nowhere"]).await;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("no folder Nowhere"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_of_several_accounts_merges_their_inboxes_or_takes_one() {
+    let env = Env::filled_with(vec![("alice", alice()), ("bob", bob())]).await;
+
+    let both = env.read(&["list", "--json", "--limit", "3"]).await;
+    let only_bob = env.read(&["list", "--json", "--account", "bob"]).await;
+    let sent = env.read(&["list", "--json", "--folder", "sent"]).await;
+
+    // Bob's Plan 11 (09:11) comes between alice's message without a Date and her Plan 6.
+    assert_eq!(
+        listed(&both),
+        [
+            in_alice("INBOX", 7),
+            ("bob".to_owned(), "INBOX".to_owned(), 1),
+            in_alice("INBOX", 6)
+        ]
+    );
+    assert_eq!(
+        listed(&only_bob),
+        [("bob".to_owned(), "INBOX".to_owned(), 1)]
+    );
+    // Bob has no Sent folder: that is not an error while another account has one.
+    assert_eq!(listed(&sent), [in_alice("Sent", 1)]);
+    let nobody = env.read(&["list", "--account", "nobody"]).await;
+    assert_eq!(nobody.status.code(), Some(1));
+    assert!(
+        stderr(&nobody).contains("no account nobody"),
+        "{}",
+        stderr(&nobody)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_says_it_in_words_too() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let output = env.read(&["list", "--limit", "7"]).await;
+
+    succeeded(&output);
+    let text = stdout(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 7, "{text}");
+    let id = inbox_id(&env, 2).await;
+    // The identifier, four flags (u unread, f flagged, a answered, @ attachments; a dot for
+    // none), the date in UTC, the first sender and the subject, separated by tabs.
+    let line = lines.iter().find(|l| l.starts_with(&id)).unwrap();
+    let columns: Vec<&str> = line.split('\t').collect();
+    assert_eq!(
+        columns[1..],
+        ["ufa.", "2026-10-17 07:02 UTC", "Carol Sender", "Plan 2"]
+    );
+    let with = lines.iter().find(|l| l.ends_with("Plan 3")).unwrap();
+    assert_eq!(with.split('\t').nth(1), Some("u..@"));
+    // The message that is none has no subject and no sender.
+    assert!(lines[0].ends_with("\t(no subject)"), "{}", lines[0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_a_text_only_message() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let message = show(&env, 1).await;
+
+    assert_eq!(message["id"], inbox_id(&env, 1).await);
+    assert_eq!(message["account"], "alice");
+    assert_eq!(message["folder"]["role"], "inbox");
+    assert_eq!(message["uid"], 1);
+    assert_eq!(message["subject"], "Plan 1");
+    assert_eq!(message["date"], 1_792_220_460);
+    assert_eq!(
+        message["from"],
+        json!([{ "name": "Carol Sender", "address": SENDER }])
+    );
+    assert_eq!(
+        message["to"],
+        json!([{ "name": "Dave Recipient", "address": RECIPIENT }])
+    );
+    assert_eq!(message["cc"], json!([]));
+    assert_eq!(message["reply_to"], json!([]));
+    assert_eq!(message["message_id"], "1@example.com");
+    assert_eq!(message["unread"], false);
+    assert_eq!(message["text"], "Nothing special.\r\n");
+    assert_eq!(message["html"], Value::Null);
+    assert_eq!(message["attachments"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_a_message_with_only_html_gives_it_as_written_and_prints_it_as_text() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let message = show(&env, 4).await;
+    let id = inbox_id(&env, 4).await;
+    let words = env.read(&["show", &id]).await;
+
+    // The HTML is the sender's, tags and script included; nothing interprets it.
+    let html = message["html"].as_str().unwrap();
+    assert!(
+        html.contains("<script>alert('never run')</script>"),
+        "{html}"
+    );
+    assert!(html.contains("<b>Quokka</b>"), "{html}");
+    // No text part: the JSON does not make one up.
+    assert_eq!(message["text"], Value::Null);
+    // For people, the HTML as text: no tag, no style, no script, and the paragraphs stay apart.
+    // The address a link goes to stays in the HTML of the JSON; the text has the link's words.
+    succeeded(&words);
+    // After the headers.
+    let text = stdout(&words).split_once("\n\n").unwrap().1.to_owned();
+    assert!(text.contains("The Quokka waits."), "{text}");
+    assert!(text.contains("Second paragraph."), "{text}");
+    assert!(!text.contains('<'), "{text}");
+    assert!(!text.contains("color: red"), "{text}");
+    assert!(!text.contains("never run"), "{text}");
+    assert!(text.contains("read it"), "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.contains("Quokka waits") && !l.contains("Second paragraph")),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_a_message_in_two_versions_gives_both_and_prints_the_text() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let message = show(&env, 5).await;
+    let id = inbox_id(&env, 5).await;
+    let words = env.read(&["show", &id]).await;
+
+    // The line break before a boundary belongs to the boundary.
+    assert_eq!(message["text"], "Plain version.");
+    assert_eq!(message["html"], "<p>HTML <b>version</b>.</p>");
+    assert_eq!(
+        message["cc"],
+        json!([{ "name": "Erin Copy", "address": "erin.copy@example.org" }])
+    );
+    assert_eq!(
+        message["reply_to"],
+        json!([{ "name": "Carol Elsewhere", "address": "carol.elsewhere@example.com" }])
+    );
+    assert_eq!(message["attachments"], json!([]));
+    // The text version, not the HTML turned into text.
+    succeeded(&words);
+    let text = stdout(&words);
+    assert!(text.contains("Plain version."), "{text}");
+    assert!(!text.contains("HTML"), "{text}");
+    // The headers come first, then a blank line.
+    assert!(text.starts_with("From: Carol Sender <"), "{text}");
+    assert!(
+        text.contains("\nCc: Erin Copy <erin.copy@example.org>\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\nReply-To: Carol Elsewhere <carol.elsewhere@example.com>\n"),
+        "{text}"
+    );
+    assert!(text.contains("\nSubject: Plan 5\n"), "{text}");
+    assert!(text.contains("\nDate: 2026-10-17 07:05 UTC\n"), "{text}");
+    assert!(
+        text.contains("\nMessage-ID: 5@example.com\n\nPlain version."),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_a_message_with_an_attachment_lists_it() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let message = show(&env, 3).await;
+    let id = inbox_id(&env, 3).await;
+    let words = env.read(&["show", &id]).await;
+
+    assert_eq!(message["text"], "The report is attached.");
+    // The part's number in the message (0 is the multipart itself, 1 the text), its decoded size.
+    assert_eq!(
+        message["attachments"],
+        json!([{
+            "name": "report.pdf",
+            "media_type": "application/pdf",
+            "size": 12,
+            "part": 2
+        }])
+    );
+    succeeded(&words);
+    assert!(
+        stdout(&words).contains("\nAttachments: report.pdf (application/pdf, 12 bytes)\n"),
+        "{}",
+        stdout(&words)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_a_message_in_another_charset_decodes_it() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    let message = show(&env, 6).await;
+    let id = inbox_id(&env, 6).await;
+    let words = env.read(&["show", &id]).await;
+
+    assert_eq!(message["subject"], "Café");
+    assert_eq!(message["text"], "Un café crème, s'il vous plaît.\r\n");
+    assert!(
+        stdout(&words).contains("Un café crème, s'il vous plaît."),
+        "{}",
+        stdout(&words)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_a_malformed_message_prints_what_can_be_read() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    let id = inbox_id(&env, 7).await;
+
+    let as_json = env.read(&["show", "--json", &id]).await;
+    let words = env.read(&["show", &id]).await;
+
+    let message = json(&as_json);
+    assert_eq!(message["uid"], 7);
+    assert_eq!(message["subject"], Value::Null);
+    assert_eq!(message["from"], json!([]));
+    assert_eq!(message["attachments"], json!([]));
+    assert_eq!(message["unread"], true);
+    // It did not panic, and the command did not fail: it prints a message without headers.
+    succeeded(&words);
+    assert!(
+        stdout(&words).contains("Subject: (no subject)"),
+        "{}",
+        stdout(&words)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_raw_gives_back_the_exact_bytes_stored() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+
+    for (uid, expected) in [(7_u64, MALFORMED.to_vec()), (6, latin1_raw())] {
+        let id = inbox_id(&env, uid).await;
+        let output = env.read(&["show", "--raw", &id]).await;
+        succeeded(&output);
+        assert_eq!(output.stdout, expected, "message {uid}");
+        assert_eq!(stderr(&output), "");
+    }
+    // The one or the other, not both.
+    let id = inbox_id(&env, 1).await;
+    let both = env.read(&["show", "--raw", "--json", &id]).await;
+    assert_eq!(both.status.code(), Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_does_not_print_the_control_characters_of_a_message_on_a_terminal() {
+    let escape = Message::new(format!(
+        "From: Carol Sender <{SENDER}>\r\nSubject: Plan\x1b[31m 12\r\n\
+         Date: Sat, 17 Oct 2026 09:12:00 +0200\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Transfer-Encoding: 8bit\r\n\r\nLine one\x1b]0;owned\x07\r\nLine\ttwo\r\n"
+    ));
+    let env = Env::filled_with(vec![(
+        "alice",
+        FakeServer::builder()
+            .user(USER, PASSWORD)
+            .folder(Folder::new("INBOX").message(escape)),
+    )])
+    .await;
+    let id = inbox_id(&env, 1).await;
+
+    let output = env.read(&["show", &id]).await;
+
+    succeeded(&output);
+    let text = stdout(&output);
+    assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text:?}");
+    assert!(text.contains("Line one"), "{text:?}");
+    // A tab and the line breaks are text.
+    assert!(text.contains("Line\ttwo"), "{text:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identifier_that_names_nothing_is_not_found_with_its_own_exit_code() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    let id = inbox_id(&env, 1).await;
+    let parts: Vec<&str> = id.split('/').collect();
+    let (folder, uidvalidity) = (parts[1], parts[2]);
+
+    for (what, wrong) in [
+        ("an unknown UID", format!("alice/{folder}/{uidvalidity}/99")),
+        ("an unknown folder", format!("alice/999/{uidvalidity}/1")),
+        (
+            "an unknown account",
+            format!("carol/{folder}/{uidvalidity}/1"),
+        ),
+        ("a changed UIDVALIDITY", format!("alice/{folder}/1/1")),
+        ("not an identifier", "alice/1".to_owned()),
+        (
+            "a number with a sign",
+            format!("alice/{folder}/{uidvalidity}/+1"),
+        ),
+        (
+            "a number with a zero",
+            format!("alice/{folder}/{uidvalidity}/01"),
+        ),
+        ("a fifth part", format!("{id}/1")),
+        ("no account", format!("/{folder}/{uidvalidity}/1")),
+    ] {
+        for flags in [&["show"][..], &["show", "--json"], &["show", "--raw"]] {
+            let mut args = flags.to_vec();
+            args.push(&wrong);
+            let output = env.read(&args).await;
+            assert_eq!(output.status.code(), Some(3), "{what}: {wrong}");
+            assert_eq!(stdout(&output), "", "{what}");
+            assert!(
+                stderr(&output).starts_with("missive: "),
+                "{what}: {}",
+                stderr(&output)
+            );
+        }
+    }
+    // Same folder and UID, other account: not that message.
+    let bob = env
+        .read(&["show", &format!("bob/{folder}/{uidvalidity}/1")])
+        .await;
+    assert_eq!(bob.status.code(), Some(3));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identifier_from_before_the_server_renumbered_the_folder_is_stale() {
+    let server = alice().start().await;
+    let env = Env::new().await;
+    env.add_account("alice", &server).await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    succeeded(&env.sync().await);
+    let id = inbox_id(&env, 1).await;
+    succeeded(&env.read(&["show", &id]).await);
+
+    server.bump_uidvalidity("INBOX");
+    succeeded(&env.sync().await);
+
+    // UID 1 is there again, under the new UIDVALIDITY: the old identifier must not show it.
+    let output = env.read(&["show", &id]).await;
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        stderr(&output).contains("renumbered"),
+        "{}",
+        stderr(&output)
+    );
+    let fresh = inbox_id(&env, 1).await;
+    assert_ne!(fresh, id);
+    succeeded(&env.read(&["show", &fresh]).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_of_a_removed_account_is_not_found_and_not_listed() {
+    let env = Env::filled_with(vec![("alice", alice()), ("bob", bob())]).await;
+    let id = inbox_id(&env, 1).await;
+    succeeded(&env.read(&["show", &id]).await);
+    AccountStore::new(env.path("config").join("missive"))
+        .remove("alice")
+        .unwrap();
+
+    let output = env.read(&["show", &id]).await;
+    let list = env.read(&["list", "--json", "--limit", "100"]).await;
+
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(listed(&list), [("bob".to_owned(), "INBOX".to_owned(), 1)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_and_show_with_no_copy_yet_say_so() {
+    let env = Env::new().await;
+
+    let list = env.read(&["list", "--json"]).await;
+    let show = env.read(&["show", "alice/1/1/1"]).await;
+
+    assert_eq!(json(&list), json!([]));
+    assert!(
+        stderr(&list).contains("no local copy yet"),
+        "{}",
+        stderr(&list)
+    );
+    assert_eq!(show.status.code(), Some(3));
+    assert!(
+        stderr(&show).contains("no local copy yet"),
+        "{}",
+        stderr(&show)
+    );
+    assert!(!env.copy_path().exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_made_before_the_attachment_marker_is_listed_after_the_daemon_has_started() {
+    let env = Env::new().await;
+    let server = alice().start().await;
+    env.add_account("alice", &server).await;
+    // A copy of version 2 as the previous build left it, with one message.
+    std::fs::create_dir_all(env.copy_path().parent().unwrap()).unwrap();
+    {
+        let connection = rusqlite::Connection::open(env.copy_path()).unwrap();
+        connection
+            .execute_batch(include_str!("../../missive-core/src/store/schema-1.sql"))
+            .unwrap();
+        connection
+            .execute_batch(include_str!("../../missive-core/src/store/schema-2.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO account (key, id, state) VALUES (1, 'alice', 'ready');
+                 INSERT INTO folder (id, account, name, role, uidvalidity)
+                     VALUES (1, 1, 'INBOX', 'inbox', 7);
+                 INSERT INTO message (id, folder, uid, flags, size, sender, recipients, cc)
+                     VALUES (1, 1, 1, '', 10, '[]', '[]', '[]');
+                 INSERT INTO message_raw (message, raw) VALUES (1, x'41');",
+            )
+            .unwrap();
+    }
+
+    let list = env.read(&["list"]).await;
+    let show = env.read(&["show", "alice/1/7/1"]).await;
+
+    assert_eq!(list.status.code(), Some(1));
+    assert!(
+        stderr(&list).contains("no attachment marker yet"),
+        "{}",
+        stderr(&list)
+    );
+    // `show` reads the raw message and needs no marker.
+    succeeded(&show);
+    let mut daemon = env.daemon(&["--check-interval", "3600"]).await;
+    daemon.stop().await;
+    succeeded(&env.read(&["list"]).await);
 }

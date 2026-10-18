@@ -6,7 +6,7 @@
 //! is ever held across a wait on the network: a process killed at any point leaves a copy that is
 //! whole as of its last commit.
 //!
-//! The schema, version 2 (`PRAGMA user_version`). Version 1 is the copy itself:
+//! The schema, version 3 (`PRAGMA user_version`). Version 1 is the copy itself:
 //!
 //! ```sql
 #![doc = include_str!("store/schema-1.sql")]
@@ -18,6 +18,12 @@
 //!
 //! ```sql
 #![doc = include_str!("store/schema-2.sql")]
+//! ```
+//!
+//! Version 3 adds whether a message has an attachment, which `missive list` shows for each row:
+//!
+//! ```sql
+#![doc = include_str!("store/schema-3.sql")]
 //! ```
 //!
 //! The index is contentless: it keeps the words and where they are, not the text, so a message
@@ -36,12 +42,13 @@ use serde::Serialize;
 
 /// The schema version this build writes. A copy written by a later version is refused rather
 /// than misread.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Each step brings the schema from the version before it: `MIGRATIONS[0]` from nothing to 1.
 const MIGRATIONS: &[&str] = &[
     include_str!("store/schema-1.sql"),
     include_str!("store/schema-2.sql"),
+    include_str!("store/schema-3.sql"),
 ];
 
 /// The local copy, opened for writing.
@@ -236,8 +243,8 @@ fn insert(transaction: &Transaction, folder: i64, message: &NewMessage) -> rusql
     };
     let mut statement = transaction.prepare_cached(
         "INSERT INTO message (folder, uid, flags, internal_date, size, date, subject, sender,
-             recipients, cc, message_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             recipients, cc, message_id, has_attachments)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT (folder, uid) DO UPDATE SET flags = excluded.flags
          RETURNING id",
     )?;
@@ -256,6 +263,7 @@ fn insert(transaction: &Transaction, folder: i64, message: &NewMessage) -> rusql
             mailboxes(parsed.and_then(|m| m.to())),
             mailboxes(parsed.and_then(|m| m.cc())),
             parsed.and_then(|m| m.message_id()),
+            parsed.is_some_and(|m| m.attachment_count() > 0),
         ],
         |r| r.get(0),
     )?;
@@ -324,6 +332,26 @@ fn index_existing(transaction: &Transaction) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Marks the messages a copy of version 2 already holds that have an attachment.
+fn mark_attachments(transaction: &Transaction) -> rusqlite::Result<()> {
+    let mut statement =
+        transaction.prepare("SELECT message, raw FROM message_raw ORDER BY message")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let raw: Vec<u8> = row.get(1)?;
+        if MessageParser::default()
+            .parse(&raw)
+            .is_some_and(|m| m.attachment_count() > 0)
+        {
+            transaction.execute(
+                "UPDATE message SET has_attachments = 1 WHERE id = ?1",
+                [row.get::<_, i64>(0)?],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn migrate(connection: &mut Connection) -> rusqlite::Result<()> {
     let transaction = connection.transaction()?;
     let version: i64 = transaction.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -337,6 +365,9 @@ fn migrate(connection: &mut Connection) -> rusqlite::Result<()> {
         transaction.execute_batch(step)?;
         if index == 1 {
             index_existing(&transaction)?;
+        }
+        if index == 2 {
+            mark_attachments(&transaction)?;
         }
         transaction.pragma_update(None, "user_version", index as i64 + 1)?;
     }
@@ -383,6 +414,81 @@ mod tests {
         assert_eq!(mode, "wal");
         // Opening it again changes nothing.
         drop(Store::open(&dir.path().join("copy.sqlite")).unwrap());
+    }
+
+    #[test]
+    fn a_copy_of_version_2_gets_the_attachment_marker_of_the_messages_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy.sqlite");
+        let plain = message(1, "").raw;
+        let attached = b"From: Carol <carol@example.com>\r\nSubject: A\r\nMIME-Version: 1.0\r\n\
+            Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\n\
+            Content-Type: text/plain\r\n\r\nHi\r\n--b\r\n\
+            Content-Type: application/pdf; name=\"a.pdf\"\r\n\
+            Content-Disposition: attachment; filename=\"a.pdf\"\r\n\r\nPDF\r\n--b--\r\n"
+            .to_vec();
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(MIGRATIONS[0]).unwrap();
+            connection.execute_batch(MIGRATIONS[1]).unwrap();
+            connection.pragma_update(None, "user_version", 2).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO account (key, id, state) VALUES (1, 'alice', 'ready');
+                     INSERT INTO folder (id, account, name) VALUES (1, 1, 'INBOX');
+                     INSERT INTO message (id, folder, uid, flags, size, sender, recipients, cc)
+                         VALUES (1, 1, 1, '', 1, '[]', '[]', '[]'), (2, 1, 2, '', 1, '[]', '[]', '[]');",
+                )
+                .unwrap();
+            for (id, raw) in [(1, &plain), (2, &attached)] {
+                connection
+                    .execute(
+                        "INSERT INTO message_raw (message, raw) VALUES (?1, ?2)",
+                        params![id, raw],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let store = Store::open(&path).unwrap();
+
+        let marks: Vec<(i64, bool)> = store
+            .connection
+            .prepare("SELECT id, has_attachments FROM message ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(marks, [(1, false), (2, true)]);
+    }
+
+    #[test]
+    fn a_message_written_says_whether_it_has_an_attachment() {
+        let (_dir, mut store) = open();
+        let account = store.account("alice").unwrap();
+        let folder = store.folder(account, "INBOX", Some("inbox")).unwrap();
+        let mut attached = message(2, "");
+        attached.raw = b"Subject: A\r\nMIME-Version: 1.0\r\n\
+            Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\n\
+            Content-Type: text/plain\r\n\r\nHi\r\n--b\r\n\
+            Content-Type: application/pdf\r\nContent-Disposition: attachment; filename=a.pdf\r\n\
+            \r\nPDF\r\n--b--\r\n"
+            .to_vec();
+
+        store
+            .insert(folder.id, &[message(1, ""), attached])
+            .unwrap();
+
+        let marks: Vec<bool> = store
+            .connection
+            .prepare("SELECT has_attachments FROM message ORDER BY uid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(marks, [false, true]);
     }
 
     #[test]
