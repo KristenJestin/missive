@@ -390,7 +390,7 @@ pub fn outbox(json: bool) -> Result<()> {
             message.outbox,
             message.account,
             message.state,
-            utc(message.queued_at),
+            local_time(message.queued_at),
             message.last_error.as_deref().unwrap_or("")
         );
     }
