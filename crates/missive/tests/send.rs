@@ -913,17 +913,11 @@ async fn without_a_sent_folder_the_event_says_so_and_no_folder_is_created() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn compose_without_send_checks_the_message_and_says_drafts_come_later() {
+async fn what_cannot_be_sent_is_refused_before_the_daemon() {
     let server = mailbox().start().await;
     let env = Env::new().await;
     env.add_account(&Setup::of(&server)).await;
 
-    let checked = env
-        .run(&["compose", "--to", RECIPIENT, "--body", BODY])
-        .await;
-    failed(&checked);
-    assert!(stderr(&checked).contains("drafts"), "{}", stderr(&checked));
-    assert!(stderr(&checked).contains("--send"), "{}", stderr(&checked));
     let invalid = env
         .run(&["compose", "--send", "--to", "not an address"])
         .await;

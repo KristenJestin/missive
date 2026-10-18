@@ -45,6 +45,7 @@ async fn two_workers_on_the_same_account_deliver_its_message_once() {
                 bcc_header: None,
             },
             false,
+            None,
         )
         .unwrap();
     let account = account(&fake);

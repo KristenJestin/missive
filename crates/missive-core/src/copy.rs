@@ -49,6 +49,9 @@ const SKIPPED_VERSION: i64 = 5;
 /// The first schema version that has the outbox.
 const OUTBOX_VERSION: i64 = 6;
 
+/// The first schema version that has the drafts waiting for the server.
+const DRAFTS_VERSION: i64 = 7;
+
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +159,22 @@ pub struct Outgoing {
     /// When it was written, in seconds since the epoch.
     pub queued_at: i64,
     /// The tries that failed before the end of data.
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+/// A draft of an account kept in the local copy until the server holds it, as `missive status`
+/// shows it: never its content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WaitingDraft {
+    /// Its Message-ID, which names it.
+    pub id: String,
+    /// `waiting` (to write to the Drafts folder), `removing` (its message was sent; to remove
+    /// from the Drafts folder) or `no-drafts-folder` (the account has none: it stays in the copy).
+    pub state: String,
+    /// When its version was saved, in seconds since the epoch.
+    pub saved_at: i64,
+    /// The tries that failed, and the last error.
     pub attempts: u32,
     pub last_error: Option<String>,
 }
@@ -435,6 +454,42 @@ impl Copy {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The drafts of an account kept in the copy until the server holds them, oldest first;
+    /// empty in a copy older than the drafts.
+    pub fn drafts(&self, account: &str) -> Result<Vec<WaitingDraft>> {
+        if self.version < DRAFTS_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare_cached(
+            "SELECT draft.message_id, draft.raw IS NULL, draft.saved_at, draft.attempts,
+                    draft.last_error,
+                    EXISTS (SELECT 1 FROM folder WHERE folder.account = account.key
+                                                   AND folder.role = 'drafts'),
+                    EXISTS (SELECT 1 FROM folder WHERE folder.account = account.key)
+               FROM draft JOIN account ON account.key = draft.account
+              WHERE account.id = ?1 ORDER BY draft.id",
+        )?;
+        let rows = statement.query_map([account], |r| {
+            let (removing, has_drafts, knows_folders): (bool, bool, bool) =
+                (r.get(1)?, r.get(5)?, r.get(6)?);
+            let state = if knows_folders && !has_drafts {
+                "no-drafts-folder"
+            } else if removing {
+                "removing"
+            } else {
+                "waiting"
+            };
+            Ok(WaitingDraft {
+                id: r.get(0)?,
+                state: state.to_owned(),
+                saved_at: r.get(2)?,
+                attempts: r.get(3)?,
+                last_error: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The unread messages of every folder of every account: those without `\Seen`, and not
     /// marked `\Deleted` (they wait for an expunge). A flag is matched as a whole word. The
     /// counts of [`FolderUnread::counted`] folders are the ones that add up in a total.
@@ -515,10 +570,19 @@ impl Copy {
     }
 
     /// The messages of the folders `list` names, newest first (`Date`, else the internal date).
+    /// A draft waiting for the server is listed in its account's Drafts folder, under its
+    /// Message-ID (it has no UID yet), in place of the older versions the folder holds.
     pub fn list(&self, list: &List) -> Result<Vec<Listed>> {
         if self.version < ATTACHMENTS_VERSION {
             return Err(CopyError::NoAttachmentMarker);
         }
+        let older = if self.version >= DRAFTS_VERSION {
+            "AND (home.role IS NOT 'drafts' OR message.message_id IS NULL
+                  OR NOT EXISTS (SELECT 1 FROM draft WHERE draft.account = home.account
+                                    AND draft.message_id = message.message_id))"
+        } else {
+            ""
+        };
         let accounts = serde_json::to_string(&list.accounts).expect("strings serialize");
         let mut statement = self.connection.prepare_cached(&format!(
             "SELECT {HIT_COLUMNS}, message.size, message.has_attachments
@@ -527,6 +591,7 @@ impl Copy {
                 AND (?2 IS NULL AND ?3 IS NULL OR folder.role = ?2 OR folder.name = ?3)
                 AND (NOT ?4 OR (' ' || message.flags || ' ' NOT LIKE '% \\Seen %'
                             AND ' ' || message.flags || ' ' NOT LIKE '% \\Deleted %'))
+                {older}
               ORDER BY coalesce(message.date, message.internal_date) DESC, message.id DESC
               LIMIT ?5",
             self.from()
@@ -551,7 +616,59 @@ impl Copy {
                 })
             },
         )?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut listed: Vec<Listed> = rows.collect::<rusqlite::Result<_>>()?;
+        // Drafts are seen: an unread list has none.
+        if self.version < DRAFTS_VERSION || list.unread {
+            return Ok(listed);
+        }
+        let mut statement = self.connection.prepare_cached(
+            "SELECT account.id, folder.id, folder.name, folder.role, draft.message_id,
+                    coalesce(draft.date, draft.saved_at), draft.subject, draft.sender,
+                    draft.recipients, length(draft.raw), draft.has_attachments
+               FROM draft
+               JOIN account ON account.key = draft.account
+               JOIN folder ON folder.id = (SELECT id FROM folder
+                                            WHERE folder.account = draft.account
+                                              AND folder.role = 'drafts' ORDER BY id LIMIT 1)
+              WHERE draft.raw IS NOT NULL AND account.id IN (SELECT value FROM json_each(?1))
+                AND (?2 IS NULL AND ?3 IS NULL OR folder.role = ?2 OR folder.name = ?3)",
+        )?;
+        let rows =
+            statement.query_map(params![accounts, text(&list.role), text(&list.name)], |r| {
+                let people = |column: usize| -> rusqlite::Result<Vec<Person>> {
+                    let json: String = r.get(column)?;
+                    Ok(serde_json::from_str(&json).unwrap_or_default())
+                };
+                Ok(Listed {
+                    hit: Hit {
+                        id: r.get(4)?,
+                        account: r.get(0)?,
+                        folder: FolderRef {
+                            id: r.get(1)?,
+                            name: r.get(2)?,
+                            role: r.get(3)?,
+                        },
+                        uidvalidity: None,
+                        uid: 0,
+                        date: r.get(5)?,
+                        subject: r.get(6)?,
+                        from: people(7)?,
+                        to: people(8)?,
+                        unread: false,
+                    },
+                    flagged: false,
+                    answered: false,
+                    size: r.get::<_, i64>(9)? as u64,
+                    has_attachments: r.get(10)?,
+                })
+            })?;
+        for row in rows {
+            listed.push(row?);
+        }
+        // Stable: the order of the copy's rows stays among equal dates.
+        listed.sort_by_key(|listed| std::cmp::Reverse(listed.hit.date));
+        listed.truncate(list.limit);
+        Ok(listed)
     }
 
     /// The message an identifier names, with its raw message. Whether the identifier is one, and

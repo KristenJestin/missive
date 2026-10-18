@@ -437,7 +437,8 @@ pub struct CopyUid {
 /// How a command ended, as the tagged answer said.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Done {
-    /// With the `COPYUID` of the tagged answer, when it had one.
+    /// With the `COPYUID` of the tagged answer, when it had one; for an `APPEND`, its
+    /// `APPENDUID`, as a copy from UID 0 ([`appended`]).
     Ok(Option<CopyUid>),
     /// With whether the server said the folder named does not exist (`TRYCREATE`).
     No {
@@ -555,7 +556,28 @@ pub(crate) fn copy_uid(response: &Response<'_>) -> Option<CopyUid> {
 /// huge range is not followed.
 const COPYUID_MAX: usize = 100_000;
 
+/// The UIDVALIDITY and the UID an `APPEND` answered with `APPENDUID` (RFC 4315).
+pub(crate) fn appended(done: &Done) -> Option<(u32, u32)> {
+    match done {
+        Done::Ok(Some(CopyUid { uidvalidity, pairs })) => match pairs[..] {
+            [(0, uid)] => Some((*uidvalidity, uid)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn copy_uid_code(code: &ResponseCode<'_>) -> Option<CopyUid> {
+    // One message is appended at a time: its UID, as a pair from UID 0, which no message has.
+    if let ResponseCode::AppendUid(uidvalidity, set) = code {
+        return match set[..] {
+            [UidSetMember::Uid(uid)] => Some(CopyUid {
+                uidvalidity: *uidvalidity,
+                pairs: vec![(0, uid)],
+            }),
+            _ => None,
+        };
+    }
     let ResponseCode::CopyUid(uidvalidity, from, to) = code else {
         return None;
     };

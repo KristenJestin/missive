@@ -7,6 +7,7 @@ pub mod body;
 pub mod compose;
 pub mod connect;
 pub mod copy;
+pub mod drafts;
 pub mod events;
 #[cfg(feature = "fake")]
 pub mod fake;

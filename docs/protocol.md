@@ -58,8 +58,8 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `no-trash` | a `delete` without `permanently`, in an account that has no trash |
 | `in-trash` | a `delete` without `permanently` of a message already in the trash |
 | `not-in-trash` | a `delete` with `permanently` of a message outside the trash, in an account that has one |
-| `busy` | a message whose move waits for the server: it takes no other action until then |
-| `bad-request` (`send`) | also: the message cannot be sent as written (`message` says why: no recipient, an address that is not one…) |
+| `busy` | a message whose move waits for the server: it takes no other action until then; or a `draft` naming a draft whose message waits in the outbox |
+| `bad-request` (`send`, `draft`) | also: the message cannot be sent as written (`message` says why: no recipient, an address that is not one…) |
 | `failed` | the daemon could not do it: it is stopping, an account's sync could not write the local copy (`message` names the account), the local copy could not be written, or the connection is already subscribed |
 
 ## Requests
@@ -141,6 +141,40 @@ in the local copy, and answers: nothing waits for the server.
 `outbox` is the message's number in the outbox, which the `sent`, `send-failed` and
 `send-uncertain` events (`docs/events.md`) name it by; `message_id` is its `Message-ID`, without
 angle brackets.
+
+### `draft`
+
+Saves a draft: a new one, or a new version of the draft `draft` names. With `send`, sends it too.
+
+```json
+{"protocol": 1, "request": "draft", "account": "alice", "draft": "4b2e…@example.org",
+ "subject": "Les comptes, version 2"}
+```
+
+| Field | | |
+|---|---|---|
+| `account` | string | the account's identifier |
+| `draft` | string, absent for a new draft | the draft to pick up again: its identifier (its `Message-ID`), or the identifier of a message of the account's Drafts folder, as `list` prints it |
+| `to`, `cc`, `bcc`, `subject`, `body`, `attachments` | as for `send`, each absent to keep the draft's own | the fields that replace the draft's; for a new draft, those absent are empty. No recipient is needed |
+| `send` | boolean, `false` when absent | send the draft, as it is once changed (at least one recipient then); it is removed from the Drafts folder once the server took the message |
+
+The daemon saves the draft in the local copy (and, with `send`, puts the message in the outbox),
+and answers: nothing waits for the server. It then writes the draft to the account's Drafts
+folder (see `missive compose` in `docs/cli.md`); the `draft` events (`docs/events.md`) tell how
+it went.
+
+```json
+{"protocol": 1, "answer": "draft", "ok": true, "message_id": "4b2e…@example.org"}
+```
+
+`message_id` is the draft's identifier, its `Message-ID` without angle brackets, the same for
+every version of the draft. With `send`, the answer also has `outbox`, as for `send`. A `draft`
+that names no draft of the account is answered `no-such-message`.
+
+A `draft` naming a draft another client wrote (one without Missive's `X-Missive-Draft` header)
+does not replace it: the daemon makes a new draft from it, under a new `message_id`, and the
+answer also has `kept`, the `draft` given, which stays on the server as it is (and is not removed
+once the message is sent).
 
 ### `subscribe`
 

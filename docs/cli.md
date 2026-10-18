@@ -183,7 +183,8 @@ When there is no copy yet (no daemon has run), they say so on standard error
 ### `missive status [--json]`
 
 Each account's connection state, its last complete sync, whether a sync is running, the
-number of messages in the copy and what its outbox holds; and whether the daemon runs.
+number of messages in the copy, what its outbox holds and the drafts the copy keeps; and whether
+the daemon runs.
 
 ```json
 {
@@ -194,9 +195,13 @@ number of messages in the copy and what its outbox holds; and whether the daemon
       "outbox": [
         { "id": 3, "state": "failed", "message_id": "9c1f…@example.org", "queued_at": 1792220100,
           "attempts": 0, "last_error": "the server answered 550 to RCPT TO" }
+      ],
+      "drafts": [
+        { "id": "4b2e…@example.org", "state": "waiting", "saved_at": 1792220300, "attempts": 0,
+          "last_error": null }
       ] },
     { "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0,
-      "skipped": [], "outbox": [] }
+      "skipped": [], "outbox": [], "drafts": [] }
   ]
 }
 ```
@@ -219,6 +224,12 @@ number of messages in the copy and what its outbox holds; and whether the daemon
 | `accounts[].outbox[].queued_at` | number | when it was written, in seconds since the epoch |
 | `accounts[].outbox[].attempts` | number | the tries that failed before the end of its data (tried again later) |
 | `accounts[].outbox[].last_error` | string or `null` | the last error, for people |
+| `accounts[].drafts` | array | the drafts the copy keeps until the server holds them, oldest first (see [Drafts](#drafts)) |
+| `accounts[].drafts[].id` | string | the draft's identifier (its `Message-ID`, without angle brackets), as `compose --json` printed it |
+| `accounts[].drafts[].state` | string | `waiting` (to write to the Drafts folder), `removing` (its message was sent: to remove from the Drafts folder) or `no-drafts-folder` (the account has no Drafts folder: the draft stays in the copy) |
+| `accounts[].drafts[].saved_at` | number | when its version was saved, in seconds since the epoch |
+| `accounts[].drafts[].attempts` | number | the tries that failed (tried again at the next pass) |
+| `accounts[].drafts[].last_error` | string or `null` | the last kind of error |
 
 `ready` does not mean the copy is complete: a folder the server refuses is skipped, the others are
 synced, and the account is `ready` all the same. `skipped` is what keeps that from being silent. It
@@ -244,7 +255,10 @@ bob	never synced	0 messages
 
 A line reads `unknown (the daemon is not running)` in the place of the state when `state` is
 `null` for the second reason above. An account whose outbox holds messages has a line more,
-`	outbox: 1 queued, 1 failed`, and one line for each failed or uncertain message, with why.
+`	outbox: 1 queued, 1 failed`, and one line for each failed or uncertain message, with why. An
+account whose drafts wait in the copy has a line more too, `	drafts: 1 to write to the Drafts
+folder` (or `kept in the local copy: the account has no Drafts folder`), and one line for each
+draft whose last try failed.
 
 ### `missive unread [--json]`
 
@@ -388,6 +402,10 @@ date). By default the inbox of each account, merged into one list, newest first.
 - A copy made before the attachment marker existed (by an earlier build) can be read by every
   other command but cannot be listed until the daemon has started once: `list` says so and
   fails.
+- A draft saved and not yet on the server (see [Drafts](#drafts)) is listed in its account's
+  Drafts folder at once: its `id` is the draft's identifier (its `Message-ID`, which
+  `compose --draft` takes), its `uid` is `0` and its `uidvalidity` `null`, and the older
+  versions of it the folder holds are not listed.
 
 ```json
 [
@@ -651,13 +669,13 @@ whose move waits, an account that is not configured.
 
 ## Sending
 
-### `missive compose [--account <id>] [--to <address>]… [--cc <address>]… [--bcc <address>]… [--subject <text>] [--body-file <path> | --body <text or ->] [--attach <path>]… --send [--json]`
+### `missive compose [--account <id>] [--draft <draft id>] [--to <address>]… [--cc <address>]… [--bcc <address>]… [--subject <text>] [--body-file <path> | --body <text or ->] [--attach <path>]… [--send] [--json]`
 
-Writes a message and, with `--send`, sends it. An address is `name@example.org` or
+Writes a message: saved as a draft, or with `--send` sent. An address is `name@example.org` or
 `Name <name@example.org>` (the name may be in any script; the address is ASCII). `--body -`
 reads the text from standard input; `--body-file` and `--body -` read UTF-8 text. Without a body
-the message has an empty text. The account is the only one configured, or the one `--account`
-names.
+the message has an empty text. The account is the only one configured, the one `--account`
+names, or the one of the message identifier `--draft` names.
 
 Each `--attach` file is read when the command runs, and goes into the message at once: changing
 or removing the file afterwards changes nothing. Its media type is guessed from its name
@@ -679,11 +697,57 @@ the outbox. With `--json`, one object:
 {"outbox": 3, "message_id": "9c1f…@example.org"}
 ```
 
-Without `--send`, the message is only checked (its addresses, its files) and the command fails,
-saying that saving drafts comes in a later version: nothing is written, no daemon is asked.
+Without `--send`, the message is saved as a **draft** (below), and needs no recipient. For people,
+one line says the draft is saved, with its identifier. With `--json`, one object:
 
-The exit status is 1 when the message cannot be sent as written: no recipient, an address that is
-not one, a file that cannot be read, an account that is not configured.
+```json
+{"id": "4b2e…@example.org"}
+```
+
+The exit status is 1 when the message cannot be written as asked: no recipient (with `--send`),
+an address that is not one, a file that cannot be read, an account that is not configured. It is
+3 when `--draft` names no draft.
+
+#### Drafts
+
+A draft is named by its identifier: its `Message-ID`, without angle brackets, which every version
+of the draft keeps (so that its versions are found again on the server, and a reply's thread
+stays whole); each version gets a new `Date`. `--draft` takes it, or the identifier `list` prints
+for a message of the Drafts folder (`missive list --folder drafts`), which is how a draft written
+by another client is picked up. The fields given replace those of the draft; the others are
+kept, its Bcc recipients and attachments included (`--attach` replaces every attachment). With
+`--send` the draft is sent as it is then, and it is removed from the Drafts folder **once the
+server took the message**: a message the server refuses (`failed`) or that may not have arrived
+(`uncertain`) keeps its draft. A draft whose message waits in the outbox cannot be changed or sent
+again until it is sent.
+
+Missive only ever replaces or removes a draft it wrote itself: its drafts carry an
+`X-Missive-Draft: 1` header (the message sent from one does not). A draft **another client
+wrote** is never changed or removed: picking it up makes a new draft, Missive's own, with a new
+identifier (which `--json` prints), and the original stays in the Drafts folder as it is, with
+`--send` or without; one line on standard error says so, and it is yours to delete there. What is
+picked up of a draft is its recipients, subject, text, attachments and the thread it answers
+(`In-Reply-To` and `References`): an HTML draft becomes text, and its other headers (`Reply-To`…)
+are not kept.
+
+The draft is saved in the local copy first, and the command returns at once, whether the server
+can be reached or not: `list --folder drafts` shows it at once. The daemon then writes it to the
+account's Drafts folder (the folder with the `drafts` role), as soon as the server can be
+reached:
+
+1. it looks for the versions the folder already holds, by `Message-ID` and Missive's own header
+   (`UID SEARCH`), one from a connection cut before the server answered included;
+2. it appends the new version, flagged `\Draft` and `\Seen`; the command counts as done only with
+   the server's `OK`;
+3. only then it removes the older versions, by their UIDs only (`UID STORE … +FLAGS.SILENT
+   (\Deleted)` then `UID EXPUNGE …`): a message another client marked deleted stays. A server
+   without UIDPLUS has no `UID EXPUNGE`: the older versions are then left in place, and the
+   `draft` event says so (`docs/events.md`). Missive never sends a bare `EXPUNGE`.
+
+When the server refuses the new version, the draft stays in the copy, the older version stays
+on the server, and it is tried again at the next pass (`status` shows it, the `draft` event
+tells it). An account without a Drafts folder keeps its drafts in the copy, and `status` says
+so: Missive never creates a folder on the server.
 
 #### The outbox
 

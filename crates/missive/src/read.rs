@@ -9,7 +9,7 @@ use clap::{Args, ValueEnum};
 use missive_core::account::{AccountStore, Listing};
 use missive_core::body::{self, Attachment};
 use missive_core::copy::{
-    Copy, FolderRef, Hit, List, NotFound, Outgoing, Person, Search, Stored, utc,
+    Copy, FolderRef, Hit, List, NotFound, Outgoing, Person, Search, Stored, WaitingDraft, utc,
 };
 use missive_core::protocol::pid_path;
 use missive_core::store::{SkippedFolder, Store};
@@ -190,6 +190,9 @@ struct AccountStatus {
     /// What waits in the outbox, or stays there: queued, sending, sent (its copy in Sent to
     /// write), failed and uncertain messages.
     outbox: Vec<Outgoing>,
+    /// The drafts kept in the local copy until the server holds them: to write, to remove (sent),
+    /// or kept there for good when the account has no Drafts folder.
+    drafts: Vec<WaitingDraft>,
     #[serde(skip)]
     in_copy: bool,
 }
@@ -204,15 +207,18 @@ pub fn status(json: bool) -> Result<()> {
     };
     let mut accounts = Vec::new();
     for id in configured {
-        let outbox = match &copy {
-            Some(copy) => copy.outbox(&id).map_err(|e| e.to_string())?,
-            None => Vec::new(),
+        let (outbox, drafts) = match &copy {
+            Some(copy) => (
+                copy.outbox(&id).map_err(|e| e.to_string())?,
+                copy.drafts(&id).map_err(|e| e.to_string())?,
+            ),
+            None => (Vec::new(), Vec::new()),
         };
-        accounts.push((id, outbox));
+        accounts.push((id, outbox, drafts));
     }
     let accounts: Vec<AccountStatus> = accounts
         .into_iter()
-        .map(|(id, outbox)| {
+        .map(|(id, outbox, drafts)| {
             let Some(row) = rows.iter().find(|row| row.id == id) else {
                 return AccountStatus {
                     id,
@@ -222,6 +228,7 @@ pub fn status(json: bool) -> Result<()> {
                     messages: 0,
                     skipped: Vec::new(),
                     outbox,
+                    drafts,
                     in_copy: false,
                 };
             };
@@ -236,6 +243,7 @@ pub fn status(json: bool) -> Result<()> {
                 messages: row.messages,
                 skipped: row.skipped.clone(),
                 outbox,
+                drafts,
                 in_copy: true,
             }
         })
@@ -302,6 +310,31 @@ pub fn status(json: bool) -> Result<()> {
                             .last_error
                             .as_deref()
                             .unwrap_or("no reason recorded")
+                    );
+                }
+            }
+        }
+        if !account.drafts.is_empty() {
+            let count = |state: &str| account.drafts.iter().filter(|d| d.state == state).count();
+            let mut parts = Vec::new();
+            for (state, text) in [
+                ("waiting", "to write to the Drafts folder"),
+                ("removing", "sent, to remove from the Drafts folder"),
+                (
+                    "no-drafts-folder",
+                    "kept in the local copy: the account has no Drafts folder",
+                ),
+            ] {
+                if count(state) > 0 {
+                    parts.push(format!("{} {text}", count(state)));
+                }
+            }
+            println!("\tdrafts: {}", parts.join(", "));
+            for draft in &account.drafts {
+                if let Some(error) = &draft.last_error {
+                    println!(
+                        "\t\tdraft {}: failed {} times ({error})",
+                        draft.id, draft.attempts
                     );
                 }
             }

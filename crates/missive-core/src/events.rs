@@ -49,6 +49,8 @@ pub enum Event {
     /// The connection was lost after a message's end of data, before the server's answer: it
     /// may have been sent, and is not sent again.
     SendUncertain(SendUncertain),
+    /// A draft was written to the Drafts folder, removed from it, or is tried again later.
+    Draft(DraftEvent),
     /// The watcher read too slowly: this many events were dropped for it.
     Lagged { missed: u64 },
     /// There is no daemon to listen to. Said by `missive watch`, never by the daemon.
@@ -103,6 +105,31 @@ pub struct ActionEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempts: Option<u32>,
     /// For `refused`: why, for people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// What became of a draft at the server (`docs/events.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftEvent {
+    pub account: String,
+    /// The draft's `Message-ID`, without angle brackets, as `missive compose --json` printed it.
+    pub draft: String,
+    /// `saved`, `removed` (its message was sent) or `retried`.
+    pub outcome: String,
+    /// For `saved`: the identifier of the version in the Drafts folder, when its UID is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// For `saved` and `removed`: how many older versions stay in the Drafts folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<usize>,
+    /// For `retried`: `refused` or `connection`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// For `retried`: how many times it failed so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// Why older versions stay, for people.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -386,6 +413,38 @@ mod tests {
         assert_eq!(
             uncertain.line(),
             r#"{"protocol":1,"event":"send-uncertain","account":"alice","outbox":7,"message_id":"1f@example.org","message":"lost"}"#
+        );
+    }
+
+    #[test]
+    fn the_draft_event_reads_as_documented() {
+        let saved = Event::Draft(DraftEvent {
+            account: "alice".to_owned(),
+            draft: "1f@example.org".to_owned(),
+            outcome: "saved".to_owned(),
+            id: Some("alice/3/7/2".to_owned()),
+            left: Some(0),
+            reason: None,
+            attempts: None,
+            message: None,
+        });
+        assert_eq!(
+            saved.line(),
+            r#"{"protocol":1,"event":"draft","account":"alice","draft":"1f@example.org","outcome":"saved","id":"alice/3/7/2","left":0}"#
+        );
+        let retried = Event::Draft(DraftEvent {
+            account: "alice".to_owned(),
+            draft: "1f@example.org".to_owned(),
+            outcome: "retried".to_owned(),
+            id: None,
+            left: None,
+            reason: Some("refused".to_owned()),
+            attempts: Some(2),
+            message: None,
+        });
+        assert_eq!(
+            retried.line(),
+            r#"{"protocol":1,"event":"draft","account":"alice","draft":"1f@example.org","outcome":"retried","reason":"refused","attempts":2}"#
         );
     }
 
