@@ -101,6 +101,9 @@ struct DaemonArgs {
     /// (and never more than 32 MiB of them, but for a single larger message).
     #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..=100))]
     batch_size: u64,
+    /// How long, in seconds, the server is given to answer each command of an action.
+    #[arg(long, value_name = "SECONDS", default_value_t = missive_core::actions::COMMAND_TIMEOUT.as_secs(), value_parser = clap::value_parser!(u64).range(1..), hide = true)]
+    action_timeout: u64,
 }
 
 #[derive(Subcommand)]
@@ -199,6 +202,7 @@ async fn main() -> ExitCode {
         Command::Daemon(args) => daemon::run(daemon::Options {
             check_interval: Duration::from_secs(args.check_interval),
             batch_size: args.batch_size as usize,
+            action_timeout: Duration::from_secs(args.action_timeout),
         })
         .await
         .map_err(Failure),

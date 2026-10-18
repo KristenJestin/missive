@@ -22,10 +22,12 @@
 //! - delete-permanently: `UID STORE <uids> +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE <uids>`;
 //!   refused without UIDPLUS, for the same reason.
 //!
-//! A `NO` leaves the action in the queue, tried again at the next pass, and the actions after it
-//! wait, so that they are applied in order; after [`MAX_ATTEMPTS`] it is refused. A cut
-//! connection leaves it in the queue as it is. A refusal that will not change (the folder was
-//! renumbered, the target does not exist, the server cannot move safely, a `BAD`) drops it and
+//! A `NO`, a cut connection, an answer the sync's reader cannot use or a command that gets no
+//! answer within its timeout leaves the action in the queue as it is, tried again at the next
+//! pass, and the actions after it wait, so that they are applied in order; after
+//! [`MAX_ATTEMPTS`] failures it is refused, so that an action that always fails does not hold the
+//! queue for ever. A refusal that will not change (the folder was renumbered, the target does not
+//! exist, the server cannot move safely, a `BAD` to the action's own command) drops it at once and
 //! takes its change back from the copy. A UID the server no longer has is not an error: the
 //! command changes nothing for it, and the next sync removes it from the copy.
 //!
@@ -35,16 +37,21 @@
 //! copied again: a copy twice is better than a message lost.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use async_imap::imap_proto::{MailboxDatum, Response, StatusAttribute};
 
-use crate::connect::ImapSession;
+use crate::connect::{ConnectError, ImapSession};
 use crate::copy::message_id;
 use crate::store::{Action, Store};
 use crate::sync::{self, Capabilities, CopyUid, Done, SyncError};
 
-/// How many times an action is tried when the server answers `NO` before it is refused.
+/// How many times an action fails (a `NO`, a cut connection, a timeout…) before it is refused.
 pub const MAX_ATTEMPTS: u32 = 5;
+
+/// How long the server is given to answer each command of an action: one that never answers
+/// would hold the worker for ever. Moving many large messages can take a server a while.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What an action does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,13 +169,14 @@ pub fn with_flag(flags: &str, flag: &str, add: bool) -> String {
 pub enum Result {
     Applied,
     /// It stays in the queue: `reason` is `refused` (the server answered `NO`) or `connection`
-    /// (the connection was lost before the server answered).
+    /// (the connection was lost, the answer could not be used, or none came in time).
     Retried {
         attempts: u32,
         reason: &'static str,
     },
     /// It was dropped and its change taken back from the copy. `reason` is `renumbered`,
-    /// `no-such-folder`, `unsupported` or `refused`.
+    /// `no-such-folder`, `unsupported`, `refused` or `connection` (it failed that way
+    /// [`MAX_ATTEMPTS`] times).
     Refused {
         reason: &'static str,
         message: String,
@@ -193,20 +201,81 @@ pub struct Applied {
     /// The folders to sync now, by row: a target whose new messages are not in the copy yet, a
     /// folder whose change was taken back.
     pub resync: BTreeSet<i64>,
+    /// Whether a command got no answer in time: what the connection says next cannot be trusted,
+    /// so it has to be dropped.
+    pub timed_out: bool,
+}
+
+/// The session, each of whose commands is given [`COMMAND_TIMEOUT`] (or the timeout asked).
+struct Server<'a> {
+    session: &'a mut ImapSession,
+    timeout: Duration,
+    timed_out: bool,
+}
+
+impl Server<'_> {
+    /// A command's result, or the error of one that got no answer in time.
+    fn timed<T>(
+        &mut self,
+        result: std::result::Result<std::result::Result<T, SyncError>, tokio::time::error::Elapsed>,
+    ) -> std::result::Result<T, SyncError> {
+        result.unwrap_or_else(|_| {
+            self.timed_out = true;
+            Err(SyncError::Connection(ConnectError::Unreachable(
+                "the IMAP server did not answer an action's command in time".to_owned(),
+            )))
+        })
+    }
+
+    async fn run_done(
+        &mut self,
+        command: &str,
+        each: impl FnMut(&Response<'_>),
+    ) -> std::result::Result<Done, SyncError> {
+        let result =
+            tokio::time::timeout(self.timeout, sync::run_done(self.session, command, each)).await;
+        self.timed(result)
+    }
+
+    async fn select(&mut self, name: &str) -> std::result::Result<Option<u32>, SyncError> {
+        let result = tokio::time::timeout(self.timeout, sync::select(self.session, name)).await;
+        self.timed(result)
+    }
+
+    async fn examine_uidvalidity(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<Option<u32>, SyncError> {
+        let result =
+            tokio::time::timeout(self.timeout, sync::examine_uidvalidity(self.session, name)).await;
+        self.timed(result)
+    }
+
+    async fn search(&mut self, criteria: &str) -> std::result::Result<Option<Vec<u32>>, SyncError> {
+        let result = tokio::time::timeout(self.timeout, sync::search(self.session, criteria)).await;
+        self.timed(result)
+    }
 }
 
 /// Applies the account's queue on the server, in order, until it is empty or an action has to
-/// wait. A connection error stops it, and is returned beside what was done before it.
+/// wait. Each command is given `timeout`. A connection error stops it, counted as a failure of
+/// the action it happened in, and is returned beside what was done before it.
 pub async fn apply(
     session: &mut ImapSession,
     store: &mut Store,
     account: i64,
     account_id: &str,
     capabilities: Capabilities,
+    timeout: Duration,
 ) -> (Applied, std::result::Result<(), SyncError>) {
     let mut applied = Applied::default();
-    let result = round(
+    let mut server = Server {
         session,
+        timeout,
+        timed_out: false,
+    };
+    let result = round(
+        &mut server,
         store,
         account,
         account_id,
@@ -214,11 +283,12 @@ pub async fn apply(
         &mut applied,
     )
     .await;
+    applied.timed_out = server.timed_out;
     (applied, result)
 }
 
 async fn round(
-    session: &mut ImapSession,
+    server: &mut Server<'_>,
     store: &mut Store,
     account: i64,
     account_id: &str,
@@ -240,17 +310,30 @@ async fn round(
             messages: messages.clone(),
             result,
         };
-        let result = match one(session, store, &action, capabilities).await {
+        let result = match one(server, store, &action, capabilities).await {
             Ok(result) => result,
-            Err(error) => {
-                if matches!(error, SyncError::Connection(_)) {
+            Err(error @ SyncError::Connection(_)) => {
+                // Counted like a `NO`: an action whose command always ends the connection, or
+                // gets an answer the reader cannot use, must not stop the account for ever.
+                let attempts = store.retried(action.id, "connection")?;
+                if attempts < MAX_ATTEMPTS {
                     applied.outcomes.push(outcome(Result::Retried {
-                        attempts: action.attempts,
+                        attempts,
                         reason: "connection",
+                    }));
+                } else {
+                    refuse(store, &action, applied)?;
+                    applied.outcomes.push(outcome(Result::Refused {
+                        reason: "connection",
+                        message: format!(
+                            "it failed {attempts} times: the connection was lost, the server's \
+                             answer could not be used, or none came in time"
+                        ),
                     }));
                 }
                 return Err(error);
             }
+            Err(error) => return Err(error),
         };
         let result = match result {
             Step::Applied { resync } => {
@@ -315,7 +398,7 @@ const NO_SUCH_FOLDER: Step =
 const BAD: Step = Step::Refused("refused", "the server refused the command as malformed");
 
 async fn one(
-    session: &mut ImapSession,
+    server: &mut Server<'_>,
     store: &mut Store,
     action: &Action,
     capabilities: Capabilities,
@@ -338,7 +421,7 @@ async fn one(
              other clients marked deleted",
         ));
     }
-    match sync::select(session, &action.folder.name).await? {
+    match server.select(&action.folder.name).await? {
         None => return Ok(Step::No("select")),
         Some(uidvalidity) if uidvalidity != action.uidvalidity => return Ok(RENUMBERED),
         Some(_) => {}
@@ -347,19 +430,19 @@ async fn one(
     if let Some((flag, add)) = action.kind.flag() {
         let sign = if add { '+' } else { '-' };
         let mut fetched = Vec::new();
-        let done = sync::run_done(
-            session,
-            &format!("UID STORE {set} {sign}FLAGS ({flag})"),
-            |response| {
-                if let Response::Fetch(_, attributes) = response
-                    && let Some(uid) = sync::uid(attributes)
-                    && action.uids.contains(&uid)
-                {
-                    fetched.push((uid, sync::flags(attributes)));
-                }
-            },
-        )
-        .await?;
+        let done = server
+            .run_done(
+                &format!("UID STORE {set} {sign}FLAGS ({flag})"),
+                |response| {
+                    if let Response::Fetch(_, attributes) = response
+                        && let Some(uid) = sync::uid(attributes)
+                        && action.uids.contains(&uid)
+                    {
+                        fetched.push((uid, sync::flags(attributes)));
+                    }
+                },
+            )
+            .await?;
         return Ok(match done {
             Done::Ok(_) => {
                 store.applied_flags(action, &fetched)?;
@@ -370,7 +453,7 @@ async fn one(
         });
     }
     if action.kind == Kind::DeletePermanently {
-        return Ok(match remove(session, &set).await? {
+        return Ok(match remove(server, &set).await? {
             Done::Ok(_) => {
                 store.applied_delete(action)?;
                 Step::Applied { resync: Vec::new() }
@@ -385,16 +468,13 @@ async fn one(
     };
     if capabilities.moves {
         let mut untagged = None;
-        let done = sync::run_done(
-            session,
-            &format!("UID MOVE {set} {target_name}"),
-            |response| {
+        let done = server
+            .run_done(&format!("UID MOVE {set} {target_name}"), |response| {
                 if let Some(copy) = sync::copy_uid(response) {
                     untagged = Some(copy);
                 }
-            },
-        )
-        .await?;
+            })
+            .await?;
         return Ok(match done {
             Done::Ok(tagged) => Step::Applied {
                 resync: store.applied_move(action, untagged.or(tagged).as_ref())?,
@@ -404,26 +484,26 @@ async fn one(
             Done::Bad => BAD,
         });
     }
-    copy_then_remove(session, store, action, &set, &target_name).await
+    copy_then_remove(server, store, action, &set, &target_name).await
 }
 
 /// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` of the same UIDs.
-async fn remove(session: &mut ImapSession, set: &str) -> std::result::Result<Done, SyncError> {
-    let done = sync::run_done(
-        session,
-        &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
-        |_| {},
-    )
-    .await?;
+async fn remove(server: &mut Server<'_>, set: &str) -> std::result::Result<Done, SyncError> {
+    let done = server
+        .run_done(
+            &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
+            |_| {},
+        )
+        .await?;
     if !matches!(done, Done::Ok(_)) {
         return Ok(done);
     }
-    sync::run_done(session, &format!("UID EXPUNGE {set}"), |_| {}).await
+    server.run_done(&format!("UID EXPUNGE {set}"), |_| {}).await
 }
 
 /// A move without MOVE: see the module's documentation. The source folder is selected.
 async fn copy_then_remove(
-    session: &mut ImapSession,
+    server: &mut Server<'_>,
     store: &mut Store,
     action: &Action,
     set: &str,
@@ -431,7 +511,7 @@ async fn copy_then_remove(
 ) -> std::result::Result<Step, SyncError> {
     let mut action = action.clone();
     if action.state == "copying" {
-        match recover_copy(session, store, &action, target_name).await? {
+        match recover_copy(server, store, &action, target_name).await? {
             Recovered::NotCopied => {
                 store.copy_state(action.id, "pending", None, None)?;
                 action.state = "pending".to_owned();
@@ -444,20 +524,20 @@ async fn copy_then_remove(
             Recovered::Unknown => return Ok(Step::No("status")),
         }
         // Looking in the target selected it.
-        match sync::select(session, &action.folder.name).await? {
+        match server.select(&action.folder.name).await? {
             None => return Ok(Step::No("select")),
             Some(uidvalidity) if uidvalidity != action.uidvalidity => return Ok(RENUMBERED),
             Some(_) => {}
         }
     }
     if action.state == "pending" {
-        let Some(uidnext) = uid_next(session, target_name).await? else {
+        let Some(uidnext) = uid_next(server, target_name).await? else {
             return Ok(Step::No("status"));
         };
         // Written before the COPY is sent: if its answer never comes, the next try knows where
         // to look for what it copied.
         store.copy_state(action.id, "copying", Some(uidnext), None)?;
-        match copy(session, &action.uids, target_name).await? {
+        match copy(server, &action.uids, target_name).await? {
             Done::Ok(copied) => {
                 store.copy_state(action.id, "copied", None, copied.as_ref())?;
                 action.copied = copied;
@@ -471,7 +551,7 @@ async fn copy_then_remove(
         }
     }
     // Copied: only the removal from the source is left, which can be tried again as it is.
-    Ok(match remove(session, set).await? {
+    Ok(match remove(server, set).await? {
         Done::Ok(_) => Step::Applied {
             resync: store.applied_move(&action, action.copied.as_ref())?,
         },
@@ -482,21 +562,21 @@ async fn copy_then_remove(
 
 /// `UID COPY`, with the `COPYUID` of its answer.
 async fn copy(
-    session: &mut ImapSession,
+    server: &mut Server<'_>,
     uids: &[u32],
     target_name: &str,
 ) -> std::result::Result<Done, SyncError> {
     let mut untagged = None;
-    let done = sync::run_done(
-        session,
-        &format!("UID COPY {} {target_name}", sync::uid_set(uids)),
-        |response| {
-            if let Some(copy) = sync::copy_uid(response) {
-                untagged = Some(copy);
-            }
-        },
-    )
-    .await?;
+    let done = server
+        .run_done(
+            &format!("UID COPY {} {target_name}", sync::uid_set(uids)),
+            |response| {
+                if let Some(copy) = sync::copy_uid(response) {
+                    untagged = Some(copy);
+                }
+            },
+        )
+        .await?;
     Ok(match done {
         Done::Ok(tagged) => Done::Ok(tagged.or(untagged)),
         other => other,
@@ -513,7 +593,7 @@ enum Recovered {
 
 /// Finds out what a `UID COPY` whose answer never came did, and copies again what it did not.
 async fn recover_copy(
-    session: &mut ImapSession,
+    server: &mut Server<'_>,
     store: &mut Store,
     action: &Action,
     target_name: &str,
@@ -521,7 +601,7 @@ async fn recover_copy(
     let Some(before) = action.target_uidnext else {
         return Ok(Recovered::NotCopied);
     };
-    let Some(now) = uid_next(session, target_name).await? else {
+    let Some(now) = uid_next(server, target_name).await? else {
         return Ok(Recovered::Unknown);
     };
     // Nothing arrived in the target since: the COPY did nothing.
@@ -529,7 +609,7 @@ async fn recover_copy(
         return Ok(Recovered::NotCopied);
     }
     let target = action.target.as_ref().expect("a move has a target");
-    let Some(uidvalidity) = sync::examine_uidvalidity(session, &target.name).await? else {
+    let Some(uidvalidity) = server.examine_uidvalidity(&target.name).await? else {
         return Ok(Recovered::Unknown);
     };
     let message_ids = store.message_ids(action.folder.id, &action.uids)?;
@@ -542,12 +622,10 @@ async fn recover_copy(
         // The copy keeps a Message-ID without its angle brackets; with them, `3@` does not
         // match `13@`.
         let new = match message_id.and_then(|id| sync::quote(&format!("<{id}>"))) {
-            Some(quoted) => sync::search(
-                session,
-                &format!("UID {before}:* HEADER Message-ID {quoted}"),
-            )
-            .await?
-            .and_then(|uids| uids.into_iter().find(|new| *new >= before)),
+            Some(quoted) => server
+                .search(&format!("UID {before}:* HEADER Message-ID {quoted}"))
+                .await?
+                .and_then(|uids| uids.into_iter().find(|new| *new >= before)),
             None => None,
         };
         match new {
@@ -560,11 +638,11 @@ async fn recover_copy(
     }
     // What was not found is copied now: it is not in the target, or has no Message-ID to be
     // found by.
-    match sync::select(session, &action.folder.name).await? {
+    match server.select(&action.folder.name).await? {
         Some(uidvalidity) if uidvalidity == action.uidvalidity => {}
         _ => return Ok(Recovered::Unknown),
     }
-    let Done::Ok(again) = copy(session, &missing, target_name).await? else {
+    let Done::Ok(again) = copy(server, &missing, target_name).await? else {
         return Ok(Recovered::Unknown);
     };
     match again {
@@ -579,20 +657,21 @@ async fn recover_copy(
 
 /// The UIDNEXT of a folder, from `STATUS`. `None` when the server refused it.
 async fn uid_next(
-    session: &mut ImapSession,
+    server: &mut Server<'_>,
     name: &str,
 ) -> std::result::Result<Option<u32>, SyncError> {
     let mut found = None;
-    let done = sync::run_done(session, &format!("STATUS {name} (UIDNEXT)"), |response| {
-        if let Response::MailboxData(MailboxDatum::Status { status, .. }) = response {
-            for attribute in status {
-                if let StatusAttribute::UidNext(next) = attribute {
-                    found = Some(*next);
+    let done = server
+        .run_done(&format!("STATUS {name} (UIDNEXT)"), |response| {
+            if let Response::MailboxData(MailboxDatum::Status { status, .. }) = response {
+                for attribute in status {
+                    if let StatusAttribute::UidNext(next) = attribute {
+                        found = Some(*next);
+                    }
                 }
             }
-        }
-    })
-    .await?;
+        })
+        .await?;
     Ok(match done {
         Done::Ok(_) => found,
         _ => None,

@@ -513,11 +513,21 @@ async fn wrote(server: &FakeServer, from: usize, expected: &[&str]) {
 /// A server, an account on it, a daemon, and a first sync. The periodic check is an hour away:
 /// the test says when a pass runs, with `missive sync`.
 async fn started(builder: missive_core::fake::Builder) -> (FakeServer, Env, Daemon) {
+    started_with(builder, &[]).await
+}
+
+/// [`started`], the daemon given `args` too.
+async fn started_with(
+    builder: missive_core::fake::Builder,
+    args: &[&str],
+) -> (FakeServer, Env, Daemon) {
     let server = builder.start().await;
     let env = Env::new().await;
     env.add_account("alice", &server, USER, Some(PASSWORD))
         .await;
-    let daemon = env.daemon(&["--check-interval", "3600"]).await;
+    let mut arguments = vec!["--check-interval", "3600"];
+    arguments.extend_from_slice(args);
+    let daemon = env.daemon(&arguments).await;
     succeeded(&sync_soon(&env).await);
     (server, env, daemon)
 }
@@ -1268,4 +1278,103 @@ async fn no_subject_address_or_body_appears_in_the_logs_of_actions() {
             assert!(!stderr(output).contains(private), "{}", stderr(output));
         }
     }
+}
+
+/// How many commands of the server's log start with `command`.
+fn tries(server: &FakeServer, command: &str) -> usize {
+    server
+        .imap_log()
+        .iter()
+        .filter(|c| c.starts_with(command))
+        .count()
+}
+
+/// Delivers a new message to the inbox and waits until the copy has it.
+async fn new_mail_is_synced(server: &FakeServer, env: &Env, n: u32) {
+    let uid = server.deliver("INBOX", message(n));
+    eventually(20, "the new message in the copy", || {
+        env.uids("INBOX").contains(&uid)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_action_the_server_always_answers_by_cutting_the_connection_is_refused_after_the_limit_and_new_mail_is_still_synced()
+ {
+    let (server, env, _daemon) = started(mailbox().cut("UID STORE", 0)).await;
+    succeeded(&env.act(&["mark", &env.id("INBOX", 3), "--read"]).await);
+    eventually(10, "a first cut", || tries(&server, "UID STORE") >= 1).await;
+
+    // Each connection syncs the folders before it tries the action again.
+    new_mail_is_synced(&server, &env, 5).await;
+    assert_eq!(env.queue(), 1, "{}", env.logs());
+
+    eventually(60, "the action refused", || env.queue() == 0).await;
+    assert_eq!(tries(&server, "UID STORE"), 5);
+    new_mail_is_synced(&server, &env, 6).await;
+    // The server ran each STORE before it cut its answer: the copy shows what it has.
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(server.flags("INBOX", 3), flags(&["\\Seen"]));
+    assert_eq!(env.flags("INBOX", 3).as_deref(), Some("\\Seen"));
+    let logs = env.logs();
+    assert!(logs.contains("refused"), "{logs}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_action_the_server_always_answers_bad_is_refused_after_the_limit_and_new_mail_is_still_synced()
+ {
+    // Through the sync's reader, a BAD is an error: here on the SELECT only an action sends.
+    let (server, env, _daemon) = started(mailbox().bad("SELECT")).await;
+    succeeded(&env.act(&["mark", &env.id("INBOX", 3), "--read"]).await);
+    eventually(10, "a first BAD", || tries(&server, "SELECT") == 1).await;
+
+    for pass in 2..=5 {
+        succeeded(&sync_soon(&env).await);
+        new_mail_is_synced(&server, &env, 10 + pass).await;
+        eventually(10, "one more try", || {
+            tries(&server, "SELECT") == pass as usize
+        })
+        .await;
+        if pass < 5 {
+            assert_eq!(env.queue(), 1);
+        }
+    }
+    eventually(10, "the action refused", || env.queue() == 0).await;
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(tries(&server, "SELECT"), 5);
+    assert_eq!(server.flags("INBOX", 3), Some(Vec::new()));
+    eventually(10, "the mark taken back", || {
+        env.flags("INBOX", 3).as_deref() == Some("")
+    })
+    .await;
+    new_mail_is_synced(&server, &env, 20).await;
+    assert_eq!(env.state("alice").as_deref(), Some("ready"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_action_command_that_never_answers_times_out_drops_the_connection_and_counts_as_a_failure()
+ {
+    let (server, env, _daemon) =
+        started_with(mailbox().stall("UID STORE"), &["--action-timeout", "1"]).await;
+    let logins = tries(&server, "LOGIN");
+    succeeded(&env.act(&["mark", &env.id("INBOX", 3), "--read"]).await);
+    eventually(10, "a first STORE", || tries(&server, "UID STORE") == 1).await;
+    // The connection is dropped and another one made.
+    eventually(10, "a new connection", || tries(&server, "LOGIN") > logins).await;
+    new_mail_is_synced(&server, &env, 5).await;
+
+    eventually(60, "the action refused", || env.queue() == 0).await;
+    // Each timeout dropped its connection, the fifth included.
+    eventually(10, "a connection after each timeout", || {
+        tries(&server, "LOGIN") > logins + 4
+    })
+    .await;
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(tries(&server, "UID STORE"), 5);
+    assert_eq!(server.flags("INBOX", 3), Some(Vec::new()));
+    eventually(10, "the mark taken back", || {
+        env.flags("INBOX", 3).as_deref() == Some("")
+    })
+    .await;
+    new_mail_is_synced(&server, &env, 6).await;
 }

@@ -75,6 +75,8 @@ pub struct Options {
     pub check_interval: Duration,
     /// How many new messages are fetched, and written to the copy, at a time.
     pub batch_size: usize,
+    /// How long the server is given to answer each command of an action.
+    pub action_timeout: Duration,
 }
 
 macro_rules! log {
@@ -336,6 +338,7 @@ impl Daemon {
                 idle_refused: false,
                 idle_backoff: Backoff::default(),
                 queue_waits: false,
+                queue_failed: false,
                 completed: reader.completed(key).unwrap_or(false),
                 reader,
                 copy,
@@ -678,9 +681,12 @@ struct Worker {
     /// Connection attempts after IDLE stalled, so that a server that never answers it is not
     /// connected to again and again: reset when IDLE starts.
     idle_backoff: Backoff,
-    /// Whether the server answered `NO` to the first action of the queue: the queue then waits
-    /// for the next pass, rather than being tried again at each wake.
+    /// Whether the first action of the queue failed (a `NO`, a lost connection…): the queue then
+    /// waits for the next pass, rather than being tried again at each wake.
     queue_waits: bool,
+    /// Whether the queue stopped on an error: the next pass syncs the folders before it tries
+    /// the queue again, so that an action that always fails never keeps the account from its mail.
+    queue_failed: bool,
     /// Whether a pass over every folder of the account ever ended: until then what a sync brings
     /// is the account's mail so far, not mail that arrives.
     completed: bool,
@@ -914,9 +920,13 @@ impl Worker {
             if capabilities.idle { "IDLE" } else { "no IDLE" }
         );
         loop {
-            // What waits in the queue first, then every folder.
+            // What waits in the queue first, then every folder; after a queue that failed, the
+            // folders first.
             self.take_requests();
-            check!(self.apply(&mut session, capabilities, &mut [], true).await);
+            let queue_first = !self.queue_failed;
+            if queue_first {
+                check!(self.apply(&mut session, capabilities, &mut [], true).await);
+            }
             self.events.send(Event::SyncStarted {
                 account: self.id.clone(),
             });
@@ -955,6 +965,12 @@ impl Worker {
             );
             self.answer("ready");
             *backoff = Backoff::default();
+            if !queue_first {
+                check!(
+                    self.apply(&mut session, capabilities, &mut folders, true)
+                        .await
+                );
+            }
 
             // Then the inbox only, until the next check of every folder.
             let inbox = folders.iter().position(|f| f.role == Some("inbox"));
@@ -1003,8 +1019,10 @@ impl Worker {
     }
 
     /// Applies the account's queue on the server, tells what became of each action, and syncs
-    /// at once those of `folders` whose copy has to catch up with the server. An action the
-    /// server answered `NO` is tried again at the next `pass` only.
+    /// at once those of `folders` whose copy has to catch up with the server. An action that
+    /// failed is tried again at the next `pass` only. A connection error of the queue is an error
+    /// only when a command got no answer in time; otherwise the session goes on, and its next
+    /// command tells whether the connection is still there.
     async fn apply(
         &mut self,
         session: &mut ImapSession,
@@ -1015,24 +1033,35 @@ impl Worker {
         if self.queue_waits && !pass {
             return Ok(());
         }
-        let (applied, result) =
-            actions::apply(session, &mut self.store, self.key, &self.id, capabilities).await;
-        self.queue_waits = applied.outcomes.iter().any(|outcome| {
-            matches!(
-                outcome.result,
-                actions::Result::Retried {
-                    reason: "refused",
-                    ..
-                }
-            )
-        });
+        let (applied, result) = actions::apply(
+            session,
+            &mut self.store,
+            self.key,
+            &self.id,
+            capabilities,
+            self.options.action_timeout,
+        )
+        .await;
+        self.queue_waits = applied
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome.result, actions::Result::Retried { .. }));
+        self.queue_failed = result.is_err();
         for outcome in &applied.outcomes {
             self.tell_outcome(outcome);
         }
         if !applied.outcomes.is_empty() {
             self.events.unread(&self.copy);
         }
-        result?;
+        match result {
+            Ok(()) => {}
+            // What the connection says next cannot be trusted.
+            Err(error) if applied.timed_out => return Err(error),
+            Err(error @ SyncError::Connection(_)) => {
+                log!("account {}: the queue stopped ({})", self.key, kind(&error));
+            }
+            Err(error) => return Err(error),
+        }
         for id in applied.resync {
             if let Some(folder) = folders.iter_mut().find(|f| f.row.id == id) {
                 // The queue may have changed what the copy knows of it (its HIGHESTMODSEQ).

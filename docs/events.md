@@ -153,7 +153,7 @@ the daemon tried it on the server.
 | `outcome` | string | `applied`, `retried` or `refused` |
 | `messages` | array of strings | the identifiers of the messages, as they were when the action was asked |
 | `reason` | string | with `retried` and `refused` only: why, for programs (below) |
-| `attempts` | number | with `retried` only: how many times the server refused it so far |
+| `attempts` | number | with `retried` only: how many times it failed so far |
 | `message` | string | with `refused` only: why, for people |
 
 An action on messages of several folders is one action per folder, each with its event.
@@ -162,15 +162,17 @@ An action on messages of several folders is one action per folder, each with its
   no longer had is not an error: nothing was done for it, and the sync removes it from the copy.
 - `retried`: the action stays in the queue, and the actions asked after it on the same account
   wait for it, so that they are applied in order. `reason` is `refused` (the server answered
-  `NO`; it is tried again at the next pass, and refused after 5 such answers) or `connection` (the
-  connection was lost before the server answered; it is tried again on the next connection, in a
-  way that neither loses nor duplicates a message).
+  `NO`) or `connection` (the connection was lost before the server answered, the answer could not
+  be used, or none came within 30 seconds of a command). It is tried again at the next pass, in a
+  way that neither loses nor duplicates a message, and refused after 5 failures of either kind.
+  After a `connection` failure, the next pass syncs the folders before it tries the queue again:
+  an action that always fails never keeps the account from its mail.
 - `refused`: the action was dropped and its effect taken back from the copy. `reason` is
   `renumbered` (the server renumbered the folder: its UIDs name other messages now),
   `no-such-folder` (the target of a move does not exist on the server), `unsupported` (the server
   can neither `MOVE` nor `UID EXPUNGE`, so moving or deleting for good would also remove the
-  messages another client marked deleted) or `refused` (the server refused it 5 times, or as
-  malformed).
+  messages another client marked deleted), `refused` (the server refused it 5 times, or as
+  malformed) or `connection` (it failed 5 times that way).
 
 ### `lagged`
 
