@@ -1,0 +1,36 @@
+From: Example Shop <news@shop.example.org>
+To: Reader <reader@example.com>
+Subject: Autumn collection
+Date: Mon, 12 Oct 2026 09:00:00 +0200
+Message-ID: <3335381141596761211@shop.example.org>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Autumn collection. See it online.
+--alt
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background-color:#eeeeee;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#eeeeee">
+<tr><td align="center" style="padding:20px 0;">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="background-color:#ffffff;border:1px solid #dddddd;">
+<tr><td style="padding:24px;font-family:Georgia,serif;font-size:28px;color:#333333;text-align:center;">Autumn collection</td></tr>
+<tr><td style="padding:0 24px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+<td width="50%" valign="top" style="padding:8px;font-family:Arial,sans-serif;font-size:14px;color:#555555;">
+<h2 style="margin:0 0 8px;color:#a0522d;font-size:18px;">Warm coats</h2>
+<p style="margin:0;line-height:20px;">Wool and linen, cut for long walks. Twelve colours, sizes XS to XXL.</p></td>
+<td width="50%" valign="top" style="padding:8px;font-family:Arial,sans-serif;font-size:14px;color:#555555;">
+<h2 style="margin:0 0 8px;color:#a0522d;font-size:18px;">Soft scarves</h2>
+<p style="margin:0;line-height:20px;">Knitted by hand. Free delivery from two items.</p></td>
+</tr></table></td></tr>
+<tr><td style="padding:16px 24px;font-family:Arial,sans-serif;font-size:12px;color:#999999;border-top:1px solid #eeeeee;">
+You receive this because you subscribed at shop.example.org. <a href="https://shop.example.org/unsubscribe" style="color:#999999;">Unsubscribe</a></td></tr>
+</table></td></tr></table></body></html>
+--alt--
