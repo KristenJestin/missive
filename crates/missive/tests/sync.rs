@@ -1502,6 +1502,76 @@ async fn a_second_daemon_refuses_to_start() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_status_probe_holding_the_pid_lock_does_not_stop_a_starting_daemon() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    // What `status` does, held for much longer than the microseconds it takes there, so that the
+    // daemon surely meets it.
+    std::fs::create_dir_all(env.pid_file().parent().unwrap()).unwrap();
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(env.pid_file())
+        .unwrap();
+    probe.lock_shared().unwrap();
+
+    let mut daemon = env.spawn_daemon(&[]);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    probe.unlock().unwrap();
+
+    let started = Instant::now();
+    while UnixStream::connect(env.socket()).await.is_err() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the daemon did not start; its log:\n{}",
+            env.logs()
+        );
+        assert!(
+            daemon.child.try_wait().unwrap().is_none(),
+            "the daemon quit; its log:\n{}",
+            env.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    succeeded(&env.sync().await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn of_two_daemons_started_at_once_exactly_one_runs() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+
+    let mut first = env.spawn_daemon(&[]);
+    let mut second = env.spawn_daemon(&[]);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            status = first.child.wait() => (Some(status.unwrap()), None),
+            status = second.child.wait() => (None, Some(status.unwrap())),
+        }
+    })
+    .await
+    .expect("one of the two daemons stops");
+
+    // The one left answers, the other one said why it stopped.
+    let quit = first.or(second).unwrap();
+    assert!(!quit.success());
+    let logs = env.logs();
+    assert_eq!(logs.matches("already running").count(), 1, "{logs}");
+    let started = Instant::now();
+    while UnixStream::connect(env.socket()).await.is_err() {
+        assert!(started.elapsed() < Duration::from_secs(10), "{logs}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    succeeded(&env.sync().await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stale_socket_from_a_killed_daemon_is_recovered() {
     let server = mailbox().start().await;
     let env = Env::new().await;

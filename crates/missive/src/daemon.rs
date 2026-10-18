@@ -174,6 +174,11 @@ pub async fn run(options: Options) -> Result<(), String> {
     Ok(())
 }
 
+/// How long a starting daemon waits for the lock before it takes it for a running daemon's, and
+/// how often it tries meanwhile. Nothing else runs yet, so sleeping the thread is harmless.
+const LOCK_WAIT: Duration = Duration::from_millis(200);
+const LOCK_RETRY: Duration = Duration::from_millis(5);
+
 /// Takes the daemon's lock, or says which daemon holds it, and writes this daemon's pid.
 fn lock(path: &Path) -> Result<File, String> {
     let mut file = OpenOptions::new()
@@ -183,15 +188,24 @@ fn lock(path: &Path) -> Result<File, String> {
         .truncate(false)
         .open(path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            let mut pid = String::new();
-            let _ = file.read_to_string(&mut pid);
-            return Err(format!("a daemon is already running (pid {})", pid.trim()));
-        }
-        Err(TryLockError::Error(e)) => {
-            return Err(format!("cannot lock {}: {e}", path.display()));
+    // `status` takes this lock shared for a few microseconds to learn whether a daemon runs. A
+    // daemon starting at that moment tries again briefly rather than quit; a daemon that really
+    // runs holds the lock for good and is still refused once the wait is over.
+    let giving_up = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if Instant::now() < giving_up => {
+                std::thread::sleep(LOCK_RETRY);
+            }
+            Err(TryLockError::WouldBlock) => {
+                let mut pid = String::new();
+                let _ = file.read_to_string(&mut pid);
+                return Err(format!("a daemon is already running (pid {})", pid.trim()));
+            }
+            Err(TryLockError::Error(e)) => {
+                return Err(format!("cannot lock {}: {e}", path.display()));
+            }
         }
     }
     file.set_len(0)
