@@ -5,7 +5,8 @@
 //!
 //! - `queued`: to send. A try that fails before the end of data (a `4xx`, a connection lost, a
 //!   login refused, a certificate refused) leaves it `queued`: the server took nothing, so sending
-//!   it again is safe. The daemon tries again later, from a backoff.
+//!   it again is safe. It is tried again after a wait of its own, which holds back no other
+//!   message ([`crate::store::Store::send_again`]).
 //! - `claimed`: a worker took it, before its first command: no other worker takes it. Nothing
 //!   was sent for it yet, so a daemon killed then leaves it to the next one, which puts it back
 //!   in the queue ([`crate::store::Store::release_claimed`]).
@@ -28,7 +29,7 @@
 //! Sent folder. After [`MAX_ATTEMPTS`] failures the copy is given up (the message was sent).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustls::ClientConfig;
 
@@ -38,6 +39,13 @@ use crate::connect::{ConnectError, ImapSession};
 use crate::store::Store;
 use crate::submit::{Outgoing, Submitted, submit};
 use crate::sync::{self, Done, SyncError};
+
+/// Now, in milliseconds since the epoch: the outbox's clock.
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
 
 /// What became of a try of the account's next message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,7 +77,8 @@ pub enum Tried {
     },
 }
 
-/// Submits the account's first message to send, if there is one, and records what came of it.
+/// Submits the account's first message whose time has come, if there is one, and records what
+/// came of it.
 pub async fn send_next(
     store: &mut Store,
     key: i64,
@@ -77,7 +86,7 @@ pub async fn send_next(
     password: &Password,
     tls: Arc<ClientConfig>,
 ) -> rusqlite::Result<Option<Tried>> {
-    let Some(message) = store.claim_next(key)? else {
+    let Some(message) = store.claim_next(key, now())? else {
         return Ok(None);
     };
     let id = message.id;
@@ -118,7 +127,7 @@ pub async fn send_next(
             }
         }
         Ok(Submitted::Again { reason }) => {
-            store.send_again(id, &reason)?;
+            store.send_again(id, &reason, now())?;
             Tried::Again { id, reason }
         }
         Ok(Submitted::Refused { code, step }) => {
@@ -139,7 +148,7 @@ pub async fn send_next(
             }
         }
         Err(error) => {
-            store.send_again(id, &error.to_string())?;
+            store.send_again(id, &error.to_string(), now())?;
             Tried::Login { id, error }
         }
     }))

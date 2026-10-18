@@ -1008,3 +1008,51 @@ async fn no_password_body_subject_or_address_appears_in_the_logs_of_sending() {
         }
     }
 }
+
+/// The bodies the server took, in order.
+fn bodies(server: &FakeServer) -> Vec<String> {
+    server
+        .smtp_messages()
+        .iter()
+        .map(|m| {
+            let data = String::from_utf8_lossy(&m.data).into_owned();
+            data.split("\r\n\r\n")
+                .nth(1)
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_waiting_for_a_retry_does_not_hold_back_the_others() {
+    let server = mailbox()
+        .smtp_answer("RCPT TO:<slow@example.com>", "451 4.3.0 try again later")
+        .start()
+        .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = env.watch().await;
+    succeeded(
+        &env.compose(&["--cc", "slow@example.com", "--body", "first"])
+            .await,
+    );
+    eventually(20, "a refused try", || {
+        env.outbox()
+            .first()
+            .is_some_and(|(_, _, attempts)| *attempts >= 1)
+    })
+    .await;
+
+    succeeded(&env.compose(&["--body", "second"]).await);
+
+    watcher.next("sent").await;
+    assert_eq!(bodies(&server), ["second"]);
+    assert_eq!(env.outbox()[0].1, "queued");
+    server.heal();
+    eventually(30, "the first message sent", || {
+        server.smtp_messages().len() == 2
+    })
+    .await;
+    assert_eq!(bodies(&server), ["second", "first"]);
+}

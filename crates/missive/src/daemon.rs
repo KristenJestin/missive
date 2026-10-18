@@ -15,8 +15,8 @@
 //! A message to send (`send`) is built and written to the copy's outbox by the connection that
 //! asked, and answered at once. Each account has a second worker for it, apart from the IMAP one
 //! so that mail goes out while the IMAP server is down: it submits the outbox in order, tries
-//! again after a backoff what the server did not take, and wakes the IMAP worker, which appends
-//! the copy to Sent (see [`missive_core::outbox`]).
+//! again what the server did not take after a wait of that message's own, and wakes the IMAP
+//! worker, which appends the copy to Sent (see [`missive_core::outbox`]).
 //!
 //! A draft (`draft`) is built and saved in the copy the same way, and answered at once; the IMAP
 //! worker, woken, writes it to the Drafts folder when it is connected, with the queue (see
@@ -1839,9 +1839,19 @@ impl SmtpWorker {
                     Err(TryRecvError::Disconnected) => return,
                 }
             }
-            match self.store.has_queued(self.key) {
-                Ok(true) => {}
-                Ok(false) => {
+            // Each message waits for its own time: one the server refuses for now holds back no
+            // other, and a new message goes at once.
+            match self.store.next_due(self.key) {
+                Ok(Some(due)) => {
+                    let early = due - outbox::now();
+                    if early > 0 {
+                        if !self.wait(Some(Duration::from_millis(early as u64))).await {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                Ok(None) => {
                     if !self.wait(None).await {
                         return;
                     }
@@ -1890,25 +1900,24 @@ impl SmtpWorker {
                     continue;
                 }
             };
-            let again = match &tried {
-                Tried::Again { .. } => true,
+            // A login that failed fails for every message: the worker waits too, so as not to log
+            // in once per message.
+            let login_failed = match &tried {
                 Tried::Login { error, .. } => {
                     if *error == ConnectError::AuthRefused {
                         password = None;
                     }
                     true
                 }
-                Tried::Sent { .. } | Tried::Failed { .. } | Tried::Uncertain { .. } => false,
+                Tried::Again { .. } => false,
+                Tried::Sent { .. } | Tried::Failed { .. } | Tried::Uncertain { .. } => {
+                    backoff = Backoff::default();
+                    false
+                }
             };
             self.tell(tried);
-            if again {
-                // The next try waits for its time, whatever is written meanwhile, as a worker
-                // that cannot connect does.
-                if !self.wait(Some(backoff.next())).await {
-                    return;
-                }
-            } else {
-                backoff = Backoff::default();
+            if login_failed && !self.wait(Some(backoff.next())).await {
+                return;
             }
         }
     }
@@ -1926,8 +1935,8 @@ impl SmtpWorker {
         })
     }
 
-    /// Waits for `timeout`, or with none for a message written to the outbox. `false` when the
-    /// daemon stops or the account was removed.
+    /// Waits for `timeout`, or for a message written to (or put back in) the outbox. `false`
+    /// when the daemon stops or the account was removed.
     async fn wait(&mut self, timeout: Option<Duration>) -> bool {
         let sleep = async {
             match timeout {
@@ -1935,17 +1944,10 @@ impl SmtpWorker {
                 None => std::future::pending().await,
             }
         };
-        tokio::pin!(sleep);
-        loop {
-            tokio::select! {
-                woken = self.wake.recv() => match woken {
-                    Some(()) if timeout.is_none() => return true,
-                    Some(()) => {}
-                    None => return false,
-                },
-                _ = &mut sleep => return true,
-                _ = stopped(&mut self.stop) => return false,
-            }
+        tokio::select! {
+            woken = self.wake.recv() => woken.is_some(),
+            _ = sleep => true,
+            _ = stopped(&mut self.stop) => false,
         }
     }
 

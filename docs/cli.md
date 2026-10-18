@@ -792,16 +792,16 @@ A message stays in the outbox until its server took it, in one of these states:
 
 | State | |
 |---|---|
-| `queued` | to send. A try that fails before the end of its data (a `4xx` answer, the server unreachable, the login or the certificate refused) leaves it here: the server took nothing, and it is tried again later, waiting longer each time (1 second, then twice as long, up to 5 minutes) |
+| `queued` | to send. A try that fails before the end of its data (a `4xx` answer, the server unreachable, the login or the certificate refused) leaves it here: the server took nothing, and it is tried again later, waiting longer each time (1 second, then twice as long, up to 5 minutes). Each message waits for its own time |
 | `claimed` | the daemon is sending it, and has not yet written its end of data: the server cannot have taken it. A daemon killed then puts it back in `queued` when it starts again |
 | `sending` | its end of data is being written |
 | `sent` | the server took it (its `250` to the end of data); only its copy in Sent is left to append. Without one to append, the message leaves the outbox at once |
 | `failed` | the server refused it for good (`5xx` to `MAIL FROM`, a `RCPT TO`, `DATA` or the end of data). It stays, shown by `status`, and is never sent again |
 | `uncertain` | the connection was lost after its end of data and before the server's answer (or the daemon was killed then): the server may have taken it. It stays, shown by `status`, and is never sent again by itself: a message delivered twice is worse than a question |
 
-Messages are sent one at a time, in the order they were written; a message that waits for a new
-try holds back those after it. `missive watch` tells when a message is `sent`, `send-failed` or
-`send-uncertain` (`docs/events.md`).
+Messages are sent one at a time, in the order they were written, each when its time has come: a
+message that waits for a new try holds back none of the others. `missive watch` tells when a
+message is `sent`, `send-failed` or `send-uncertain` (`docs/events.md`).
 
 #### The copy in Sent
 
