@@ -1002,6 +1002,53 @@ async fn a_listed_message_carries_what_search_prints_and_more() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_newsletter_with_inline_images_has_no_attachment_but_a_file_makes_one() {
+    let newsletter = |extra: &str| {
+        Message::new(format!(
+            "From: Carol Sender <{SENDER}>\r\nSubject: News\r\n\
+             Date: Sat, 17 Oct 2026 09:20:00 +0200\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"m\"\r\n\r\n\
+             --m\r\nContent-Type: multipart/related; boundary=\"r\"\r\n\r\n\
+             --r\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+             <p>News</p><img src=\"cid:logo@example.com\">\r\n\
+             --r\r\nContent-Type: image/png\r\nContent-ID: <logo@example.com>\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\nAAEC\r\n--r--\r\n{extra}--m--\r\n"
+        ))
+    };
+    let with_file = "--m\r\nContent-Type: application/pdf; name=\"a.pdf\"\r\n\
+        Content-Disposition: attachment; filename=\"a.pdf\"\r\n\r\nPDF\r\n";
+    let env = Env::filled_with(vec![(
+        "alice",
+        FakeServer::builder().user(USER, PASSWORD).folder(
+            Folder::new("INBOX")
+                .message(newsletter(""))
+                .message(newsletter(with_file)),
+        ),
+    )])
+    .await;
+
+    let list = json(&env.read(&["list", "--json"]).await);
+    let marks: Vec<(u64, bool)> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["uid"].as_u64().unwrap(),
+                m["has_attachments"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(marks, [(2, true), (1, false)]);
+    let text = stdout(&env.read(&["list"]).await);
+    let flags: Vec<&str> = text
+        .lines()
+        .map(|l| l.split('\t').nth(1).unwrap())
+        .collect();
+    assert_eq!(flags, ["u..@", "u..."]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn list_can_keep_the_unread_messages_only() {
     let env = Env::filled_with(vec![("alice", alice())]).await;
 

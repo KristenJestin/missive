@@ -3,7 +3,7 @@
 //! Nothing here interprets the HTML: it is handed back as the sender wrote it, and reduced to
 //! text only for people, by dropping its markup.
 
-use mail_parser::{MessageParser, MimeHeaders, PartType};
+use mail_parser::{Message, MessageParser, MimeHeaders, PartType};
 use serde::Serialize;
 
 use crate::copy::Person;
@@ -105,6 +105,68 @@ pub fn read(raw: &[u8]) -> Body {
     }
 }
 
+/// Whether a message has something a person would call an attachment: a file, or a message
+/// attached as a file. An image the HTML shows inside the text is not one: a part with a
+/// `Content-ID` that the HTML names as `cid:`, or an `inline` image inside `multipart/related`.
+/// A message nested without being attached (a bounce's copy of the original, say) is not one
+/// either.
+pub fn has_attachments(message: &Message) -> bool {
+    let html = message
+        .html_body
+        .iter()
+        .filter_map(|id| match &message.parts.get(*id as usize)?.body {
+            PartType::Html(html) => Some(html.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let related: Vec<u32> = message
+        .parts
+        .iter()
+        .filter(|part| {
+            part.content_type()
+                .is_some_and(|t| t.ctype() == "multipart" && t.subtype() == Some("related"))
+        })
+        .filter_map(|part| match &part.body {
+            PartType::Multipart(children) => Some(children),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    message.attachments.iter().any(|id| {
+        let Some(part) = message.parts.get(*id as usize) else {
+            return false;
+        };
+        if let PartType::Message(_) = part.body {
+            return part.attachment_name().is_some()
+                || part
+                    .content_disposition()
+                    .is_some_and(|d| d.is_attachment());
+        }
+        let image = part.content_type().is_some_and(|t| t.ctype() == "image");
+        let shown = part.content_id().is_some_and(|cid| {
+            references(&html, &cid.trim_matches(['<', '>']).to_ascii_lowercase())
+        }) || related.contains(id)
+            && part
+                .content_disposition()
+                .is_some_and(|d| d.ctype() == "inline");
+        !(image && shown)
+    })
+}
+
+/// Whether lowercased `html` holds `cid:<cid>` as a whole reference, not as the start of a
+/// longer one.
+fn references(html: &str, cid: &str) -> bool {
+    let needle = format!("cid:{cid}");
+    html.match_indices(&needle).any(|(at, _)| {
+        html[at + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, '"' | '\'' | ')' | '>' | ' ' | '\t' | '\r' | '\n'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +228,90 @@ mod tests {
             .as_bytes(),
         );
         assert_eq!(both.readable, "Plain");
+    }
+
+    fn attached(raw: &str) -> bool {
+        has_attachments(&MessageParser::default().parse(raw.as_bytes()).unwrap())
+    }
+
+    const PDF: &str = "--b\r\nContent-Type: application/pdf\r\n\
+        Content-Disposition: attachment; filename=a.pdf\r\n\r\nPDF\r\n";
+
+    #[test]
+    fn an_image_the_html_shows_inside_the_text_is_no_attachment() {
+        let newsletter = "Content-Type: multipart/related; boundary=b\r\n\r\n\
+            --b\r\nContent-Type: text/html\r\n\r\n<p>Hi</p><img src=\"cid:logo@example.org\">\r\n\
+            --b\r\nContent-Type: image/png\r\nContent-ID: <logo@example.org>\r\n\
+            Content-Transfer-Encoding: base64\r\n\r\nAAEC\r\n--b--\r\n";
+        assert!(!attached(newsletter));
+        // Without a Content-Disposition at all, the reference is what tells.
+        assert!(!attached(&newsletter.replace("related", "mixed")));
+    }
+
+    #[test]
+    fn an_inline_image_inside_multipart_related_is_no_attachment_even_unreferenced() {
+        assert!(!attached(
+            "Content-Type: multipart/related; boundary=b\r\n\r\n\
+             --b\r\nContent-Type: text/html\r\n\r\n<p>Hi</p>\r\n\
+             --b\r\nContent-Type: image/gif; name=x.gif\r\nContent-Disposition: inline\r\n\
+             \r\nGIF\r\n--b--\r\n"
+        ));
+    }
+
+    #[test]
+    fn a_file_next_to_an_inline_image_still_makes_an_attachment() {
+        let raw = format!(
+            "Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+             --b\r\nContent-Type: multipart/related; boundary=r\r\n\r\n\
+             --r\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:logo\">\r\n\
+             --r\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\n\r\nPNG\r\n--r--\r\n\
+             {PDF}--b--\r\n"
+        );
+        assert!(attached(&raw));
+    }
+
+    #[test]
+    fn an_image_the_html_does_not_show_is_an_attachment() {
+        let raw = |disposition: &str| {
+            format!(
+                "Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+                 --b\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:other\">\r\n\
+                 --b\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\n{disposition}\r\n\
+                 PNG\r\n--b--\r\n"
+            )
+        };
+        assert!(attached(&raw("")));
+        assert!(attached(&raw(
+            "Content-Disposition: attachment; filename=p.png\r\n"
+        )));
+        // `cid:logo2` is not `cid:logo`.
+        assert!(attached(&raw("").replace("cid:other", "cid:logo2")));
+    }
+
+    #[test]
+    fn a_nested_message_is_an_attachment_only_when_it_is_attached() {
+        let raw = |disposition: &str| {
+            format!(
+                "Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+                 --b\r\nContent-Type: text/plain\r\n\r\nSee below\r\n\
+                 --b\r\nContent-Type: message/rfc822\r\n{disposition}\r\n\
+                 Subject: Inner\r\n\r\nInner body\r\n--b--\r\n"
+            )
+        };
+        assert!(!attached(&raw("")));
+        assert!(!attached(&raw("Content-Disposition: inline\r\n")));
+        assert!(attached(&raw("Content-Disposition: attachment\r\n")));
+        assert!(attached(&raw(
+            "Content-Disposition: attachment; filename=fwd.eml\r\n"
+        )));
+    }
+
+    #[test]
+    fn a_message_in_text_and_html_versions_has_no_attachment() {
+        assert!(!attached(
+            "Content-Type: multipart/alternative; boundary=b\r\n\r\n\
+             --b\r\nContent-Type: text/plain\r\n\r\nPlain\r\n\
+             --b\r\nContent-Type: text/html\r\n\r\n<p>Plain</p>\r\n--b--\r\n"
+        ));
     }
 }

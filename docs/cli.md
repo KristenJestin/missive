@@ -429,7 +429,7 @@ One message, by the identifier `search` and `list` print (`<account>/<folder id>
 }
 ```
 
-It has the fields of a `list` message (but `has_attachments`: the list of `attachments` says it),
+It has the fields of a `list` message (but `has_attachments`: the list of `attachments` says it, with no distinction of inline images),
 and:
 
 | Field | Type | |
