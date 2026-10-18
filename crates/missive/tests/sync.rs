@@ -965,6 +965,24 @@ async fn a_listing_shorter_than_exists_leaves_its_folder_as_it_is_and_the_next_o
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_folder_named_with_a_quote_and_a_backslash_syncs_under_its_name() {
+    let name = "Rec\"ipes\\Old";
+    let server = mailbox()
+        .folder(Folder::new(name).message(message(7)))
+        .start()
+        .await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+
+    succeeded(&sync_soon(&env).await);
+
+    assert_eq!(env.uids(name).len(), 1);
+    assert_eq!(env.uids("INBOX"), [1, 2, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_session_lost_at_every_pass_answers_the_sync_and_records_unreachable() {
     let server = mailbox().cut("EXAMINE", 0).start().await;
     let env = Env::new().await;

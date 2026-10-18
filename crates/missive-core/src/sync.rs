@@ -170,7 +170,7 @@ pub async fn folders(
                     _ => None,
                 })
             };
-            names.push((list.name.to_string(), role));
+            names.push((unescape(&list.name), role));
         }
     })
     .await?;
@@ -520,6 +520,21 @@ fn new_message(attributes: &[AttributeValue<'_>], sizes: &HashMap<u32, u32>) -> 
     })
 }
 
+/// The name `LIST` gave, without the escapes of its quoted string (`\\` and `\"`): `imap-proto`
+/// hands the string over as it was written.
+fn unescape(name: &str) -> String {
+    let mut unescaped = String::with_capacity(name.len());
+    let mut chars = name.chars();
+    while let Some(c) = chars.next() {
+        unescaped.push(if c == '\\' {
+            chars.next().unwrap_or(c)
+        } else {
+            c
+        });
+    }
+    unescaped
+}
+
 /// A folder name as a quoted string; `None` for a name no command can carry.
 fn quote(name: &str) -> Option<String> {
     if name.contains(['\r', '\n']) {
@@ -684,6 +699,16 @@ mod tests {
         assert_eq!(quote("INBOX").unwrap(), "\"INBOX\"");
         assert_eq!(quote("a \"b\" \\c").unwrap(), "\"a \\\"b\\\" \\\\c\"");
         assert!(quote("a\r\nb").is_none());
+    }
+
+    #[test]
+    fn a_listed_folder_name_loses_the_escapes_of_its_quoted_string() {
+        assert_eq!(unescape("INBOX"), "INBOX");
+        assert_eq!(unescape("a\\\"b\\\\c"), "a\"b\\c");
+        // What quote() writes, unescape() reads back.
+        let name = "a \"b\" \\c\\";
+        let quoted = quote(name).unwrap();
+        assert_eq!(unescape(&quoted[1..quoted.len() - 1]), name);
     }
 
     #[test]
