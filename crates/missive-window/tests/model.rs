@@ -2,9 +2,12 @@
 
 mod common;
 
-use common::{ID, Mail, mailbox, plan};
+use std::time::Duration;
+
+use common::{ID, Mail, hostile, mailbox, plan};
 use missive_core::events::{Event, NewMessage, Unread};
-use missive_window::model::{Daemon, Model, Reader};
+use missive_core::fake::Folder;
+use missive_window::model::{Body, Daemon, Model, Reader};
 
 fn subjects(model: &Model) -> Vec<String> {
     model
@@ -28,6 +31,19 @@ fn opened_subject(model: &Model) -> Option<String> {
         Reader::Open(opened) => opened.subject.clone(),
         _ => None,
     }
+}
+
+fn opened_body(model: &Model) -> Option<Body> {
+    match &model.reader {
+        Reader::Open(opened) => Some(opened.body.clone()),
+        _ => None,
+    }
+}
+
+/// Runs the reduction the model asked for, as the window does off its thread, and hands it back.
+fn prepare(model: &mut Model) {
+    let reduction = model.take_reduction().expect("a reduction to run");
+    model.reduced(reduction.run());
 }
 
 fn select(model: &mut Model, role: &str) {
@@ -123,7 +139,11 @@ async fn the_reader_shows_the_headers_and_the_body_in_the_reduced_form() {
     );
     assert_eq!(opened.to[0].address.as_deref(), Some("dave@example.net"));
     assert!(opened.date.is_some());
-    let html = opened.html.as_deref().unwrap();
+    assert_eq!(opened.body, Body::Preparing);
+    prepare(&mut model);
+    let Some(Body::Reduced(html)) = opened_body(&model) else {
+        panic!("not reduced: {:?}", opened_body(&model));
+    };
     assert!(
         html.contains("<a href=\"https://www.example.org/news\">the news</a>"),
         "{html}"
@@ -260,4 +280,56 @@ async fn without_a_copy_the_window_shows_the_accounts_and_no_message() {
     assert_eq!(model.accounts[0].state, None);
     assert!(model.messages.is_empty());
     assert_eq!(model.problem, None);
+}
+
+#[tokio::test]
+async fn a_body_that_cannot_be_reduced_shows_its_text_and_does_not_block_other_messages() {
+    let mail = Mail::new(mailbox().folder(Folder::new("Hostile").message(hostile()))).await;
+    let mut model = mail.model();
+    let folder = model.accounts[0]
+        .folders
+        .iter()
+        .find(|f| f.folder.name == "Hostile")
+        .unwrap()
+        .folder
+        .id;
+    model.select_folder(ID, folder);
+    let hostile_id = model.messages[0].hit.id.clone();
+    model.open(&hostile_id);
+    assert_eq!(opened_body(&model), Some(Body::Preparing));
+    let late = model.take_reduction().unwrap();
+
+    // Another message opens while the first is still being prepared, and is shown.
+    select(&mut model, "inbox");
+    model.open_cursor();
+    assert_eq!(opened_subject(&model).as_deref(), Some("Plan 3"));
+    prepare(&mut model);
+    assert!(matches!(opened_body(&model), Some(Body::Reduced(_))));
+    // The first one's end, coming late, changes nothing.
+    model.reduced(late.run());
+    assert_eq!(opened_subject(&model).as_deref(), Some("Plan 3"));
+    assert!(matches!(opened_body(&model), Some(Body::Reduced(_))));
+
+    model.select_folder(ID, folder);
+    model.open(&hostile_id);
+    prepare(&mut model);
+    let Some(Body::Text(text)) = opened_body(&model) else {
+        panic!("not the text: {:?}", opened_body(&model));
+    };
+    assert!(text.contains("The hostile words."), "{text}");
+}
+
+#[tokio::test]
+async fn a_reduction_over_its_budget_shows_the_text() {
+    let mail = Mail::new(mailbox()).await;
+    let mut model = mail.model();
+    let id = model.messages[1].hit.id.clone();
+    model.open(&id);
+    let mut reduction = model.take_reduction().unwrap();
+    reduction.budget = Duration::ZERO;
+    model.reduced(reduction.run());
+    let Some(Body::Text(text)) = opened_body(&model) else {
+        panic!("not the text: {:?}", opened_body(&model));
+    };
+    assert!(text.contains("the news"), "{text}");
 }

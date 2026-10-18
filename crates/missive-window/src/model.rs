@@ -5,8 +5,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use missive_core::account::{AccountStore, Listing};
+use missive_core::body;
 use missive_core::copy::{Copy, FolderRef, List, Listed, NotFound, Person};
 use missive_core::events::Event;
 use missive_core::store::Store;
@@ -19,6 +21,9 @@ pub const LIMIT: usize = 500;
 /// The width the reduction computes styles at: what the author's CSS hides does not depend on it
 /// in practice, and the window lays the result out at its own width.
 const REDUCE_WIDTH: u32 = 800;
+
+/// How long a message may take to reduce before its text is shown instead.
+const BUDGET: Duration = Duration::from_secs(2);
 
 /// Where the window reads from.
 pub struct Sources {
@@ -89,12 +94,61 @@ pub struct Opened {
     pub to: Vec<Person>,
     pub cc: Vec<Person>,
     pub date: Option<i64>,
-    /// The body in the reduced form; `None` when the message has no readable body.
-    pub html: Option<String>,
+    pub body: Body,
     /// The message's parts named by a Content-ID, for its `cid:` images.
     pub parts: HashMap<String, Vec<u8>>,
     /// The message as the server sent it, for "View original".
     pub raw: Vec<u8>,
+}
+
+/// The body of the open message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Body {
+    /// Being reduced, off the window's thread.
+    Preparing,
+    /// The reduced form.
+    Reduced(String),
+    /// The message's text: its body could not be reduced (too large, too deep, too long, or the
+    /// reduction failed).
+    Text(String),
+    /// The message has no readable body.
+    None,
+}
+
+/// A message to reduce off the window's thread: [`Reduction::run`] takes up to its budget.
+pub struct Reduction {
+    /// Which opening it is for: a later one makes it stale.
+    opening: u64,
+    raw: Vec<u8>,
+    theme: Theme,
+    pub budget: Duration,
+}
+
+/// What a reduction gives back to the model.
+pub struct Reduced {
+    opening: u64,
+    body: Body,
+    parts: HashMap<String, Vec<u8>>,
+}
+
+impl Reduction {
+    pub fn run(self) -> Reduced {
+        let (body, parts) = match message::read(&self.raw) {
+            Ok(message) => {
+                let body = match reduce(&message.html, self.theme, REDUCE_WIDTH, self.budget) {
+                    Ok(html) => Body::Reduced(html),
+                    Err(_) => Body::Text(body::read(&self.raw).readable),
+                };
+                (body, message.parts)
+            }
+            Err(_) => (Body::None, HashMap::new()),
+        };
+        Reduced {
+            opening: self.opening,
+            body,
+            parts,
+        }
+    }
 }
 
 pub struct Model {
@@ -114,6 +168,9 @@ pub struct Model {
     /// Why the copy or the configuration could not be read, for people.
     pub problem: Option<String>,
     dark: bool,
+    /// How many times a message was read for the reader: the last one is the one shown.
+    openings: u64,
+    reduction: Option<Reduction>,
 }
 
 impl Model {
@@ -132,6 +189,8 @@ impl Model {
             reader: Reader::Empty,
             problem: None,
             dark: false,
+            openings: 0,
+            reduction: None,
         };
         model.refresh();
         model
@@ -244,6 +303,24 @@ impl Model {
     /// Closes the reader.
     pub fn back(&mut self) {
         self.reader = Reader::Empty;
+        self.reduction = None;
+    }
+
+    /// The reduction the open message waits for, to run off the window's thread.
+    pub fn take_reduction(&mut self) -> Option<Reduction> {
+        self.reduction.take()
+    }
+
+    /// Shows a reduction's result, unless another message (or the same one again) was opened
+    /// since.
+    pub fn reduced(&mut self, reduced: Reduced) {
+        if reduced.opening != self.openings {
+            return;
+        }
+        if let Reader::Open(opened) = &mut self.reader {
+            opened.body = reduced.body;
+            opened.parts = reduced.parts;
+        }
     }
 
     /// Follows the system's colours: the open message is reduced again under the other theme.
@@ -389,10 +466,13 @@ impl Model {
                 return Reader::Gone;
             }
         };
-        let (html, parts) = match message::read(&stored.raw) {
-            Ok(body) => (Some(reduce(&body.html, &theme, REDUCE_WIDTH)), body.parts),
-            Err(_) => (None, HashMap::new()),
-        };
+        self.openings += 1;
+        self.reduction = Some(Reduction {
+            opening: self.openings,
+            raw: stored.raw.clone(),
+            theme,
+            budget: BUDGET,
+        });
         Reader::Open(Box::new(Opened {
             id: stored.hit.id,
             subject: stored.hit.subject,
@@ -400,8 +480,8 @@ impl Model {
             to: stored.hit.to,
             cc: stored.cc,
             date: stored.hit.date,
-            html,
-            parts,
+            body: Body::Preparing,
+            parts: HashMap::new(),
             raw: stored.raw,
         }))
     }

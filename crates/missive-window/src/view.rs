@@ -15,7 +15,7 @@ use missive_core::copy::{Person, utc};
 use missive_core::opener::followable;
 
 use crate::images::MessageImages;
-use crate::model::{Daemon, Model, Opened, Reader};
+use crate::model::{Body, Daemon, Model, Opened, Reader};
 
 actions!(
     missive_window,
@@ -64,8 +64,7 @@ impl MailWindow {
         window.focus(&focus, cx);
         cx.observe_window_appearance(window, |this, window, cx| {
             this.model.set_dark(is_dark(window.appearance()));
-            this.images = images_of(&this.model);
-            cx.notify();
+            this.changed(cx);
         })
         .detach();
         let mut model = model;
@@ -81,8 +80,19 @@ impl MailWindow {
         }
     }
 
-    /// After the model changed: the images follow the open message, the list follows the cursor.
+    /// After the model changed: the open message is reduced off this thread, the images follow
+    /// it, the list follows the cursor.
     pub fn changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(reduction) = self.model.take_reduction() {
+            cx.spawn(async move |this, cx| {
+                let reduced = cx.background_spawn(async move { reduction.run() }).await;
+                this.update(cx, |this, cx| {
+                    this.model.reduced(reduced);
+                    this.changed(cx);
+                })
+            })
+            .detach();
+        }
         self.images = images_of(&self.model);
         if let Some(at) = self.model.cursor {
             self.list.scroll_to_item(at, ScrollStrategy::Nearest);
@@ -448,8 +458,12 @@ impl MailWindow {
                         .overflow_y_scroll()
                         .px_6()
                         .py_4()
-                        .child(match &opened.html {
-                            Some(html) => body(
+                        .child(match &opened.body {
+                            Body::Preparing => div()
+                                .text_color(palette.muted)
+                                .child("Preparing…")
+                                .into_any_element(),
+                            Body::Reduced(html) => body(
                                 &opened.id,
                                 html,
                                 self.images.clone(),
@@ -457,7 +471,28 @@ impl MailWindow {
                                 palette,
                             )
                             .into_any_element(),
-                            None => div()
+                            Body::Text(text) => {
+                                let raw = opened.raw.clone();
+                                let opener = self.opener.clone();
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .id("text-only")
+                                            .debug_selector(|| "text-only".to_owned())
+                                            .text_color(palette.muted)
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |_, _, _, _| {
+                                                opener(Opening::Original(raw.clone()));
+                                            }))
+                                            .child("Shown as text: this message is too large or too deep to lay out. View original shows it as it was sent."),
+                                    )
+                                    .child(text.clone())
+                                    .into_any_element()
+                            }
+                            Body::None => div()
                                 .text_color(palette.muted)
                                 .child("This message has no readable body: View original shows it as it was sent.")
                                 .into_any_element(),

@@ -11,12 +11,13 @@ use std::net::TcpListener;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use common::{Mail, mailbox};
+use common::{Mail, hostile, mailbox};
 use gpui_kit::http_client::{self, AsyncBody, HttpClient, Request, Response, Url, http};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     Context, Modifiers, MouseButton, TestAppContext, VisualTestContext, Window, div, point, px,
 };
+use missive_core::fake::{FakeServer, Folder};
 use missive_window::images::MessageImages;
 use missive_window::view::{self, MailWindow, Opener, Opening, Palette};
 
@@ -263,4 +264,28 @@ fn the_keyboard_moves_opens_and_closes_and_view_original_opens_the_message(
 
     cx.simulate_keystrokes("escape");
     assert_eq!(subject(cx), None);
+}
+
+#[gpui_kit::test]
+fn a_message_too_deep_to_lay_out_shows_its_text_and_offers_the_original(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mail = runtime.block_on(Mail::new(
+        FakeServer::builder()
+            .user(common::USER, common::PASSWORD)
+            .folder(Folder::new("INBOX").message(hostile())),
+    ));
+    let (opener, opened) = recorder();
+    let cx = window(cx, &mail, opener);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let bounds = cx
+        .debug_bounds("text-only")
+        .expect("the line saying the text is shown");
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    let opened = opened.lock().unwrap().clone();
+    let [Opening::Original(raw)] = opened.as_slice() else {
+        panic!("not the original: {}", opened.len());
+    };
+    assert!(String::from_utf8_lossy(raw).contains("Subject: Plan 5"));
 }

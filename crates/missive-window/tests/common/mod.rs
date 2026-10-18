@@ -14,8 +14,8 @@ use missive_window::model::{Model, Sources};
 use tempfile::TempDir;
 
 pub const ID: &str = "alice";
-const USER: &str = "alice@example.org";
-const PASSWORD: &str = "Recognisable-Pa55word-4c1d";
+pub const USER: &str = "alice@example.org";
+pub const PASSWORD: &str = "Recognisable-Pa55word-4c1d";
 
 /// A message from Carol whose subject is `Plan <n>`, dated `n` minutes after 09:00 (+0200) on 17
 /// October 2026.
@@ -36,6 +36,18 @@ pub fn newsletter() -> Message {
          <p><img src=\"https://images.example.org/logo.png\" alt=\"Our logo\"></p>\
          <p>Read <a href=\"https://www.example.org/news\">the news</a>.</p>\
          <img src=\"https://track.example.net/pixel.gif\" width=\"1\" height=\"1\"></body></html>",
+    )
+}
+
+/// Plan 5, nested deeper than the reduction follows (in SVG, nothing closes what came before).
+pub fn hostile() -> Message {
+    plan(
+        5,
+        "Content-Type: text/html; charset=utf-8\r\n",
+        &format!(
+            "<p>The hostile words.</p><svg>{}</svg>",
+            "<tr>".repeat(5_000)
+        ),
     )
 }
 

@@ -103,19 +103,22 @@ fn render_one(way: &str, eml: &Path, png: &Path, width: u32) -> ExitCode {
             return ExitCode::from(run::UNREADABLE_EXIT as u8);
         }
     };
+    // The run's own timeout bounds the reduction: its budget here is only a backstop.
+    let reduced = |theme| reduce::reduce(&message.html, theme, width, Duration::from_secs(3600));
     let (html, scheme) = match way {
-        "blitz" => (message.html, ColorScheme::Light),
-        "reduced-light" => (
-            reduce::reduce(&message.html, &reduce::Theme::Light, width),
-            ColorScheme::Light,
-        ),
-        "reduced-dark" => (
-            reduce::reduce(&message.html, &reduce::Theme::Dark, width),
-            ColorScheme::Dark,
-        ),
+        "blitz" => (Ok(message.html.clone()), ColorScheme::Light),
+        "reduced-light" => (reduced(reduce::Theme::Light), ColorScheme::Light),
+        "reduced-dark" => (reduced(reduce::Theme::Dark), ColorScheme::Dark),
         _ => {
             eprintln!("render-bench: unknown way {way}");
             return ExitCode::from(2);
+        }
+    };
+    let html = match html {
+        Ok(html) => html,
+        Err(refused) => {
+            eprintln!("render-bench: not reduced: {refused:?}");
+            return ExitCode::from(run::UNREADABLE_EXIT as u8);
         }
     };
     match render::draw(&html, message.parts, width, scheme, png) {
