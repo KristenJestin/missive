@@ -94,10 +94,11 @@ pub struct SaveDraft {
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<Attached>>,
-    /// The thread a new draft answers (`reply`): Message-IDs without angle brackets. Ignored
-    /// when a draft is picked up again, which keeps its own.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub in_reply_to: Vec<String>,
+    /// The Message-ID, without angle brackets, of the message the draft answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    /// The `References` of the draft, Message-IDs without angle brackets; none given keeps its
+    /// own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<String>,
     /// Sends the draft (through the outbox); it is removed from the Drafts folder once the
@@ -122,9 +123,10 @@ pub struct Send {
     pub body: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attached>,
-    /// The thread the message answers: Message-IDs without angle brackets.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub in_reply_to: Vec<String>,
+    /// The `Message-ID`, without angle brackets, of the message this one answers, and the
+    /// `References` of its thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<String>,
     /// The identifier of the message this one is a reply to: once the server took the reply,
@@ -384,12 +386,12 @@ mod tests {
 
     #[test]
     fn a_reply_request_names_its_thread_and_the_message_it_answers() {
-        let line = r#"{"protocol":1,"request":"send","account":"alice","body":"","in_reply_to":["a@example.com"],"references":["r@example.com","a@example.com"],"answers":"alice/1/2/3"}"#;
+        let line = r#"{"protocol":1,"request":"send","account":"alice","body":"","in_reply_to":"a@example.com","references":["r@example.com","a@example.com"],"answers":"alice/1/2/3"}"#;
         let request = Request {
             protocol: 1,
             command: Command::Send(Send {
                 account: "alice".to_owned(),
-                in_reply_to: vec!["a@example.com".to_owned()],
+                in_reply_to: Some("a@example.com".to_owned()),
                 references: vec!["r@example.com".to_owned(), "a@example.com".to_owned()],
                 answers: Some("alice/1/2/3".to_owned()),
                 ..Send::default()
@@ -425,6 +427,22 @@ mod tests {
                 })
             })
         );
+    }
+
+    #[test]
+    fn a_draft_request_may_name_the_message_it_answers() {
+        let line =
+            r#"{"protocol":1,"request":"draft","account":"alice","in_reply_to":"1@example.org"}"#;
+        let request = Request {
+            protocol: 1,
+            command: Command::Draft(SaveDraft {
+                account: "alice".to_owned(),
+                in_reply_to: Some("1@example.org".to_owned()),
+                ..SaveDraft::default()
+            }),
+        };
+        assert_eq!(read_request(line), Ok(request.clone()));
+        assert_eq!(serde_json::to_string(&request).unwrap(), line);
     }
 
     #[test]

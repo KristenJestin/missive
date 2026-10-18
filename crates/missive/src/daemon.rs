@@ -692,7 +692,8 @@ impl Daemon {
             || request.bcc.is_some()
             || request.subject.is_some()
             || request.body.is_some()
-            || request.attachments.is_some();
+            || request.attachments.is_some()
+            || request.in_reply_to.is_some();
         let mailboxes = |list: &[String]| -> Result<Vec<Mailbox>, String> {
             list.iter().map(|text| Mailbox::parse(text)).collect()
         };
@@ -721,9 +722,11 @@ impl Daemon {
                     })
                     .collect();
             }
-            if request.draft.is_none() {
-                draft.in_reply_to = request.in_reply_to.clone();
-                draft.references = request.references.clone();
+            if let Some(id) = request.in_reply_to {
+                draft.in_reply_to = vec![id];
+            }
+            if !request.references.is_empty() {
+                draft.references = request.references;
             }
             if request.send {
                 draft.check()?;
@@ -835,7 +838,7 @@ impl Daemon {
                         data: a.data,
                     })
                     .collect(),
-                in_reply_to: send.in_reply_to,
+                in_reply_to: send.in_reply_to.into_iter().collect(),
                 references: send.references,
             })
         })();
