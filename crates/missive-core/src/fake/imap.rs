@@ -385,6 +385,8 @@ impl Session {
             self.send(format!("{tag} NO [NONEXISTENT] no such folder"));
             return Flow::Continue;
         };
+        // In the order Gmail sends them: UIDVALIDITY before EXISTS, so that an answer cut short
+        // can hold one without the other.
         let mut lines = vec![
             format!("* FLAGS {SYSTEM_FLAGS}"),
             if read_only {
@@ -392,16 +394,13 @@ impl Session {
             } else {
                 format!("* OK [PERMANENTFLAGS {SYSTEM_FLAGS}] flags allowed")
             },
+            format!("* OK [UIDVALIDITY {}] UIDs valid", folder.uidvalidity),
             format!("* {} EXISTS", folder.messages.len()),
             "* 0 RECENT".to_owned(),
         ];
         if let Some(position) = folder.messages.iter().position(|m| !seen(m)) {
             lines.push(format!("* OK [UNSEEN {}] first unseen", position + 1));
         }
-        lines.push(format!(
-            "* OK [UIDVALIDITY {}] UIDs valid",
-            folder.uidvalidity
-        ));
         lines.push(format!(
             "* OK [UIDNEXT {}] predicted next UID",
             folder.uidnext
