@@ -48,6 +48,9 @@ pub enum Tried {
         message_id: String,
         /// `append`, `server` or `none`: see [`crate::events::Sent`].
         sent_copy: &'static str,
+        /// Whether the message it answers was marked `\Answered`: the account's IMAP worker has
+        /// that action to apply.
+        answered: bool,
     },
     /// It stays to send: the server took nothing.
     Again { id: i64, reason: String },
@@ -106,11 +109,12 @@ pub async fn send_next(
             } else {
                 "append"
             };
-            store.sent(id, sent_copy == "append")?;
+            let answered = store.sent(id, sent_copy == "append")?;
             Tried::Sent {
                 id,
                 message_id,
                 sent_copy,
+                answered,
             }
         }
         Ok(Submitted::Again { reason }) => {

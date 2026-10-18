@@ -4,6 +4,7 @@
 use rusqlite::{OptionalExtension, params};
 
 use super::Store;
+use crate::actions::{Kind, Wanted};
 use crate::compose::Built;
 
 /// A message of the outbox to send.
@@ -45,10 +46,33 @@ impl Store {
         sent_copy: bool,
         draft: Option<&str>,
     ) -> rusqlite::Result<i64> {
+        self.insert_outbox(account, built, sent_copy, draft, None)
+    }
+
+    /// Puts a reply in the account's outbox. Once the server took it, the message it answers
+    /// (`answers`, its identifier) is marked `\Answered`, through the queue of actions.
+    pub fn enqueue_reply(
+        &self,
+        account: i64,
+        built: &Built,
+        sent_copy: bool,
+        answers: &str,
+    ) -> rusqlite::Result<i64> {
+        self.insert_outbox(account, built, sent_copy, None, Some(answers))
+    }
+
+    fn insert_outbox(
+        &self,
+        account: i64,
+        built: &Built,
+        sent_copy: bool,
+        draft: Option<&str>,
+        answers: Option<&str>,
+    ) -> rusqlite::Result<i64> {
         self.connection.query_row(
             "INSERT INTO outbox (account, sender, recipients, message_id, raw, bcc_header,
-                                 sent_copy, queued_at, draft)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch(), ?8)
+                                 sent_copy, queued_at, draft, answers)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch(), ?8, ?9)
              RETURNING id",
             params![
                 account,
@@ -58,7 +82,8 @@ impl Store {
                 built.raw,
                 built.bcc_header,
                 sent_copy,
-                draft
+                draft,
+                answers
             ],
             |r| r.get(0),
         )
@@ -160,25 +185,40 @@ impl Store {
     }
 
     /// The server took the message: it leaves the outbox, or waits for its copy in Sent when
-    /// `copy`. The draft it was sent from, if any, is to be removed, in the same transaction.
-    pub fn sent(&mut self, id: i64, copy: bool) -> rusqlite::Result<()> {
+    /// `copy`. The draft it was sent from, if any, is to be removed, and the message it answers,
+    /// if any, is to be marked `\Answered`, in the same transaction. Whether an action was
+    /// recorded for the latter: the original may be gone, or being moved, by now, and then
+    /// there is nothing to mark.
+    pub fn sent(&mut self, id: i64, copy: bool) -> rusqlite::Result<bool> {
         let transaction = self.connection.transaction()?;
-        let draft: Option<(i64, Option<String>)> = transaction
+        let row: Option<(i64, Option<String>, Option<String>)> = transaction
             .query_row(
-                "SELECT account, draft FROM outbox WHERE id = ?1",
+                "SELECT account, draft, answers FROM outbox WHERE id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((account, Some(draft))) = draft {
-            super::drafts::remove_draft(&transaction, account, &draft)?;
+        let mut answered = false;
+        if let Some((account, draft, answers)) = row {
+            if let Some(draft) = draft {
+                super::drafts::remove_draft(&transaction, account, &draft)?;
+            }
+            if let Some(answers) = answers {
+                answered = super::queue::queue_in(
+                    &transaction,
+                    &[answers],
+                    &Wanted::Mark(Kind::Answered),
+                )?
+                .is_ok();
+            }
         }
         if copy {
             transaction.execute("UPDATE outbox SET state = 'sent' WHERE id = ?1", [id])?;
         } else {
             transaction.execute("DELETE FROM outbox WHERE id = ?1", [id])?;
         }
-        transaction.commit()
+        transaction.commit()?;
+        Ok(answered)
     }
 
     fn set(&self, id: i64, state: &str, why: Option<&str>) -> rusqlite::Result<()> {
@@ -387,5 +427,77 @@ mod tests {
         assert_eq!(store.sent_copies(account).unwrap()[0].attempts, 1);
         store.copy_done(one).unwrap();
         assert!(states(&store).is_empty());
+    }
+
+    /// The account's inbox holds UID 1; returns the inbox row and the message's identifier.
+    fn with_a_message(store: &mut Store, account: i64) -> (i64, String) {
+        let inbox = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
+        store.rebuild(inbox, 10).unwrap();
+        let raw = b"From: carol@example.com\r\nSubject: Hi\r\n\r\nHello.\r\n".to_vec();
+        store
+            .insert(
+                inbox,
+                &[crate::store::NewMessage {
+                    uid: 1,
+                    flags: "\\Seen".to_owned(),
+                    internal_date: Some(1_790_000_000),
+                    size: raw.len() as i64,
+                    raw,
+                }],
+            )
+            .unwrap();
+        (inbox, crate::copy::message_id("alice", inbox, 10, 1))
+    }
+
+    fn actions(store: &Store) -> Vec<String> {
+        store
+            .connection
+            .prepare("SELECT kind FROM action ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_reply_marks_the_original_answered_only_once_it_is_sent() {
+        let (_dir, mut store, account) = open();
+        let (inbox, original) = with_a_message(&mut store, account);
+        let reply = store
+            .enqueue_reply(account, &built(1), false, &original)
+            .unwrap();
+
+        // Waiting to be sent, it marks nothing.
+        assert!(actions(&store).is_empty());
+        assert_eq!(store.flags(inbox).unwrap()[&1], "\\Seen");
+
+        assert!(store.sent(reply, false).unwrap());
+        assert_eq!(actions(&store), ["answered"]);
+        assert_eq!(store.flags(inbox).unwrap()[&1], "\\Answered \\Seen");
+        assert!(states(&store).is_empty());
+    }
+
+    #[test]
+    fn a_message_sent_that_answers_nothing_marks_nothing() {
+        let (_dir, mut store, account) = open();
+        with_a_message(&mut store, account);
+        let one = store.enqueue(account, &built(1), false, None).unwrap();
+        assert!(!store.sent(one, false).unwrap());
+        assert!(actions(&store).is_empty());
+    }
+
+    #[test]
+    fn a_reply_sent_whose_original_is_gone_is_sent_all_the_same() {
+        let (_dir, mut store, account) = open();
+        let (inbox, original) = with_a_message(&mut store, account);
+        let reply = store
+            .enqueue_reply(account, &built(1), true, &original)
+            .unwrap();
+        store.rebuild(inbox, 11).unwrap();
+
+        assert!(!store.sent(reply, true).unwrap());
+        assert!(actions(&store).is_empty());
+        assert_eq!(states(&store), [(reply, "sent".to_owned())]);
     }
 }

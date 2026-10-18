@@ -64,173 +64,187 @@ impl Store {
         wanted: &Wanted,
     ) -> rusqlite::Result<Result<Queued, Refused>> {
         let transaction = self.connection.transaction()?;
-        let mut groups: Vec<Group> = Vec::new();
-        let mut queued = Queued::default();
-        for id in ids {
-            let Some(parsed) = MessageId::parse(id) else {
-                return Ok(Err(not_found(id, NotFound::Invalid)));
-            };
-            let folder: Option<(i64, Option<u32>, Option<String>, String)> = transaction
-                .query_row(
-                    "SELECT account.key, folder.uidvalidity, folder.role, folder.name FROM folder
+        let queued = queue_in(&transaction, ids, wanted)?;
+        if queued.is_ok() {
+            transaction.commit()?;
+        }
+        Ok(queued)
+    }
+}
+
+/// [`Store::queue`] inside a transaction the caller commits, when the request was recorded.
+pub(super) fn queue_in(
+    transaction: &Transaction,
+    ids: &[String],
+    wanted: &Wanted,
+) -> rusqlite::Result<Result<Queued, Refused>> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut queued = Queued::default();
+    for id in ids {
+        let Some(parsed) = MessageId::parse(id) else {
+            return Ok(Err(not_found(id, NotFound::Invalid)));
+        };
+        let folder: Option<(i64, Option<u32>, Option<String>, String)> = transaction
+            .query_row(
+                "SELECT account.key, folder.uidvalidity, folder.role, folder.name FROM folder
                        JOIN account ON account.key = folder.account
                       WHERE account.id = ?1 AND folder.id = ?2",
-                    params![parsed.account, parsed.folder],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
-                .optional()?;
-            let Some((account, uidvalidity, role, name)) = folder else {
-                return Ok(Err(not_found(id, NotFound::Unknown)));
-            };
-            if uidvalidity.unwrap_or(0) != parsed.uidvalidity {
-                return Ok(Err(not_found(id, NotFound::Renumbered(name))));
-            }
-            let moving: Option<Option<i64>> = transaction
-                .query_row(
-                    "SELECT moving_to FROM message WHERE folder = ?1 AND uid = ?2",
-                    params![parsed.folder, parsed.uid],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let Some(moving) = moving else {
-                return Ok(Err(not_found(id, NotFound::Unknown)));
-            };
-            if moving.is_some() {
-                return Ok(Err(Refused::new(
-                    "busy",
-                    format!(
-                        "{id}: a move of this message waits for the server; ask again once it is \
+                params![parsed.account, parsed.folder],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((account, uidvalidity, role, name)) = folder else {
+            return Ok(Err(not_found(id, NotFound::Unknown)));
+        };
+        if uidvalidity.unwrap_or(0) != parsed.uidvalidity {
+            return Ok(Err(not_found(id, NotFound::Renumbered(name))));
+        }
+        let moving: Option<Option<i64>> = transaction
+            .query_row(
+                "SELECT moving_to FROM message WHERE folder = ?1 AND uid = ?2",
+                params![parsed.folder, parsed.uid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(moving) = moving else {
+            return Ok(Err(not_found(id, NotFound::Unknown)));
+        };
+        if moving.is_some() {
+            return Ok(Err(Refused::new(
+                "busy",
+                format!(
+                    "{id}: a move of this message waits for the server; ask again once it is \
                          applied (missive watch tells when)"
-                    ),
-                )));
-            }
-            if queued.messages.contains(id) {
-                continue;
-            }
-            queued.messages.push(id.clone());
-            if !queued.accounts.contains(&parsed.account) {
-                queued.accounts.push(parsed.account.clone());
-            }
-            match groups.iter_mut().find(|g| g.folder == parsed.folder) {
-                Some(group) => group.uids.push(parsed.uid),
-                None => groups.push(Group {
-                    account,
-                    account_id: parsed.account.clone(),
-                    folder: parsed.folder,
-                    role,
-                    uidvalidity: parsed.uidvalidity,
-                    uids: vec![parsed.uid],
-                    first: id.clone(),
-                }),
-            }
+                ),
+            )));
         }
-
-        // Every group is checked before anything is written.
-        let mut actions = Vec::new();
-        for group in &mut groups {
-            group.uids.sort_unstable();
-            let trash = folder_with_role(&transaction, group.account, "trash")?;
-            let in_trash = group.role.as_deref() == Some("trash");
-            let (kind, target) = match wanted {
-                Wanted::Mark(kind) => (*kind, None),
-                Wanted::Move(to) => {
-                    let Some(target) = find_folder(&transaction, group.account, to)? else {
-                        return Ok(Err(Refused::new(
-                            "no-such-folder",
-                            format!(
-                                "the account {} has no folder {to} (a role, or a name as missive \
-                                 unread shows it)",
-                                group.account_id
-                            ),
-                        )));
-                    };
-                    if target == group.folder {
-                        // Already there: nothing to do.
-                        continue;
-                    }
-                    (Kind::Move, Some(target))
-                }
-                Wanted::Delete { permanently: false } => {
-                    if in_trash {
-                        return Ok(Err(Refused::new(
-                            "in-trash",
-                            format!(
-                                "{}: already in the trash; missive delete --permanently deletes \
-                                 it for good",
-                                group.first
-                            ),
-                        )));
-                    }
-                    let Some(trash) = trash else {
-                        return Ok(Err(Refused::new(
-                            "no-trash",
-                            format!(
-                                "the account {} has no trash folder to move messages to; missive \
-                                 delete --permanently deletes them for good",
-                                group.account_id
-                            ),
-                        )));
-                    };
-                    (Kind::Delete, Some(trash))
-                }
-                Wanted::Delete { permanently: true } => {
-                    if trash.is_some() && !in_trash {
-                        return Ok(Err(Refused::new(
-                            "not-in-trash",
-                            format!(
-                                "{}: not in the trash; missive delete moves it there, and only \
-                                 from there does --permanently delete for good",
-                                group.first
-                            ),
-                        )));
-                    }
-                    (Kind::DeletePermanently, None)
-                }
-            };
-            actions.push((&*group, kind, target));
+        if queued.messages.contains(id) {
+            continue;
         }
-
-        for (group, kind, target) in actions {
-            transaction.execute(
-                "INSERT INTO action (account, folder, uidvalidity, uids, kind, target)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    group.account,
-                    group.folder,
-                    group.uidvalidity,
-                    serde_json::to_string(&group.uids).expect("numbers serialize"),
-                    kind.name(),
-                    target
-                ],
-            )?;
-            for uid in &group.uids {
-                if let Some((flag, add)) = kind.flag() {
-                    let flags: String = transaction.query_row(
-                        "SELECT flags FROM message WHERE folder = ?1 AND uid = ?2",
-                        params![group.folder, uid],
-                        |r| r.get(0),
-                    )?;
-                    transaction.execute(
-                        "UPDATE message SET flags = ?3 WHERE folder = ?1 AND uid = ?2",
-                        params![group.folder, uid, with_flag(&flags, flag, add)],
-                    )?;
-                } else if kind.moves() {
-                    transaction.execute(
-                        "UPDATE message SET moving_to = ?3 WHERE folder = ?1 AND uid = ?2",
-                        params![group.folder, uid, target],
-                    )?;
-                } else {
-                    transaction.execute(
-                        "DELETE FROM message WHERE folder = ?1 AND uid = ?2",
-                        params![group.folder, uid],
-                    )?;
-                }
-            }
+        queued.messages.push(id.clone());
+        if !queued.accounts.contains(&parsed.account) {
+            queued.accounts.push(parsed.account.clone());
         }
-        transaction.commit()?;
-        Ok(Ok(queued))
+        match groups.iter_mut().find(|g| g.folder == parsed.folder) {
+            Some(group) => group.uids.push(parsed.uid),
+            None => groups.push(Group {
+                account,
+                account_id: parsed.account.clone(),
+                folder: parsed.folder,
+                role,
+                uidvalidity: parsed.uidvalidity,
+                uids: vec![parsed.uid],
+                first: id.clone(),
+            }),
+        }
     }
 
+    // Every group is checked before anything is written.
+    let mut actions = Vec::new();
+    for group in &mut groups {
+        group.uids.sort_unstable();
+        let trash = folder_with_role(transaction, group.account, "trash")?;
+        let in_trash = group.role.as_deref() == Some("trash");
+        let (kind, target) = match wanted {
+            Wanted::Mark(kind) => (*kind, None),
+            Wanted::Move(to) => {
+                let Some(target) = find_folder(transaction, group.account, to)? else {
+                    return Ok(Err(Refused::new(
+                        "no-such-folder",
+                        format!(
+                            "the account {} has no folder {to} (a role, or a name as missive \
+                                 unread shows it)",
+                            group.account_id
+                        ),
+                    )));
+                };
+                if target == group.folder {
+                    // Already there: nothing to do.
+                    continue;
+                }
+                (Kind::Move, Some(target))
+            }
+            Wanted::Delete { permanently: false } => {
+                if in_trash {
+                    return Ok(Err(Refused::new(
+                        "in-trash",
+                        format!(
+                            "{}: already in the trash; missive delete --permanently deletes \
+                                 it for good",
+                            group.first
+                        ),
+                    )));
+                }
+                let Some(trash) = trash else {
+                    return Ok(Err(Refused::new(
+                        "no-trash",
+                        format!(
+                            "the account {} has no trash folder to move messages to; missive \
+                                 delete --permanently deletes them for good",
+                            group.account_id
+                        ),
+                    )));
+                };
+                (Kind::Delete, Some(trash))
+            }
+            Wanted::Delete { permanently: true } => {
+                if trash.is_some() && !in_trash {
+                    return Ok(Err(Refused::new(
+                        "not-in-trash",
+                        format!(
+                            "{}: not in the trash; missive delete moves it there, and only \
+                                 from there does --permanently delete for good",
+                            group.first
+                        ),
+                    )));
+                }
+                (Kind::DeletePermanently, None)
+            }
+        };
+        actions.push((&*group, kind, target));
+    }
+
+    for (group, kind, target) in actions {
+        transaction.execute(
+            "INSERT INTO action (account, folder, uidvalidity, uids, kind, target)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                group.account,
+                group.folder,
+                group.uidvalidity,
+                serde_json::to_string(&group.uids).expect("numbers serialize"),
+                kind.name(),
+                target
+            ],
+        )?;
+        for uid in &group.uids {
+            if let Some((flag, add)) = kind.flag() {
+                let flags: String = transaction.query_row(
+                    "SELECT flags FROM message WHERE folder = ?1 AND uid = ?2",
+                    params![group.folder, uid],
+                    |r| r.get(0),
+                )?;
+                transaction.execute(
+                    "UPDATE message SET flags = ?3 WHERE folder = ?1 AND uid = ?2",
+                    params![group.folder, uid, with_flag(&flags, flag, add)],
+                )?;
+            } else if kind.moves() {
+                transaction.execute(
+                    "UPDATE message SET moving_to = ?3 WHERE folder = ?1 AND uid = ?2",
+                    params![group.folder, uid, target],
+                )?;
+            } else {
+                transaction.execute(
+                    "DELETE FROM message WHERE folder = ?1 AND uid = ?2",
+                    params![group.folder, uid],
+                )?;
+            }
+        }
+    }
+    Ok(Ok(queued))
+}
+
+impl Store {
     /// The account's first action, the one to apply next.
     pub fn next_action(&self, account: i64) -> rusqlite::Result<Option<Action>> {
         self.connection
@@ -470,7 +484,7 @@ pub(super) fn pending_flags(
         "SELECT action.kind, action.uids FROM action
            JOIN folder ON folder.id = action.folder
           WHERE action.folder = ?1 AND action.uidvalidity = folder.uidvalidity
-            AND action.kind IN ('read', 'unread', 'flagged', 'unflagged')
+            AND action.kind IN ('read', 'unread', 'flagged', 'unflagged', 'answered')
           ORDER BY action.id",
     )?;
     let rows = statement.query_map([folder], |r| {

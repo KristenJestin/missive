@@ -580,7 +580,7 @@ impl Daemon {
             }
             Command::Subscribe => unreachable!("`serve` answers a subscription itself"),
             Command::Mark { messages, mark_as } => match Kind::parse(&mark_as) {
-                Some(kind) if kind.flag().is_some() => {
+                Some(kind) if kind.flag().is_some() && kind != Kind::Answered => {
                     self.record(name, &messages, Wanted::Mark(kind))
                 }
                 _ => Answer::error(
@@ -725,6 +725,9 @@ impl Daemon {
             if let Some(id) = request.in_reply_to {
                 draft.in_reply_to = vec![id];
             }
+            if !request.references.is_empty() {
+                draft.references = request.references;
+            }
             if request.send {
                 draft.check()?;
             }
@@ -835,7 +838,8 @@ impl Daemon {
                         data: a.data,
                     })
                     .collect(),
-                ..Draft::default()
+                in_reply_to: send.in_reply_to.into_iter().collect(),
+                references: send.references,
             })
         })();
         let built = match draft.and_then(|draft| compose::build(&account, &draft, now())) {
@@ -844,9 +848,13 @@ impl Daemon {
         };
         let queued = Store::open(&self.store).and_then(|store| {
             let key = store.account(&send.account)?;
+            let sent_copy = !account.server_saves_sent;
             Ok((
                 key,
-                store.enqueue(key, &built, !account.server_saves_sent, None)?,
+                match &send.answers {
+                    Some(answers) => store.enqueue_reply(key, &built, sent_copy, answers)?,
+                    None => store.enqueue(key, &built, sent_copy, None)?,
+                },
             ))
         });
         let (key, outbox) = match queued {
@@ -1949,12 +1957,14 @@ impl SmtpWorker {
                 id,
                 message_id,
                 sent_copy,
+                answered,
             } => {
                 log!(
-                    "account {}: message {id} sent (copy in Sent: {sent_copy})",
+                    "account {}: message {id} sent (copy in Sent: {sent_copy}, answered: \
+                     {answered})",
                     self.key
                 );
-                if sent_copy == "append"
+                if (sent_copy == "append" || answered)
                     && let Some(imap) = self.imap.upgrade()
                 {
                     let _ = imap.send(Request::Actions);
