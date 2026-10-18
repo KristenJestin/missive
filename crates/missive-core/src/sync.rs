@@ -16,7 +16,9 @@
 //!    HIGHESTMODSEQ.
 //! 3. The messages of the listing missing from the copy, newest first, fetched whole in batches
 //!    of at most `batch` messages and [`BATCH_BYTES`] bytes, by the sizes the server gives
-//!    (`RFC822.SIZE`, asked first); a message larger than that comes alone.
+//!    (`RFC822.SIZE`, asked first, for the missing UIDs only, in commands of bounded length); a
+//!    message larger than that comes alone, and so does one the server gave no size for (a
+//!    `NO` keeps the sizes that came before it), so that a refusal lands on it alone.
 //!
 //! The sync point is the set of UIDs in the copy itself, written with the messages: a sync cut at
 //! any point (a lost connection, a killed daemon) leaves whole batches behind, and the next one
@@ -42,6 +44,10 @@ use crate::store::{FolderRow, NewMessage, Store};
 
 /// The most bytes of messages fetched, and held in memory, at a time: 32 MiB.
 pub const BATCH_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The most bytes of a UID set in the commands that ask the sizes: a command line stays well
+/// under the 8000 bytes servers have to take (RFC 7162), however scattered the UIDs are.
+const SET_BYTES: usize = 900;
 
 /// Why a sync stopped.
 #[derive(Debug)]
@@ -266,38 +272,38 @@ pub async fn folder(
         .filter(|uid| !local.contains_key(uid))
         .copied()
         .collect();
-    let (Some(&newest), Some(&oldest)) = (missing.first(), missing.last()) else {
-        return Ok(Some(changes));
-    };
-    // One range, however scattered the missing UIDs are: a command line stays short.
-    let mut sizes = HashMap::new();
-    let ended = run(
-        session,
-        &format!("UID FETCH {oldest}:{newest} (UID RFC822.SIZE)"),
-        |response| {
-            if let Response::Fetch(_, attributes) = response
-                && let Some(uid) = uid(attributes)
-                && let Some(size) = attributes.iter().find_map(|a| match a {
-                    AttributeValue::Rfc822Size(size) => Some(*size),
-                    _ => None,
-                })
-            {
-                sizes.insert(uid, size);
-            }
-        },
-    )
-    .await?;
-    if ended == Ended::No {
-        changes.refused = missing.len();
+    if missing.is_empty() {
         return Ok(Some(changes));
     }
-    // A message without a size was expunged meanwhile; the next listing tells.
-    let missing: Vec<(u32, u32)> = missing
+    // The sizes of what is missing, in commands of a bounded length. A refusal (`NO`) keeps the
+    // sizes that came before it: a message the server cannot read must not hold the others back.
+    let mut sizes = HashMap::new();
+    for set in uid_sets(&missing, SET_BYTES) {
+        run(
+            session,
+            &format!("UID FETCH {set} (UID RFC822.SIZE)"),
+            |response| {
+                if let Response::Fetch(_, attributes) = response
+                    && let Some(uid) = uid(attributes)
+                    && let Some(size) = attributes.iter().find_map(|a| match a {
+                        AttributeValue::Rfc822Size(size) => Some(*size),
+                        _ => None,
+                    })
+                {
+                    sizes.insert(uid, size);
+                }
+            },
+        )
+        .await?;
+    }
+    // One left without a size is fetched alone, so that a refusal lands on it alone.
+    let missing: Vec<(u32, Option<u32>)> = missing
         .iter()
-        .filter_map(|uid| Some((*uid, *sizes.get(uid)?)))
+        .map(|uid| (*uid, sizes.get(uid).copied()))
         .collect();
     for uids in batches(&missing, batch, BATCH_BYTES) {
         let uids = &uids[..];
+        let without_size = uids.iter().any(|uid| !sizes.contains_key(uid));
         let mut messages = Vec::new();
         let command = format!(
             "UID FETCH {} (UID FLAGS INTERNALDATE BODY.PEEK[])",
@@ -317,8 +323,10 @@ pub async fn folder(
         // come is still missing from the copy: the next pass asks for it again.
         changes.new += messages.len();
         store.insert(folder.row.id, &messages)?;
-        // A message expunged meanwhile is simply not there; the next listing tells.
-        if ended? == Ended::No {
+        // A message expunged meanwhile is simply not there; the next listing tells. But one the
+        // server did not size is told apart from it by nothing, so it is counted: the log says
+        // that a message never came.
+        if ended? == Ended::No || without_size {
             changes.refused += uids.len().saturating_sub(messages.len());
         }
     }
@@ -326,12 +334,19 @@ pub async fn folder(
 }
 
 /// Cuts the messages to fetch, `(uid, size)` in the order given, into batches of at most `count`
-/// messages and `bytes` bytes. A message larger than `bytes` makes a batch of its own.
-fn batches(messages: &[(u32, u32)], count: usize, bytes: u64) -> Vec<Vec<u32>> {
+/// messages and `bytes` bytes. A message larger than `bytes`, or whose size the server did not
+/// give, makes a batch of its own.
+fn batches(messages: &[(u32, Option<u32>)], count: usize, bytes: u64) -> Vec<Vec<u32>> {
     let mut batches = Vec::new();
     let mut current = Vec::new();
     let mut held = 0;
     for &(uid, size) in messages {
+        let Some(size) = size else {
+            batches.extend((!current.is_empty()).then(|| std::mem::take(&mut current)));
+            batches.push(vec![uid]);
+            held = 0;
+            continue;
+        };
         let size = u64::from(size);
         if !current.is_empty() && (current.len() >= count.max(1) || held + size > bytes) {
             batches.push(std::mem::take(&mut current));
@@ -586,11 +601,11 @@ fn flags(attributes: &[AttributeValue<'_>]) -> String {
     flags.join(" ")
 }
 
-/// A UID set for a command: runs of consecutive UIDs as ranges, `5:9,2`.
-fn uid_set(uids: &[u32]) -> String {
+/// Runs of consecutive UIDs as ranges, in ascending order: `2`, `5:9`.
+fn uid_runs(uids: &[u32]) -> Vec<String> {
     let mut sorted = uids.to_vec();
     sorted.sort_unstable();
-    let mut parts: Vec<String> = Vec::new();
+    let mut runs: Vec<String> = Vec::new();
     let mut index = 0;
     while index < sorted.len() {
         let start = sorted[index];
@@ -599,14 +614,36 @@ fn uid_set(uids: &[u32]) -> String {
             index += 1;
             end = sorted[index];
         }
-        parts.push(if start == end {
+        runs.push(if start == end {
             start.to_string()
         } else {
             format!("{start}:{end}")
         });
         index += 1;
     }
-    parts.join(",")
+    runs
+}
+
+/// A UID set for a command: runs of consecutive UIDs as ranges, `2,5:9`.
+fn uid_set(uids: &[u32]) -> String {
+    uid_runs(uids).join(",")
+}
+
+/// The UIDs as sets of at most `limit` bytes each (a single run is never cut).
+fn uid_sets(uids: &[u32], limit: usize) -> Vec<String> {
+    let mut sets = Vec::new();
+    let mut current = String::new();
+    for run in uid_runs(uids) {
+        if !current.is_empty() && current.len() + 1 + run.len() > limit {
+            sets.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(',');
+        }
+        current.push_str(&run);
+    }
+    sets.extend((!current.is_empty()).then_some(current));
+    sets
 }
 
 #[cfg(test)]
@@ -651,26 +688,55 @@ mod tests {
     #[test]
     fn batches_are_cut_by_count_and_by_size_and_a_big_message_comes_alone() {
         let messages = [
-            (9, 10),
-            (8, 10),
-            (7, 10),
-            (6, 10),
-            (5, 100),
-            (4, 10),
-            (3, 30),
+            (9, Some(10)),
+            (8, Some(10)),
+            (7, Some(10)),
+            (6, Some(10)),
+            (5, Some(100)),
+            (4, Some(10)),
+            (3, Some(30)),
         ];
         assert_eq!(
             batches(&messages, 3, 50),
             [vec![9, 8, 7], vec![6], vec![5], vec![4, 3]]
         );
         assert_eq!(batches(&messages[..2], 50, 20), [vec![9, 8]]);
-        assert_eq!(batches(&[(1, 21)], 50, 20), [vec![1]]);
+        assert_eq!(batches(&[(1, Some(21))], 50, 20), [vec![1]]);
         assert!(batches(&[], 50, 20).is_empty());
+    }
+
+    #[test]
+    fn a_message_without_a_size_comes_alone_where_it_stands() {
+        let messages = [
+            (9, Some(10)),
+            (8, None),
+            (7, Some(10)),
+            (6, Some(10)),
+            (5, None),
+            (4, None),
+        ];
+        assert_eq!(
+            batches(&messages, 50, 1000),
+            [vec![9], vec![8], vec![7, 6], vec![5], vec![4]]
+        );
     }
 
     #[test]
     fn a_uid_set_writes_runs_as_ranges() {
         assert_eq!(uid_set(&[9, 8, 7, 3, 1, 2, 12]), "1:3,7:9,12");
         assert_eq!(uid_set(&[4]), "4");
+    }
+
+    #[test]
+    fn uid_sets_are_cut_under_a_length_and_hold_every_uid_once() {
+        let scattered: Vec<u32> = (1..=500).map(|n| n * 2).collect();
+        let sets = uid_sets(&scattered, 100);
+        assert!(sets.len() > 1);
+        assert!(sets.iter().all(|set| set.len() <= 100), "{sets:?}");
+        assert_eq!(sets.join(",").split(',').count(), 500);
+        // A run is one piece, however long the limit.
+        assert_eq!(uid_sets(&[3, 4, 5, 6, 7, 8, 9, 10], 3), ["3:10"]);
+        assert_eq!(uid_sets(&[9, 1, 2, 7], 100), ["1:2,7,9"]);
+        assert!(uid_sets(&[], 100).is_empty());
     }
 }

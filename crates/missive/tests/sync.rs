@@ -802,6 +802,111 @@ async fn a_message_the_server_refuses_to_send_is_skipped_and_asked_again_at_the_
     assert_eq!(env.uids("INBOX"), [1, 2, 3]);
 }
 
+/// Single-UID commands of the log that fetch `uid` whole or ask its size.
+fn asks_for(server: &FakeServer, uid: u32) -> (usize, usize) {
+    let log = server.imap_log();
+    let count = |tail: &str| {
+        log.iter()
+            .filter(|c| **c == format!("UID FETCH {uid} {tail}"))
+            .count()
+    };
+    (
+        count("(UID RFC822.SIZE)"),
+        count("(UID FLAGS INTERNALDATE BODY.PEEK[])"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_refused_in_the_sizes_command_and_in_the_body_fetch_does_not_hold_the_others_back()
+ {
+    let server = mailbox().start().await;
+    server.refuse_uid(2);
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+
+    succeeded(&sync_soon(&env).await);
+
+    // The sizes of the others came with the NO, and the refusal landed on the message alone.
+    assert_eq!(env.uids("INBOX"), [1, 3]);
+    assert_eq!(env.uids("Sent").len(), 1);
+    assert_eq!(env.uids(PRIVATE_FOLDER), [5, 9]);
+    assert!(env.logs().contains("1 refused"), "{}", env.logs());
+    let log = server.imap_log();
+    assert!(
+        log.iter()
+            .any(|c| c.starts_with("UID FETCH 3 (UID FLAGS INTERNALDATE")
+                || c.starts_with("UID FETCH 1,3 (UID FLAGS INTERNALDATE")
+                || c.starts_with("UID FETCH 1:3 (UID FLAGS INTERNALDATE")),
+        "{log:?}"
+    );
+    // Asked by the pass, and by the sync of the inbox before IDLE: then no more.
+    eventually(10, "IDLE", || server.imap_log().iter().any(|c| c == "IDLE")).await;
+    let (sizes, bodies) = asks_for(&server, 2);
+    assert!((1..=2).contains(&sizes) && (1..=2).contains(&bodies));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(asks_for(&server, 2), (sizes, bodies));
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(env.uids("INBOX"), [1, 2, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_message_left_without_a_size_is_fetched_alone() {
+    let server = mailbox().start().await;
+    // The sizes command of the inbox is refused whole, and so is one message.
+    server.refuse("UID FETCH 1:3 (UID RFC822.SIZE)");
+    server.refuse_uid(2);
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+
+    succeeded(&sync_soon(&env).await);
+
+    assert_eq!(env.uids("INBOX"), [1, 3]);
+    for uid in [1, 2, 3] {
+        assert!(
+            asks_for(&server, uid).1 >= 1,
+            "{uid}: {:?}",
+            server.imap_log()
+        );
+    }
+    assert!(env.logs().contains("1 refused"), "{}", env.logs());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scattered_uids_are_asked_in_commands_of_a_bounded_length() {
+    let mut inbox = Folder::new("INBOX");
+    for n in 1..=400 {
+        inbox = inbox.message(message(n).uid(n * 2));
+    }
+    let server = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .folder(inbox)
+        .start()
+        .await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--batch-size", "100"]).await;
+
+    succeeded(&sync_soon(&env).await);
+
+    assert_eq!(env.uids("INBOX").len(), 400);
+    let longest = server.imap_log().iter().map(String::len).max().unwrap();
+    assert!(longest < 1100, "{longest}");
+    assert!(
+        server
+            .imap_log()
+            .iter()
+            .filter(|c| c.ends_with("(UID RFC822.SIZE)"))
+            .count()
+            >= 2
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_lost_at_every_pass_answers_the_sync_and_records_unreachable() {
     let server = mailbox().cut("EXAMINE", 0).start().await;
