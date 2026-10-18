@@ -1,5 +1,6 @@
 mod act;
 mod daemon;
+mod open;
 mod read;
 mod watch;
 
@@ -74,6 +75,10 @@ enum Command {
     /// server sent. The HTML is never interpreted. Reads the local copy only; exits with 3 when
     /// the identifier names no message.
     Show(read::ShowArgs),
+    /// Open a message in the system's default browser, cleaned of everything that runs or
+    /// phones home (see docs/cli.md), from a private file; prints that file's path. Reads the
+    /// local copy only; exits with 3 when the identifier names no message.
+    Open(open::OpenArgs),
     /// Mark messages read or unread, flagged or not. Shown in the local copy at once, applied on
     /// the server when the account is connected; starts the daemon when none runs.
     Mark(act::MarkArgs),
@@ -202,6 +207,14 @@ async fn main() -> ExitCode {
         Command::Search(args) => read::search(args).map_err(Failure),
         Command::List(args) => read::list(args).map_err(Failure),
         Command::Show(args) => match read::show(args) {
+            Ok(()) => Ok(()),
+            Err(read::ShowError::NotFound(message)) => {
+                eprintln!("missive: {message}");
+                return ExitCode::from(read::NOT_FOUND);
+            }
+            Err(read::ShowError::Failed(message)) => Err(Failure(message)),
+        },
+        Command::Open(args) => match open::run(args).await {
             Ok(()) => Ok(()),
             Err(read::ShowError::NotFound(message)) => {
                 eprintln!("missive: {message}");

@@ -482,6 +482,62 @@ nothing on standard output. It says which of three it is:
 
 With no local copy yet, `show` says so (as the other commands do) and exits with 3.
 
+### `missive open <message id> [--original]`
+
+"View original": the message, cleaned, in the system's default browser. It is the fallback for
+any message a window cannot draw well. Until the window exists it is the only view, so
+`--original` changes nothing yet; a program that wants the browser passes it already.
+
+The message is read from the local copy (as `show` does: the same identifiers, the same exit
+status 3 when the identifier names no message), cleaned, and written to a new file
+`$XDG_RUNTIME_DIR/missive/original/<random>.html`, readable by the user only (mode 0600, in a
+folder of mode 0700). Without `XDG_RUNTIME_DIR` it refuses: the page is never written to a
+shared folder such as `/tmp`. Pages older than an hour are removed at the next `open`. On success
+the path of the page is printed on standard output, and nothing of the message is printed.
+
+The page is opened with the system's default handler, never a named browser: the desktop
+portal (`org.freedesktop.portal.OpenURI.OpenFile`, given the file as a descriptor, which a
+sandboxed browser can read), else `xdg-open`. `open` does not wait for the browser: it returns
+once the portal has taken the page, or once `xdg-open` is started. A portal that says it could
+not open the page leaves it to `xdg-open`; one that does not answer within two seconds is taken
+to be asking the user. `xdg-open` gets exactly the environment `missive` received, with nothing
+added.
+
+**What the cleaning keeps.** Everything is kept by allow-list; what is not listed goes.
+
+- *HTML*: the elements of a document's content (text, lists, tables, images, links, `font`,
+  `center`…) and their presentation attributes (`style`, `class`, `id`, `align`, `valign`,
+  `bgcolor`, `width`, `height`, `dir`, table spacing, `font` colour, face and size). Scripts,
+  event handler attributes (`onclick`…), forms, frames, objects, embeds, SVG and MathML, `<meta>`
+  (refresh included), `<base>`, `<link>` (external stylesheets and fonts), the `<title>` and HTML
+  comments are removed.
+- *Links* (`<a href>`) stay clickable for `http`, `https` and `mailto`, and for anchors of the
+  page itself (`#…`); every other address (`javascript:`, `data:`, a relative path, which would
+  point into the user's files) is removed. Links get `rel="noopener noreferrer"`.
+- *Images* keep their source only when it is a part of the message: a `cid:` image (PNG, GIF,
+  JPEG or WebP) is inlined as a `data:` URL. A remote image, a tracking pixel among them, never
+  loads; its `alt` text stays.
+- *Styles* (`<style>` blocks, gathered at the top of the page, and `style` attributes): plain
+  rules and `@media` rules, with declarations of these properties and their families: `align-*`,
+  `aspect-ratio`, `background`, `border`, `box-shadow`, `box-sizing`, `caption-side`, `clear`,
+  `color`, `column-gap`, `direction`, `display`, `empty-cells`, `flex`, `float`, `font`, `gap`,
+  `grid`, `height`, `hyphens`, `justify-*`, `letter-spacing`, `line-height`, `list-style`,
+  `margin`, `max-height`, `max-width`, `min-height`, `min-width`, `object-fit`, `opacity`,
+  `order`, `outline`, `overflow`, `padding`, `row-gap`, `tab-size`, `table-layout`, `text-*`,
+  `unicode-bidi`, `vertical-align`, `visibility`, `white-space`, `width`, `word-break`,
+  `word-spacing`, `word-wrap`, `-webkit-text-size-adjust`, `-ms-text-size-adjust`. A value may
+  call only `rgb`, `rgba`, `hsl`, `hsla`, `hwb`, `calc`, `min`, `max`, `clamp`, the gradients,
+  `repeat`, `minmax`, `fit-content`, and `url()` for a `data:` image (PNG, GIF, JPEG, WebP in
+  base64). Every other at-rule (`@import`, `@font-face`…), property (`position`, `content`,
+  `cursor`, `behavior`, `-moz-binding`…) and function (`expression()`, `image-set()`, `url()` of
+  anything else…) is removed. CSS escapes (`\75rl(`) and comments are removed first, so that
+  nothing can spell a removed word.
+- A Content-Security-Policy comes first in the page, as a second line of defence: `default-src
+  'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'`.
+
+A message with only text is opened as a plain-text page: the text escaped in a `<pre>`, never
+interpreted. Allowing remote images, for a message or a sender, does not exist yet.
+
 ## Changing messages
 
 `missive mark`, `missive move` and `missive delete` change messages on the server. They name
@@ -545,4 +601,3 @@ the action cannot apply to one of them, nothing is recorded and the command fail
 standard error. The exit status is 3 when an identifier names no message (as for `show`), 1 for
 every other refusal: a folder that does not exist, `--permanently` outside the trash, a message
 whose move waits, an account that is not configured.
-

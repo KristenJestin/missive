@@ -1,0 +1,15 @@
+From: Example Shop <news@shop.example.org>
+To: Reader <reader@example.com>
+Subject: Your order has shipped
+Date: Mon, 12 Oct 2026 09:00:00 +0200
+Message-ID: <457482536204999028@shop.example.org>
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body style="font-family:Arial,sans-serif;font-size:15px;">
+<p>Good news: order 7781 left our warehouse today and should arrive on Thursday.</p>
+<p>Track it at <a href="https://track.example.org/p/7781">track.example.org</a>.</p>
+<img src="https://track.example.org/open.gif?u=7781" width="1" height="1" alt="" style="display:block;border:0;">
+<img src="http://track.example.org/pixel?id=7781" width="1" height="1">
+</body></html>

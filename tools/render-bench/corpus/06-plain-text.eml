@@ -1,0 +1,24 @@
+From: Example Shop <news@shop.example.org>
+To: Reader <reader@example.com>
+Subject: Notes from the meeting
+Date: Mon, 12 Oct 2026 09:00:00 +0200
+Message-ID: <3096727235155959379@shop.example.org>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8; format=flowed
+Content-Transfer-Encoding: 7bit
+
+Hi all,
+
+Notes from today:
+
+1. The garden plan is agreed.
+2. Sam orders the seeds (see https://seeds.example.org/catalogue).
+3. Next meeting on the 20th.
+
+> Can we also talk about the fence?
+>> It can wait until spring.
+
+Thanks,
+Alex
+--
+Alex, example.com

@@ -1,0 +1,32 @@
+[package]
+name = "render-bench"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Renders a folder of .eml files with each candidate way, headless, for issue #7"
+
+# A workspace of its own: the client's build and CI never carry a browser engine.
+[workspace]
+
+# Blitz is pinned to exact versions: it is a beta and its crates move together. Every default
+# feature is off so that nothing able to reach the network (blitz-net, reqwest…) enters the tree;
+# the features turned on are the ones mail needs: system fonts and floats (old mail floats).
+[dependencies]
+anyrender = "=0.14.0"
+anyrender_vello_cpu = "=0.18.0"
+base64 = "0.22"
+blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts", "floats"] }
+blitz-html = { version = "=0.3.0-beta.4", default-features = false }
+blitz-paint = { version = "=0.3.0-beta.4", default-features = false }
+blitz-traits = { version = "=0.3.0-beta.4", default-features = false }
+# blitz-dom decodes images with `image` but enables no format: the formats mail uses are here.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+libc = "0.2"
+# full_encoding: a charset mail-parser does not know would be a reading failure, not a rendering one.
+mail-parser = { version = "0.11", features = ["full_encoding"] }
+peniko = "0.6"
+percent-encoding = "2"
+
+[dev-dependencies]
+tempfile = "3"
