@@ -304,7 +304,8 @@ impl Env {
         self.rows(&[
             "SELECT id, account, name, role, uidvalidity, highest_modseq FROM folder ORDER BY id",
             "SELECT folder, uid, flags, internal_date, size, date, subject, sender, recipients, \
-             cc, message_id, hex(raw) FROM message ORDER BY folder, uid",
+             cc, message_id, hex(raw) FROM message \
+             JOIN message_raw ON message_raw.message = message.id ORDER BY folder, uid",
         ])
     }
 
@@ -489,7 +490,9 @@ async fn messages_and_flags_appear_in_the_copy() {
     let (subject, sender, recipients, size, raw): (String, String, String, i64, Vec<u8>) = copy
         .query_row(
             "SELECT subject, sender, recipients, size, raw FROM message \
-             JOIN folder ON folder.id = message.folder WHERE folder.name = 'INBOX' AND uid = 3",
+             JOIN folder ON folder.id = message.folder \
+             JOIN message_raw ON message_raw.message = message.id \
+             WHERE folder.name = 'INBOX' AND uid = 3",
             [],
             |row| {
                 Ok((
@@ -1335,7 +1338,7 @@ async fn the_copy_is_in_wal_mode_with_a_schema_version() {
     assert_eq!(version, 1);
     assert_eq!(
         env.table_names(),
-        ["account", "folder", "message"]
+        ["account", "folder", "message", "message_raw"]
             .into_iter()
             .map(str::to_owned)
             .collect()

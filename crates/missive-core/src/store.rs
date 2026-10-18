@@ -220,26 +220,35 @@ fn insert(transaction: &Transaction, folder: i64, message: &NewMessage) -> rusql
     };
     let mut statement = transaction.prepare_cached(
         "INSERT INTO message (folder, uid, flags, internal_date, size, date, subject, sender,
-             recipients, cc, message_id, raw)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-         ON CONFLICT (folder, uid) DO UPDATE SET flags = excluded.flags",
+             recipients, cc, message_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT (folder, uid) DO UPDATE SET flags = excluded.flags
+         RETURNING id",
     )?;
-    statement.execute(params![
-        folder,
-        message.uid,
-        message.flags,
-        message.internal_date,
-        message.size,
-        parsed
-            .and_then(|m| m.date())
-            .map(|date| date.to_timestamp()),
-        parsed.and_then(|m| m.subject()),
-        mailboxes(parsed.and_then(|m| m.from())),
-        mailboxes(parsed.and_then(|m| m.to())),
-        mailboxes(parsed.and_then(|m| m.cc())),
-        parsed.and_then(|m| m.message_id()),
-        message.raw,
-    ])?;
+    let id: i64 = statement.query_row(
+        params![
+            folder,
+            message.uid,
+            message.flags,
+            message.internal_date,
+            message.size,
+            parsed
+                .and_then(|m| m.date())
+                .map(|date| date.to_timestamp()),
+            parsed.and_then(|m| m.subject()),
+            mailboxes(parsed.and_then(|m| m.from())),
+            mailboxes(parsed.and_then(|m| m.to())),
+            mailboxes(parsed.and_then(|m| m.cc())),
+            parsed.and_then(|m| m.message_id()),
+        ],
+        |r| r.get(0),
+    )?;
+    transaction
+        .prepare_cached(
+            "INSERT INTO message_raw (message, raw) VALUES (?1, ?2)
+             ON CONFLICT (message) DO NOTHING",
+        )?
+        .execute(params![id, message.raw])?;
     Ok(())
 }
 
@@ -322,7 +331,8 @@ mod tests {
         let row: (String, String, String, i64, Vec<u8>, i64) = store
             .connection
             .query_row(
-                "SELECT subject, sender, recipients, date, raw, size FROM message",
+                "SELECT subject, sender, recipients, date, raw, size FROM message \
+                 JOIN message_raw ON message_raw.message = message.id",
                 [],
                 |r| {
                     Ok((
@@ -371,6 +381,31 @@ mod tests {
                 highest_modseq: Some(42),
             }
         );
+    }
+
+    fn raws(store: &Store) -> i64 {
+        store
+            .connection
+            .query_row("SELECT count(*) FROM message_raw", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_message_leaves_with_its_raw_message_and_a_replayed_batch_keeps_one() {
+        let (_dir, mut store) = open();
+        let account = store.account("alice").unwrap();
+        let folder = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
+        store
+            .insert(folder, &[message(1, ""), message(2, "")])
+            .unwrap();
+        // The same batch again, as after a kill before the sync point was known to move.
+        store.insert(folder, &[message(2, "\\Seen")]).unwrap();
+        assert_eq!(raws(&store), 2);
+
+        store.apply_listing(folder, &[1], &[], None).unwrap();
+        assert_eq!(raws(&store), 1);
+        store.rebuild(folder, 9).unwrap();
+        assert_eq!(raws(&store), 0);
     }
 
     #[test]

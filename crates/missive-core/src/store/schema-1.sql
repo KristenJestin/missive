@@ -24,7 +24,7 @@ CREATE TABLE folder (
     UNIQUE (account, name)
 ) STRICT;
 
--- A message of a folder: the raw message as the server sent it, with what is read from it.
+-- A message of a folder: what is read from its raw message, which is kept in `message_raw`.
 CREATE TABLE message (
     id INTEGER PRIMARY KEY,
     folder INTEGER NOT NULL REFERENCES folder (id) ON DELETE CASCADE,
@@ -43,6 +43,12 @@ CREATE TABLE message (
     recipients TEXT NOT NULL,
     cc TEXT NOT NULL,
     message_id TEXT,
-    raw BLOB NOT NULL,
     UNIQUE (folder, uid)
+) STRICT;
+
+-- A message as the server sent it, written with its row of `message`. Apart, so that the rows of
+-- `message` stay small and a count or a list over them reads few pages.
+CREATE TABLE message_raw (
+    message INTEGER PRIMARY KEY REFERENCES message (id) ON DELETE CASCADE,
+    raw BLOB NOT NULL
 ) STRICT;
