@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
-use super::{FolderState, Io, Shared, StoredMessage};
+use super::{Action, FolderState, Io, Shared, StoredMessage};
 
 const SYSTEM_FLAGS: &str = "(\\Answered \\Flagged \\Deleted \\Seen \\Draft)";
 
@@ -43,9 +43,22 @@ pub(super) async fn serve(
         }
         let text = String::from_utf8_lossy(&line);
         let text = text.trim_end_matches(['\r', '\n']);
-        let flow = session.command(text);
+        let rule = session.shared.rule(text);
+        let flow = if rule == Some(Action::Refuse) {
+            session.refuse(text)
+        } else {
+            session.command(text)
+        };
         if !session.shared.fetch_delay.is_zero() && is_fetch(text) {
             tokio::time::sleep(session.shared.fetch_delay).await;
+        }
+        if let Some(Action::Cut(lines)) = rule {
+            cut(&mut session.out, lines);
+            session.send("* BYE the test cut this answer short");
+            if flush(&mut io, &mut session.out).await.is_ok() {
+                let _ = io.shutdown().await;
+            }
+            return;
         }
         match flow {
             Flow::Continue => {}
@@ -80,6 +93,18 @@ fn is_fetch(line: &str) -> bool {
         word => word,
     };
     name.is_some_and(|name| name.eq_ignore_ascii_case("FETCH"))
+}
+
+/// Keeps the first `lines` lines of an answer.
+fn cut(out: &mut Vec<u8>, lines: usize) {
+    let mut kept = 0;
+    for _ in 0..lines {
+        match out[kept..].windows(2).position(|w| w == b"\r\n") {
+            Some(end) => kept += end + 2,
+            None => break,
+        }
+    }
+    out.truncate(kept);
 }
 
 async fn flush(io: &mut BufReader<Box<dyn Io>>, out: &mut Vec<u8>) -> std::io::Result<()> {
@@ -213,6 +238,21 @@ impl Session {
             Ok(()) => self.send(format!("{tag} OK {name} completed")),
             Err(answer) => self.send(format!("{tag} {answer}")),
         }
+        Flow::Continue
+    }
+
+    /// Answers `NO` to a command a test asked to refuse, without running it.
+    fn refuse(&mut self, line: &str) -> Flow {
+        let (tag, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let name = rest
+            .split(' ')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        self.log(&name, rest);
+        self.send(format!(
+            "{tag} NO [UNAVAILABLE] the test refused this command"
+        ));
         Flow::Continue
     }
 
@@ -632,9 +672,14 @@ impl Session {
             if flush(io, &mut self.out).await.is_err() {
                 return false;
             }
+            let keepalive = self.shared.idle_keepalive;
             let read = tokio::select! {
                 read = io.read_until(b'\n', &mut line) => Some(read),
                 _ = self.changes.changed() => None,
+                _ = tokio::time::sleep(keepalive), if !keepalive.is_zero() => {
+                    self.send("* OK Still here");
+                    None
+                }
             };
             match read {
                 None => continue,

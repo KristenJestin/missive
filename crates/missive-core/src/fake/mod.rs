@@ -29,7 +29,13 @@
 //! Changes made through [`FakeServer`] reach a connected client the way a real server tells them:
 //! during `IDLE` at once, otherwise at its next `NOOP`. A client whose selected folder gets a new
 //! UIDVALIDITY is disconnected with `BYE`. [`Builder::fetch_delay`] slows every `FETCH` answer,
-//! to catch a client in the middle of a sync.
+//! to catch a client in the middle of a sync, and [`Builder::idle_keepalive`] sends keepalives
+//! during `IDLE`, as many servers do.
+//!
+//! A server can also misbehave on purpose, from the start ([`Builder::refuse`], [`Builder::cut`])
+//! or from a point of the test on ([`FakeServer::refuse`], [`FakeServer::cut`], until
+//! [`FakeServer::heal`]): it answers `NO` to a chosen command, or drops the client in the middle
+//! of an answer.
 //!
 //! The SMTP side serves `EHLO`/`HELO`, `STARTTLS`, `AUTH PLAIN` and `AUTH LOGIN` (offered only
 //! over TLS; [`Builder::smtp_login_only`] drops `PLAIN`), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP`
@@ -187,6 +193,8 @@ pub struct Builder {
     imap_login_unavailable: bool,
     smtp_login_only: bool,
     fetch_delay: Duration,
+    idle_keepalive: Duration,
+    rules: Vec<Rule>,
 }
 
 impl Builder {
@@ -227,6 +235,25 @@ impl Builder {
     /// big mailbox: a test can then catch a client in the middle of a sync.
     pub fn fetch_delay(mut self, delay: Duration) -> Self {
         self.fetch_delay = delay;
+        self
+    }
+
+    /// Sends `* OK Still here` every `interval` to a client in `IDLE`, as Dovecot does every two
+    /// minutes.
+    pub fn idle_keepalive(mut self, interval: Duration) -> Self {
+        self.idle_keepalive = interval;
+        self
+    }
+
+    /// Starts as [`FakeServer::refuse`] would leave it.
+    pub fn refuse(mut self, command: &str) -> Self {
+        self.rules.push(Rule::new(command, Action::Refuse));
+        self
+    }
+
+    /// Starts as [`FakeServer::cut`] would leave it.
+    pub fn cut(mut self, command: &str, lines: usize) -> Self {
+        self.rules.push(Rule::new(command, Action::Cut(lines)));
         self
     }
 
@@ -273,12 +300,14 @@ impl Builder {
                 folders,
                 imap_log: Vec::new(),
                 smtp_messages: Vec::new(),
+                rules: self.rules,
             }),
             changes: watch::channel(()).0,
             condstore: !self.without_condstore,
             imap_login_unavailable: self.imap_login_unavailable,
             smtp_login_only: self.smtp_login_only,
             fetch_delay: self.fetch_delay,
+            idle_keepalive: self.idle_keepalive,
         });
 
         let mut listeners = Vec::new();
@@ -418,6 +447,33 @@ impl FakeServer {
         self.shared.state().imap_log.clone()
     }
 
+    /// Answers `{tag} NO [UNAVAILABLE] …`, and nothing else, to every IMAP command that starts
+    /// with `command` (written without its tag, in any case): `server.refuse("UID SEARCH")`. The
+    /// command is logged but not run.
+    pub fn refuse(&self, command: &str) {
+        self.shared
+            .state()
+            .rules
+            .push(Rule::new(command, Action::Refuse));
+    }
+
+    /// Answers every IMAP command that starts with `command` with the first `lines` lines of its
+    /// answer only, then `* BYE` and a clean close (TLS `close_notify`), as a server that drops a
+    /// client in the middle of an answer: `server.cut("UID FETCH 1:*", 2)`. Lines are counted by
+    /// their `\r\n`, so a cut inside a literal leaves it unfinished.
+    pub fn cut(&self, command: &str, lines: usize) {
+        self.shared
+            .state()
+            .rules
+            .push(Rule::new(command, Action::Cut(lines)));
+    }
+
+    /// Forgets every [`refuse`](FakeServer::refuse) and [`cut`](FakeServer::cut): the server
+    /// behaves again.
+    pub fn heal(&self) {
+        self.shared.state().rules.clear();
+    }
+
     /// Every message the SMTP side accepted, in order.
     pub fn smtp_messages(&self) -> Vec<SmtpMessage> {
         self.shared.state().smtp_messages.clone()
@@ -441,6 +497,7 @@ struct Shared {
     imap_login_unavailable: bool,
     smtp_login_only: bool,
     fetch_delay: Duration,
+    idle_keepalive: Duration,
 }
 
 impl Shared {
@@ -455,6 +512,17 @@ impl Shared {
         let result = change(&mut self.state());
         self.changes.send_modify(|_| {});
         result
+    }
+
+    /// What a test asked the server to do with this command line, tag included.
+    fn rule(&self, line: &str) -> Option<Action> {
+        let command = line.split_once(' ').map_or("", |(_, command)| command);
+        let command = command.to_ascii_uppercase();
+        self.state()
+            .rules
+            .iter()
+            .find(|rule| command.starts_with(&rule.command))
+            .map(|rule| rule.action)
     }
 
     fn knows(&self, user: &str) -> bool {
@@ -474,6 +542,30 @@ struct State {
     folders: Vec<FolderState>,
     imap_log: Vec<String>,
     smtp_messages: Vec<SmtpMessage>,
+    rules: Vec<Rule>,
+}
+
+/// A misbehaviour a test asked for: what to do with the commands that start with `command`.
+#[derive(Debug)]
+struct Rule {
+    /// In upper case.
+    command: String,
+    action: Action,
+}
+
+impl Rule {
+    fn new(command: &str, action: Action) -> Self {
+        Rule {
+            command: command.to_ascii_uppercase(),
+            action,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    Refuse,
+    Cut(usize),
 }
 
 impl State {
