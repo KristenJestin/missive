@@ -197,6 +197,8 @@ async fn an_account_with_the_fakes_ca_marked_certificate_imported_is_added() {
     let output = setup.add_with_certificate().await;
 
     succeeded(&output);
+    // A pinned certificate does not need the system store: nothing is said about it.
+    assert!(!stderr(&output).contains("system certificates"));
     let items = setup.keyring.items();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].secret, PASSWORD.as_bytes());
@@ -229,6 +231,54 @@ async fn the_same_without_the_import_is_refused_with_a_message_about_the_certifi
     assert!(stderr.contains("--certificate <file.pem>"), "{stderr}");
     assert!(!stderr.contains("auth-refused"), "{stderr}");
     assert!(!stderr.contains("unreachable"), "{stderr}");
+    setup.nothing_saved();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_system_store_is_said_instead_of_blaming_the_servers_certificate() {
+    let setup = Setup::new().await;
+    // The store the system would give, with nothing in it.
+    let empty_file = setup.home.path().join("empty.pem");
+    std::fs::write(&empty_file, "").unwrap();
+    let empty_dir = setup.home.path().join("empty-certs");
+    std::fs::create_dir(&empty_dir).unwrap();
+    let imap_port = setup.server.imap_starttls_addr().port().to_string();
+    let smtp_port = setup.server.smtp_tls_addr().port().to_string();
+    let mut command = setup.command(&[
+        "account",
+        "add",
+        "--name",
+        "Alice Example",
+        "--address",
+        USER,
+        "--imap-host",
+        "127.0.0.1",
+        "--imap-port",
+        &imap_port,
+        "--imap-security",
+        "starttls",
+        "--smtp-host",
+        "localhost",
+        "--smtp-port",
+        &smtp_port,
+        "--smtp-security",
+        "tls",
+        "--password-stdin",
+    ]);
+    command
+        .env("SSL_CERT_FILE", &empty_file)
+        .env("SSL_CERT_DIR", &empty_dir);
+
+    let output = setup
+        .run_with_stdin(command, &format!("{PASSWORD}\n"))
+        .await;
+
+    failed(&output);
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("no system certificates were found"),
+        "{stderr}"
+    );
     setup.nothing_saved();
 }
 

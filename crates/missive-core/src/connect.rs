@@ -89,6 +89,15 @@ pub fn client_config(pinned: Option<CertificateDer<'static>>) -> Arc<ClientConfi
     let mut roots = RootCertStore::empty();
     // A certificate the store cannot read is skipped, as every TLS client does.
     roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    if roots.is_empty() {
+        // Said apart from the refused certificate that will follow: importing one is then the
+        // only way in, but the system's store is what is wrong.
+        eprintln!(
+            "missive: no system certificates were found, so no server certificate can be \
+             verified (check the ca-certificates of this system, or import the server's own \
+             certificate)"
+        );
+    }
     Arc::new(
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
