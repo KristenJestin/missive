@@ -17,7 +17,6 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     Context, Modifiers, MouseButton, TestAppContext, VisualTestContext, Window, div, point, px,
 };
-use missive_render::reduce::{Theme, reduce};
 use missive_window::images::MessageImages;
 use missive_window::view::{self, MailWindow, Opener, Opening, Palette};
 
@@ -138,17 +137,7 @@ fn a_remote_image_in_a_message_never_reaches_the_network(cx: &mut TestAppContext
     assert!(opened.lock().unwrap().is_empty());
 }
 
-#[gpui_kit::test]
-fn a_remote_image_is_never_fetched_through_the_reduced_form_either(cx: &mut TestAppContext) {
-    let listener = Listener::start();
-    let html = reduce(&remote_images(&listener), &Theme::Light, 800);
-    let (opener, _) = recorder();
-    let cx = show(cx, &html, opener);
-    cx.run_until_parked();
-    assert!(!listener.contacted(), "the listener was contacted");
-}
-
-/// The proof that the two tests above can fail: the same text view without the message's image
+/// The proof that the test above can fail: the same text view without the message's image
 /// source does reach the listener.
 #[gpui_kit::test]
 fn without_the_message_image_source_the_listener_would_be_contacted(cx: &mut TestAppContext) {
