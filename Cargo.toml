@@ -24,6 +24,8 @@ mail-parser = "0.11"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rpassword = "7"
+# The user's own id, without `unsafe`: `missive open` checks who owns its folder.
+rustix = { version = "1", default-features = false, features = ["process"] }
 # The local copy. Bundled, so that every machine has the same SQLite, with FTS5.
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls-native-certs = "0.8"

@@ -36,6 +36,11 @@ pub enum PortalAnswer {
     Failed,
     /// No `Response` at all, as a portal still waiting for the user.
     Silent,
+    /// `0`, but the `Response` comes only after this long, as a user choosing an application.
+    Late(Duration),
+    /// `0`, but the method itself returns only after this long, as a portal busy before it
+    /// hands out the request.
+    Slow(Duration),
 }
 
 /// One `OpenFile` call, as the portal received it.
@@ -146,17 +151,22 @@ impl OpenUri {
             handle_token.as_deref().unwrap_or("t")
         ))
         .map_err(|e| fdo::Error::InvalidArgs(e.to_string()))?;
-        let code = match self.answer {
-            PortalAnswer::Opened => 0u32,
-            PortalAnswer::Failed => 2,
+        let (code, delay) = match self.answer {
+            PortalAnswer::Opened => (0u32, Duration::from_millis(20)),
+            PortalAnswer::Failed => (2, Duration::from_millis(20)),
             PortalAnswer::Silent => return Ok(request),
+            PortalAnswer::Late(after) => (0, after),
+            PortalAnswer::Slow(before) => {
+                tokio::time::sleep(before).await;
+                (0, Duration::from_millis(20))
+            }
         };
         let connection = connection.clone();
         let destination = header.sender().map(|name| name.to_owned());
         let path = request.clone();
         // After the method returned, as a real portal answers.
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(delay).await;
             let results: HashMap<String, OwnedValue> = HashMap::new();
             let _ = connection
                 .emit_signal(

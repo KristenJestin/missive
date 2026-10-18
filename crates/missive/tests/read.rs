@@ -1829,6 +1829,126 @@ async fn open_without_a_runtime_folder_refuses() {
     assert!(!env.path("bin").join("args").exists());
 }
 
+/// Runs `missive open` on a runtime folder prepared by `prepare`, and checks that it refused with
+/// `needle` in its message, that nothing was handed to `xdg-open`, and that no page was written
+/// under `watched`. A folder owned by another user cannot be made without root: the tests stand
+/// in with the folder's permissions and with symlinks, the two other ways it is not Missive's own.
+async fn open_refused_on(prepare: impl FnOnce(&Env), watched: impl FnOnce(&Env) -> PathBuf) {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let id = inbox_id(&env, 4).await;
+    prepare(&env);
+
+    let output = open(&env, &[&id], &nowhere(&env)).await;
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not private to you"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty());
+    let watched = watched(&env);
+    assert!(
+        std::fs::read_dir(&watched).unwrap().next().is_none(),
+        "{watched:?} holds a file"
+    );
+    assert!(!env.path("bin").join("args").exists());
+}
+
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_refuses_a_missive_folder_others_can_write() {
+    for mode in [0o770, 0o707] {
+        open_refused_on(
+            |env| {
+                std::fs::create_dir_all(originals(env)).unwrap();
+                chmod(originals(env).parent().unwrap(), mode);
+            },
+            originals,
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_refuses_an_original_folder_others_can_write() {
+    for mode in [0o770, 0o707] {
+        open_refused_on(
+            |env| {
+                std::fs::create_dir_all(originals(env)).unwrap();
+                chmod(&originals(env), mode);
+            },
+            originals,
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_refuses_an_original_folder_that_is_a_symlink() {
+    open_refused_on(
+        |env| {
+            let elsewhere = env.path("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::fs::create_dir_all(originals(env).parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, originals(env)).unwrap();
+        },
+        |env| env.path("elsewhere"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_refuses_a_missive_folder_that_is_a_symlink() {
+    open_refused_on(
+        |env| {
+            let elsewhere = env.path("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("original")).unwrap();
+            let missive = env.path("runtime").join("missive");
+            let _ = std::fs::remove_dir_all(&missive);
+            std::os::unix::fs::symlink(&elsewhere, missive).unwrap();
+        },
+        |env| env.path("elsewhere").join("original"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_portal_slow_to_take_the_call_does_not_get_xdg_open_as_well() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    // Slower than the time `open` gives the call: the portal may well be showing a chooser.
+    let portal = FakePortal::start(PortalAnswer::Slow(Duration::from_secs(7))).await;
+    let id = inbox_id(&env, 4).await;
+
+    let output = open(&env, &[&id], portal.address()).await;
+
+    succeeded(&output);
+    assert_eq!(portal.calls().len(), 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!env.path("bin").join("args").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_portal_answering_after_the_wait_does_not_get_xdg_open_as_well() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let portal = FakePortal::start(PortalAnswer::Late(Duration::from_secs(3))).await;
+    let id = inbox_id(&env, 4).await;
+
+    let output = open(&env, &[&id], portal.address()).await;
+
+    succeeded(&output);
+    assert_eq!(portal.calls().len(), 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!env.path("bin").join("args").exists());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_page_older_than_an_hour_is_removed_at_the_next_open() {
     let env = Env::filled_with(vec![("alice", alice())]).await;
