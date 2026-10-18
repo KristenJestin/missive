@@ -1,4 +1,5 @@
 mod act;
+mod compose;
 mod daemon;
 mod open;
 mod read;
@@ -89,6 +90,9 @@ enum Command {
     /// the local copy at once, applied on the server when the account is connected; starts the
     /// daemon when none runs.
     Delete(act::DeleteArgs),
+    /// Write a message, with files attached, and with --send send it: it goes into the outbox at
+    /// once and is sent as soon as the server can be reached; starts the daemon when none runs.
+    Compose(compose::ComposeArgs),
 }
 
 #[derive(Args)]
@@ -162,6 +166,10 @@ struct AddArgs {
     /// authorities: for a local bridge with its own self-signed certificate.
     #[arg(long, value_name = "FILE.PEM")]
     certificate: Option<PathBuf>,
+    /// The SMTP server keeps a copy of what it sends in the Sent folder itself (Proton Mail
+    /// Bridge does): Missive then does not append its own.
+    #[arg(long)]
+    server_saves_sent: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -229,6 +237,7 @@ async fn main() -> ExitCode {
         Command::Mark(args) => acted(act::mark(args).await),
         Command::Move(args) => acted(act::move_to(args).await),
         Command::Delete(args) => acted(act::delete(args).await),
+        Command::Compose(args) => acted(compose::run(args).await),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -304,6 +313,7 @@ async fn add(args: AddArgs) -> Result<()> {
         user,
         imap,
         smtp,
+        server_saves_sent: args.server_saves_sent,
     };
     let tls = client_config(certificate.clone());
     check_imap(&account.imap, &account.user, &password, tls.clone())

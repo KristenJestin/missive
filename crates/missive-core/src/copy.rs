@@ -46,6 +46,9 @@ const QUEUE_VERSION: i64 = 4;
 /// The first schema version that records the folders a pass skipped.
 const SKIPPED_VERSION: i64 = 5;
 
+/// The first schema version that has the outbox.
+const OUTBOX_VERSION: i64 = 6;
+
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +142,22 @@ pub struct AccountRow {
     pub messages: u64,
     /// The folders the last complete pass left as they were.
     pub skipped: Vec<SkippedFolder>,
+}
+
+/// A message of an account's outbox, as `missive status` shows it: never its content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Outgoing {
+    /// Its number in the outbox.
+    pub id: i64,
+    /// `queued`, `sending`, `sent` (its copy in Sent is still to be written), `failed` or
+    /// `uncertain`: see [`crate::outbox`].
+    pub state: String,
+    pub message_id: String,
+    /// When it was written, in seconds since the epoch.
+    pub queued_at: i64,
+    /// The tries that failed before the end of data.
+    pub attempts: u32,
+    pub last_error: Option<String>,
 }
 
 /// A folder of an account.
@@ -387,6 +406,30 @@ impl Copy {
                 last_sync: r.get(2)?,
                 messages: r.get::<_, i64>(3)? as u64,
                 skipped: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The outbox of an account, oldest first; empty in a copy older than the outbox.
+    pub fn outbox(&self, account: &str) -> Result<Vec<Outgoing>> {
+        if self.version < OUTBOX_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare_cached(
+            "SELECT outbox.id, outbox.state, outbox.message_id, outbox.queued_at,
+                    outbox.attempts, outbox.last_error
+               FROM outbox JOIN account ON account.key = outbox.account
+              WHERE account.id = ?1 ORDER BY outbox.id",
+        )?;
+        let rows = statement.query_map([account], |r| {
+            Ok(Outgoing {
+                id: r.get(0)?,
+                state: r.get(1)?,
+                message_id: r.get(2)?,
+                queued_at: r.get(3)?,
+                attempts: r.get(4)?,
+                last_error: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

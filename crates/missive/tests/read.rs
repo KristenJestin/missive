@@ -125,6 +125,7 @@ impl Env {
                 port: server.smtp_tls_addr().port(),
                 security: Security::Tls,
             },
+            server_saves_sent: false,
         };
         AccountStore::new(self.path("config").join("missive"))
             .save(id, &account, Some(&server.certificate_der()))
@@ -644,6 +645,7 @@ async fn an_account_not_yet_in_the_copy_is_never_synced_and_a_removed_one_is_not
         json!([{
             "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0,
             "skipped": [],
+            "outbox": []
         }])
     );
     let unread = json(&env.read(&["unread", "--json"]).await);
@@ -721,7 +723,7 @@ async fn with_no_copy_yet_the_commands_say_so_and_give_zeros_and_create_nothing(
         json(&status),
         json!({ "daemon": "stopped", "accounts": [
             { "id": "alice", "state": null, "syncing": false, "last_sync": null, "messages": 0,
-              "skipped": [] }
+              "skipped": [], "outbox": [] }
         ]})
     );
     assert!(

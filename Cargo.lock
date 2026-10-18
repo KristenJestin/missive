@@ -4569,6 +4569,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
+name = "mail-builder"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccbc27cb02a58a311a404769a22f5abf63fe3173b290d80be7c534f9c7023151"
+
+[[package]]
 name = "mail-parser"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4768,7 +4774,9 @@ name = "missive"
 version = "0.0.0"
 dependencies = [
  "async-imap",
+ "base64 0.22.1",
  "clap",
+ "mail-parser",
  "missive-core",
  "rpassword",
  "rusqlite",
@@ -4789,7 +4797,9 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "html5ever 0.40.1",
+ "mail-builder",
  "mail-parser",
+ "mime_guess",
  "missive-core",
  "rcgen",
  "rusqlite",

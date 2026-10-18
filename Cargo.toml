@@ -20,8 +20,13 @@ futures-channel = "0.3"
 futures-util = "0.3"
 # The tokenizer ammonia is built on, to find the stylesheets of a message.
 html5ever = "0.40"
+# Writes the messages Missive sends. Without its default `gethostname`: the Message-ID names the
+# sender's domain, never the machine.
+mail-builder = { version = "1", default-features = false }
 # Reads messages for the local copy: their envelope, from the raw message kept beside it.
 mail-parser = "0.11"
+# The media type of an attachment, from its file name: a static table, no lookup at run time.
+mime_guess = { version = "2", default-features = false }
 # The `data:` URLs a message embeds.
 percent-encoding = "2"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

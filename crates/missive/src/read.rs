@@ -8,7 +8,9 @@ use std::io::Write;
 use clap::{Args, ValueEnum};
 use missive_core::account::{AccountStore, Listing};
 use missive_core::body::{self, Attachment};
-use missive_core::copy::{Copy, FolderRef, Hit, List, NotFound, Person, Search, Stored, utc};
+use missive_core::copy::{
+    Copy, FolderRef, Hit, List, NotFound, Outgoing, Person, Search, Stored, utc,
+};
 use missive_core::protocol::pid_path;
 use missive_core::store::{SkippedFolder, Store};
 use serde::Serialize;
@@ -185,6 +187,9 @@ struct AccountStatus {
     /// The folders the last complete pass left as they were: told apart from the state, which
     /// stays `ready`.
     skipped: Vec<SkippedFolder>,
+    /// What waits in the outbox, or stays there: queued, sending, sent (its copy in Sent to
+    /// write), failed and uncertain messages.
+    outbox: Vec<Outgoing>,
     #[serde(skip)]
     in_copy: bool,
 }
@@ -197,9 +202,17 @@ pub fn status(json: bool) -> Result<()> {
         Some(copy) => copy.accounts().map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let accounts: Vec<AccountStatus> = configured
+    let mut accounts = Vec::new();
+    for id in configured {
+        let outbox = match &copy {
+            Some(copy) => copy.outbox(&id).map_err(|e| e.to_string())?,
+            None => Vec::new(),
+        };
+        accounts.push((id, outbox));
+    }
+    let accounts: Vec<AccountStatus> = accounts
         .into_iter()
-        .map(|id| {
+        .map(|(id, outbox)| {
             let Some(row) = rows.iter().find(|row| row.id == id) else {
                 return AccountStatus {
                     id,
@@ -208,6 +221,7 @@ pub fn status(json: bool) -> Result<()> {
                     last_sync: None,
                     messages: 0,
                     skipped: Vec::new(),
+                    outbox,
                     in_copy: false,
                 };
             };
@@ -221,6 +235,7 @@ pub fn status(json: bool) -> Result<()> {
                 last_sync: row.last_sync,
                 messages: row.messages,
                 skipped: row.skipped.clone(),
+                outbox,
                 in_copy: true,
             }
         })
@@ -262,6 +277,33 @@ pub fn status(json: bool) -> Result<()> {
             ),
             (Some(state), _) => {
                 println!("{}\t{state}\t{synced}\t{messages}{skipped}", account.id)
+            }
+        }
+        if !account.outbox.is_empty() {
+            let mut counts: Vec<(&str, usize)> = Vec::new();
+            for message in &account.outbox {
+                match counts.iter_mut().find(|(state, _)| *state == message.state) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((&message.state, 1)),
+                }
+            }
+            let counts: Vec<String> = counts
+                .iter()
+                .map(|(state, count)| format!("{count} {state}"))
+                .collect();
+            println!("\toutbox: {}", counts.join(", "));
+            for message in &account.outbox {
+                if matches!(message.state.as_str(), "failed" | "uncertain") {
+                    println!(
+                        "\t\tmessage {} {}: {}",
+                        message.id,
+                        message.state,
+                        message
+                            .last_error
+                            .as_deref()
+                            .unwrap_or("no reason recorded")
+                    );
+                }
             }
         }
     }

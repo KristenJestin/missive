@@ -31,6 +31,7 @@ fails.
 | `--user` | the login on both servers | the address |
 | `--certificate <file.pem>` | trust exactly this server certificate for this account | the system's authorities |
 | `--password-stdin` | read the password from standard input, one line | asked without echo |
+| `--server-saves-sent` | the SMTP server keeps a copy of what it sends in the Sent folder itself (Proton Mail Bridge does): Missive appends none | Missive appends the copy |
 
 On a terminal, what no option gives is asked for. When standard input is not a terminal (or with
 `--password-stdin`), nothing is asked: a missing value without a default is an error, and the
@@ -68,6 +69,7 @@ keyring. With `--json`, standard output is one JSON array, one object per accoun
     "user": "alice@example.org",
     "imap": { "host": "127.0.0.1", "port": 1143, "security": "starttls" },
     "smtp": { "host": "127.0.0.1", "port": 1025, "security": "starttls" },
+    "server_saves_sent": false,
     "certificate": true
   }
 ]
@@ -80,6 +82,7 @@ keyring. With `--json`, standard output is one JSON array, one object per accoun
 | `address` | string | |
 | `user` | string | the login on both servers |
 | `imap`, `smtp` | object | `host` (string), `port` (number), `security` (`"tls"` or `"starttls"`) |
+| `server_saves_sent` | boolean | whether the SMTP server keeps the copy of what it sends (`--server-saves-sent`) |
 | `certificate` | boolean | whether a certificate is pinned for the account |
 
 Without accounts, it prints `[]`. The array is printed on one line; the layout above is only for
@@ -179,17 +182,21 @@ When there is no copy yet (no daemon has run), they say so on standard error
 
 ### `missive status [--json]`
 
-Each account's connection state, its last complete sync, whether a sync is running, and the
-number of messages in the copy; and whether the daemon runs.
+Each account's connection state, its last complete sync, whether a sync is running, the
+number of messages in the copy and what its outbox holds; and whether the daemon runs.
 
 ```json
 {
   "daemon": "running",
   "accounts": [
     { "id": "alice", "state": "ready", "syncing": false, "last_sync": 1792220640, "messages": 8,
-      "skipped": [{ "folder": "sent", "kind": "refused" }] },
+      "skipped": [{ "folder": "sent", "kind": "refused" }],
+      "outbox": [
+        { "id": 3, "state": "failed", "message_id": "9c1f…@example.org", "queued_at": 1792220100,
+          "attempts": 0, "last_error": "the server answered 550 to RCPT TO" }
+      ] },
     { "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0,
-      "skipped": [] }
+      "skipped": [], "outbox": [] }
   ]
 }
 ```
@@ -205,6 +212,13 @@ number of messages in the copy; and whether the daemon runs.
 | `accounts[].skipped` | array | the folders the last complete pass left as they were, `[]` when none (below) |
 | `accounts[].skipped[].folder` | string | the folder's role (`inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`), else its name |
 | `accounts[].skipped[].kind` | string | why: `refused` (the server answered `NO` to a command of the sync, for example `EXAMINE`) or `unusable` (it answered `OK` with something no sync can use: no `UIDVALIDITY` or `EXISTS`, a listing shorter than the folder) |
+| `accounts[].outbox` | array | the messages of the outbox, oldest first (see [Sending](#sending)) |
+| `accounts[].outbox[].id` | number | its number in the outbox, as `compose --json` printed it |
+| `accounts[].outbox[].state` | string | `queued`, `claimed`, `sending`, `sent` (its copy in Sent is still to be appended), `failed` or `uncertain` |
+| `accounts[].outbox[].message_id` | string | its `Message-ID`, without angle brackets |
+| `accounts[].outbox[].queued_at` | number | when it was written, in seconds since the epoch |
+| `accounts[].outbox[].attempts` | number | the tries that failed before the end of its data (tried again later) |
+| `accounts[].outbox[].last_error` | string or `null` | the last error, for people |
 
 `ready` does not mean the copy is complete: a folder the server refuses is skipped, the others are
 synced, and the account is `ready` all the same. `skipped` is what keeps that from being silent. It
@@ -229,7 +243,8 @@ bob	never synced	0 messages
 ```
 
 A line reads `unknown (the daemon is not running)` in the place of the state when `state` is
-`null` for the second reason above.
+`null` for the second reason above. An account whose outbox holds messages has a line more,
+`	outbox: 1 queued, 1 failed`, and one line for each failed or uncertain message, with why.
 
 ### `missive unread [--json]`
 
@@ -633,3 +648,68 @@ the action cannot apply to one of them, nothing is recorded and the command fail
 standard error. The exit status is 3 when an identifier names no message (as for `show`), 1 for
 every other refusal: a folder that does not exist, `--permanently` outside the trash, a message
 whose move waits, an account that is not configured.
+
+## Sending
+
+### `missive compose [--account <id>] [--to <address>]… [--cc <address>]… [--bcc <address>]… [--subject <text>] [--body-file <path> | --body <text or ->] [--attach <path>]… --send [--json]`
+
+Writes a message and, with `--send`, sends it. An address is `name@example.org` or
+`Name <name@example.org>` (the name may be in any script; the address is ASCII). `--body -`
+reads the text from standard input; `--body-file` and `--body -` read UTF-8 text. Without a body
+the message has an empty text. The account is the only one configured, or the one `--account`
+names.
+
+Each `--attach` file is read when the command runs, and goes into the message at once: changing
+or removing the file afterwards changes nothing. Its media type is guessed from its name
+(`application/octet-stream` when the name says nothing), and its name is written as RFC 2231
+asks, so that any script survives.
+
+The message is built by the daemon (with `mail-builder`): UTF-8 headers encoded as RFC 2047
+asks, a `Message-ID` at the domain of the account's address, a `Date`, the text, then the
+attachments. Bcc recipients are given to the server only: the message sent does not name them.
+
+With `--send`, the command asks the daemon (starting one when none answers), which writes the
+message to the account's **outbox** in the local copy, and answers: the command returns at once,
+whether the server can be reached or not. The daemon then sends it over SMTP, with STARTTLS or
+TLS and the account's pinned certificate, as soon as the server can be reached; a daemon stopped
+or killed in between sends it when it starts again. For people, one line says the message is in
+the outbox. With `--json`, one object:
+
+```json
+{"outbox": 3, "message_id": "9c1f…@example.org"}
+```
+
+Without `--send`, the message is only checked (its addresses, its files) and the command fails,
+saying that saving drafts comes in a later version: nothing is written, no daemon is asked.
+
+The exit status is 1 when the message cannot be sent as written: no recipient, an address that is
+not one, a file that cannot be read, an account that is not configured.
+
+#### The outbox
+
+A message stays in the outbox until its server took it, in one of these states:
+
+| State | |
+|---|---|
+| `queued` | to send. A try that fails before the end of its data (a `4xx` answer, the server unreachable, the login or the certificate refused) leaves it here: the server took nothing, and it is tried again later, waiting longer each time (1 second, then twice as long, up to 5 minutes) |
+| `claimed` | the daemon is sending it, and has not yet written its end of data: the server cannot have taken it. A daemon killed then puts it back in `queued` when it starts again |
+| `sending` | its end of data is being written |
+| `sent` | the server took it (its `250` to the end of data); only its copy in Sent is left to append. Without one to append, the message leaves the outbox at once |
+| `failed` | the server refused it for good (`5xx` to `MAIL FROM`, a `RCPT TO`, `DATA` or the end of data). It stays, shown by `status`, and is never sent again |
+| `uncertain` | the connection was lost after its end of data and before the server's answer (or the daemon was killed then): the server may have taken it. It stays, shown by `status`, and is never sent again by itself: a message delivered twice is worse than a question |
+
+Messages are sent one at a time, in the order they were written; a message that waits for a new
+try holds back those after it. `missive watch` tells when a message is `sent`, `send-failed` or
+`send-uncertain` (`docs/events.md`).
+
+#### The copy in Sent
+
+Once the server took a message, Missive appends a copy to the account's Sent folder (the folder
+with the `sent` role) over IMAP, flagged `\Seen`, unless the account was added with
+`--server-saves-sent` (Proton Mail Bridge saves what it sends itself). The copy holds the Bcc
+recipients, in a `Bcc:` header: it is the user's own record, as in every mail client; what the
+recipients got never names them. A server that saves sent mail itself keeps what it was sent,
+without them. An account without a Sent folder gets no copy (the `sent` event says so): Missive
+never creates a folder. Appending is tried again when it fails, up to five times; an append whose
+answer was lost is looked for in Sent by its `Message-ID` before it is tried again.
+

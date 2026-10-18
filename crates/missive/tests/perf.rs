@@ -272,6 +272,7 @@ fn search_unread_and_status_answer_quickly_on_50_000_messages() {
             user: id.to_owned(),
             imap: server.clone(),
             smtp: server,
+            server_saves_sent: false,
         };
         accounts.save(id, &account, None).unwrap();
     }
