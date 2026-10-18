@@ -1070,6 +1070,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "missive-render"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "blitz-dom",
+ "blitz-html",
+ "blitz-traits",
+ "mail-parser",
+ "percent-encoding",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1481,6 +1493,7 @@ dependencies = [
  "image",
  "libc",
  "mail-parser",
+ "missive-render",
  "peniko",
  "percent-encoding",
  "tempfile",

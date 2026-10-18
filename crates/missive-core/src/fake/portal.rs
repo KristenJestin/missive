@@ -13,9 +13,9 @@ use zbus::{Connection, fdo, interface};
 use super::bus::Daemon;
 
 /// A private `dbus-daemon` with a fake `org.freedesktop.portal.Desktop` on it, serving
-/// `org.freedesktop.portal.OpenURI.OpenFile` only: it opens nothing, it records each call
-/// ([`FakePortal::calls`]) and answers on its request object as the test chose
-/// ([`PortalAnswer`]).
+/// `org.freedesktop.portal.OpenURI.OpenFile` and `OpenURI`: it opens nothing, it records each
+/// call ([`FakePortal::calls`], [`FakePortal::uris`]) and answers on its request object as the
+/// test chose ([`PortalAnswer`]).
 ///
 /// Run the program under test with `DBUS_SESSION_BUS_ADDRESS` set to [`FakePortal::address`].
 /// The bus and the fake stop when it is dropped; it needs a running tokio runtime.
@@ -25,6 +25,7 @@ pub struct FakePortal {
     _daemon: Daemon,
     address: String,
     calls: Arc<Mutex<Vec<PortalCall>>>,
+    uris: Arc<Mutex<Vec<String>>>,
 }
 
 /// What the portal answers to `OpenFile`, in the `Response` signal of its request.
@@ -60,6 +61,7 @@ impl FakePortal {
     pub async fn start(answer: PortalAnswer) -> Self {
         let (daemon, address) = Daemon::start();
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let uris = Arc::new(Mutex::new(Vec::new()));
         let connection = zbus::connection::Builder::address(address.as_str())
             .expect("a bus address")
             .name("org.freedesktop.portal.Desktop")
@@ -69,6 +71,7 @@ impl FakePortal {
                 OpenUri {
                     answer,
                     calls: calls.clone(),
+                    uris: uris.clone(),
                 },
             )
             .expect("the portal object")
@@ -80,6 +83,7 @@ impl FakePortal {
             _daemon: daemon,
             address,
             calls,
+            uris,
         }
     }
 
@@ -92,9 +96,14 @@ impl FakePortal {
     pub fn calls(&self) -> Vec<PortalCall> {
         lock(&self.calls).clone()
     }
+
+    /// The URI of every `OpenURI` call, in order.
+    pub fn uris(&self) -> Vec<String> {
+        lock(&self.uris).clone()
+    }
 }
 
-fn lock(calls: &Mutex<Vec<PortalCall>>) -> MutexGuard<'_, Vec<PortalCall>> {
+fn lock<T>(calls: &Mutex<Vec<T>>) -> MutexGuard<'_, Vec<T>> {
     calls
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -103,6 +112,7 @@ fn lock(calls: &Mutex<Vec<PortalCall>>) -> MutexGuard<'_, Vec<PortalCall>> {
 struct OpenUri {
     answer: PortalAnswer,
     calls: Arc<Mutex<Vec<PortalCall>>>,
+    uris: Arc<Mutex<Vec<String>>>,
 }
 
 #[interface(name = "org.freedesktop.portal.OpenURI")]
@@ -139,7 +149,36 @@ impl OpenUri {
             read_only,
             handle_token: handle_token.clone(),
         });
+        self.respond(&header, connection, handle_token.as_deref())
+            .await
+    }
 
+    #[zbus(name = "OpenURI")]
+    async fn open_uri(
+        &self,
+        _parent_window: String,
+        uri: String,
+        options: HashMap<String, OwnedValue>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<OwnedObjectPath> {
+        let handle_token = options
+            .get("handle_token")
+            .and_then(|token| String::try_from(token.try_clone().ok()?).ok());
+        lock(&self.uris).push(uri);
+        self.respond(&header, connection, handle_token.as_deref())
+            .await
+    }
+}
+
+impl OpenUri {
+    /// The request object of a call, answered as the test chose.
+    async fn respond(
+        &self,
+        header: &zbus::message::Header<'_>,
+        connection: &Connection,
+        handle_token: Option<&str>,
+    ) -> fdo::Result<OwnedObjectPath> {
         // The request object is named after the caller and its token, so that the caller can
         // listen to it before calling.
         let sender = header
@@ -148,7 +187,7 @@ impl OpenUri {
             .unwrap_or_default();
         let request = OwnedObjectPath::try_from(format!(
             "/org/freedesktop/portal/desktop/request/{sender}/{}",
-            handle_token.as_deref().unwrap_or("t")
+            handle_token.unwrap_or("t")
         ))
         .map_err(|e| fdo::Error::InvalidArgs(e.to_string()))?;
         let (code, delay) = match self.answer {

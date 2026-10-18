@@ -6,13 +6,51 @@
 //! image leaves its alternative text. What the author's CSS hides (a newsletter's preheader, most
 //! often) is not content: Blitz computes the styles, without fetching anything, to find it.
 
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
+
 use blitz_dom::{BaseDocument, DocumentConfig, ElementData, Node, NodeData};
 use blitz_html::HtmlDocument;
 use blitz_traits::shell::{ColorScheme, Viewport};
 
+use crate::flatten::flatten;
+
+#[derive(Clone, Copy)]
 pub enum Theme {
     Light,
     Dark,
+}
+
+/// The largest body reduced, in bytes.
+pub const MAX_HTML: usize = 2 << 20;
+
+/// How deep the elements of the reduced document nest at most: a text view may parse and lay
+/// them out recursively (gpui-base's does). Deeper content goes into the nearest kept element.
+pub const MAX_DEPTH: usize = 32;
+
+/// The stack the reduction runs on. On it, Blitz styled and laid out about 400 nested elements
+/// in a debug build, and 2 000 in a release build, before overflowing (measured).
+const STACK: usize = 8 << 20;
+
+/// How many open elements the body may nest in before Blitz parses it: deeper tags are removed,
+/// their text kept. Blitz's parser also gets slow with depth (5 000 nested `div`s take seconds).
+const FLATTEN_AT: usize = 96;
+
+/// How deep Blitz's tree may be: the count before parsing is an estimate (a table gains a
+/// `tbody`, SVG nests what HTML closes). Deeper, the reduction is refused rather than overflow.
+const MAX_TREE: usize = 160;
+
+/// Why a body has no reduced form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// Larger than [`MAX_HTML`].
+    TooLarge,
+    /// Nested deeper than the reduction can follow safely.
+    TooDeep,
+    /// Not done within its time budget.
+    TooLong,
+    /// The reduction failed (it panicked).
+    Failed,
 }
 
 /// Colours close to the GNOME (Adwaita) defaults: a stand-in for the system's.
@@ -42,34 +80,79 @@ hr {{ border: none; border-top: 1px solid {rule}; }}
     )
 }
 
-/// The reduced document, ready to be drawn.
-pub fn reduce(html: &str, theme: &Theme, width: u32) -> String {
+/// The reduced document, ready to be drawn. It runs on a thread of its own, with a known stack;
+/// past `budget` it is refused, and the thread is left to end on its own (the bounds above keep
+/// that short).
+pub fn reduce(html: &str, theme: Theme, width: u32, budget: Duration) -> Result<String, Refused> {
+    if html.len() > MAX_HTML {
+        return Err(Refused::TooLarge);
+    }
+    let html = html.to_owned();
+    let (send, receive) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("reduce".to_owned())
+        .stack_size(STACK)
+        .spawn(move || {
+            let _ = send.send(reduced(&html, &theme, width));
+        })
+        .map_err(|_| Refused::Failed)?;
+    match receive.recv_timeout(budget) {
+        Ok(reduced) => reduced,
+        Err(RecvTimeoutError::Timeout) => Err(Refused::TooLong),
+        Err(RecvTimeoutError::Disconnected) => Err(Refused::Failed),
+    }
+}
+
+fn reduced(html: &str, theme: &Theme, width: u32) -> Result<String, Refused> {
+    let html = flatten(html, FLATTEN_AT);
     // No net provider: Blitz's default one drops every request.
     let mut document = HtmlDocument::from_html(
-        html,
+        &html,
         DocumentConfig {
             viewport: Some(Viewport::new(width, 600, 1.0, ColorScheme::Light)),
             ..Default::default()
         },
     );
+    if depth(&document) > MAX_TREE {
+        return Err(Refused::TooDeep);
+    }
     document.resolve(0.0);
     let mut reducer = Reducer {
         document: &document,
         out: String::new(),
         in_data_table: false,
+        depth: 0,
     };
     reducer.children(document.root_node());
-    format!(
+    Ok(format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>{}</style></head><body>{}</body></html>",
         stylesheet(theme),
         reducer.out
-    )
+    ))
+}
+
+/// How deep a document's tree is, found without recursion.
+fn depth(document: &BaseDocument) -> usize {
+    let mut deepest = 0;
+    let mut pending = vec![(document.root_node(), 1)];
+    while let Some((node, depth)) = pending.pop() {
+        deepest = deepest.max(depth);
+        pending.extend(
+            node.children
+                .iter()
+                .filter_map(|&child| document.get_node(child))
+                .map(|child| (child, depth + 1)),
+        );
+    }
+    deepest
 }
 
 struct Reducer<'a> {
     document: &'a BaseDocument,
     out: String,
     in_data_table: bool,
+    /// How many elements of `out` are open.
+    depth: usize,
 }
 
 /// Kept as they are, without their attributes.
@@ -124,9 +207,59 @@ const DROPPED: &[&str] = &[
 
 impl Reducer<'_> {
     fn children(&mut self, node: &Node) {
+        if self.has_breaks(node) {
+            return self.lines(node);
+        }
         for &child in &node.children {
             if let Some(child) = self.document.get_node(child) {
                 self.node(child);
+            }
+        }
+    }
+
+    /// Whether a line break is among the children of a node.
+    fn has_breaks(&self, node: &Node) -> bool {
+        node.children
+            .iter()
+            .any(|&child| self.document.get_node(child).is_some_and(is_break))
+    }
+
+    /// The children of a node cut at its line breaks, each line a block of its own and a blank
+    /// line an empty one: a text view that lays a paragraph out as one run of text (gpui-base's)
+    /// would otherwise join the lines of a plain-text message.
+    fn lines(&mut self, node: &Node) {
+        // Too deep for a block per line, the lines are joined by breaks.
+        let blocks = self.depth < MAX_DEPTH;
+        self.depth += usize::from(blocks);
+        let mut line = String::new();
+        let mut lines = Vec::new();
+        for &child in &node.children {
+            let Some(child) = self.document.get_node(child) else {
+                continue;
+            };
+            if is_break(child) {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            let outer = std::mem::take(&mut self.out);
+            self.node(child);
+            line.push_str(&std::mem::replace(&mut self.out, outer));
+        }
+        // A last break ends the last line; it does not start another.
+        if !line.trim().is_empty() {
+            lines.push(line);
+        }
+        self.depth -= usize::from(blocks);
+        if !blocks {
+            self.out.push_str(&lines.join("<br>"));
+            return;
+        }
+        for line in lines {
+            if line.trim().is_empty() {
+                // A no-break space, not a `<br>`: gpui-base draws a lone break as nothing.
+                self.out.push_str("<div>\u{a0}</div>");
+            } else {
+                self.out.push_str(&format!("<div>{line}</div>"));
             }
         }
     }
@@ -148,34 +281,33 @@ impl Reducer<'_> {
             "br" | "hr" => self.out.push_str(&format!("<{tag}>")),
             "a" => match element.attr(blitz_dom::local_name!("href")) {
                 Some(href) if is_followable(href) => {
-                    self.out.push_str("<a href=\"");
-                    escape_into(&mut self.out, href);
-                    self.out.push_str("\">");
-                    self.children(node);
-                    self.out.push_str("</a>");
+                    let mut attributes = " href=\"".to_owned();
+                    escape_into(&mut attributes, href);
+                    attributes.push('"');
+                    self.wrapped_with("a", &attributes, node);
                 }
                 _ => self.children(node),
             },
             "img" => self.image(element),
             "table" => self.table(node),
             "tr" | "thead" | "tbody" | "tfoot" | "td" | "th" if self.in_data_table => {
-                self.out.push_str(&format!("<{tag}"));
+                let mut attributes = String::new();
                 for span in ["colspan", "rowspan"] {
                     if let Some(value) = element
                         .attrs()
                         .iter()
                         .find(|attr| &*attr.name.local == span)
                     {
-                        self.out.push_str(&format!(" {span}=\""));
-                        escape_into(&mut self.out, &value.value);
-                        self.out.push('"');
+                        attributes.push_str(&format!(" {span}=\""));
+                        escape_into(&mut attributes, &value.value);
+                        attributes.push('"');
                     }
                 }
-                self.out.push('>');
-                self.children(node);
-                self.out.push_str(&format!("</{tag}>"));
+                self.wrapped_with(tag, &attributes, node);
             }
             "td" | "th" => self.wrapped("div", node),
+            // A paragraph cut into lines holds blocks, which a paragraph cannot.
+            "p" if self.has_breaks(node) => self.wrapped("div", node),
             _ if KEPT.contains(&tag) => self.wrapped(tag, node),
             _ if BLOCKS.contains(&tag) => self.wrapped("div", node),
             _ => self.children(node),
@@ -188,8 +320,18 @@ impl Reducer<'_> {
     }
 
     fn wrapped(&mut self, tag: &str, node: &Node) {
-        self.out.push_str(&format!("<{tag}>"));
+        self.wrapped_with(tag, "", node);
+    }
+
+    /// The node's children in a `tag`, unless the output is already as deep as it may be.
+    fn wrapped_with(&mut self, tag: &str, attributes: &str, node: &Node) {
+        if self.depth >= MAX_DEPTH {
+            return self.children(node);
+        }
+        self.out.push_str(&format!("<{tag}{attributes}>"));
+        self.depth += 1;
         self.children(node);
+        self.depth -= 1;
         self.out.push_str(&format!("</{tag}>"));
     }
 
@@ -203,15 +345,23 @@ impl Reducer<'_> {
             escape_into(&mut self.out, alt);
             self.out.push_str("\">");
         } else if !alt.trim().is_empty() {
-            self.out.push_str("<span class=\"alt\">[");
+            let styled = self.depth < MAX_DEPTH;
+            if styled {
+                self.out.push_str("<span class=\"alt\">");
+            }
+            self.out.push('[');
             escape_into(&mut self.out, alt.trim());
-            self.out.push_str("]</span>");
+            self.out.push(']');
+            if styled {
+                self.out.push_str("</span>");
+            }
         }
     }
 
     fn table(&mut self, node: &Node) {
         let outer = self.in_data_table;
-        self.in_data_table = self.holds_data(node);
+        // A table, its row group, a row and a cell: a data table needs room for all four.
+        self.in_data_table = self.depth + 4 <= MAX_DEPTH && self.holds_data(node);
         if self.in_data_table {
             self.wrapped("table", node);
         } else {
@@ -280,6 +430,11 @@ struct Shape {
     nested_table: bool,
 }
 
+fn is_break(node: &Node) -> bool {
+    node.element_data()
+        .is_some_and(|element| &*element.name.local == "br")
+}
+
 fn is_followable(href: &str) -> bool {
     let lower = href.trim().to_ascii_lowercase();
     lower.starts_with("https:") || lower.starts_with("http:") || lower.starts_with("mailto:")
@@ -302,7 +457,7 @@ mod tests {
     use super::*;
 
     fn body(html: &str) -> String {
-        let reduced = reduce(html, &Theme::Light, 800);
+        let reduced = reduce(html, Theme::Light, 800, Duration::from_secs(10)).unwrap();
         let start = reduced.find("<body>").unwrap() + "<body>".len();
         let end = reduced.rfind("</body>").unwrap();
         reduced[start..end].to_string()
@@ -374,7 +529,18 @@ mod tests {
     }
 
     #[test]
+    fn each_line_broken_by_a_line_break_is_a_block_and_a_blank_line_stays() {
+        let out = body("<p>Hi all,<br><br>Notes:<br>1. <b>Agreed</b>.<br></p>");
+        assert_eq!(
+            out,
+            "<div><div>Hi all,</div><div>\u{a0}</div><div>Notes:</div>\
+             <div>1. <b>Agreed</b>.</div></div>"
+        );
+    }
+
+    #[test]
     fn the_dark_theme_sets_a_dark_background() {
-        assert!(reduce("<p>x</p>", &Theme::Dark, 800).contains("background: #242424"));
+        let reduced = reduce("<p>x</p>", Theme::Dark, 800, Duration::from_secs(10)).unwrap();
+        assert!(reduced.contains("background: #242424"));
     }
 }

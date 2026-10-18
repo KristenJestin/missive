@@ -10,8 +10,8 @@
 //! On the server, every command is read through the same path as the sync's, and counts as done
 //! only with its tagged `OK`:
 //!
-//! - read, unread, flagged, unflagged: `UID STORE <uids> +FLAGS (\Seen)` (or `-FLAGS`, or
-//!   `\Flagged`), not silent: the flags it answers are written to the copy.
+//! - read, unread, flagged, unflagged, answered: `UID STORE <uids> +FLAGS (\Seen)` (or `-FLAGS`,
+//!   or `\Flagged`, `\Answered`), not silent: the flags it answers are written to the copy.
 //! - move, and delete (a move to the trash): `UID MOVE` when the server has MOVE. Else, with
 //!   UIDPLUS, `UID COPY`, then `UID STORE <uids> +FLAGS.SILENT (\Deleted)` and
 //!   `UID EXPUNGE <uids>`, which removes those UIDs and no other message marked deleted. A server
@@ -63,6 +63,8 @@ pub enum Kind {
     Unread,
     Flagged,
     Unflagged,
+    /// Set by a reply once it is sent, never asked for with `mark`.
+    Answered,
     Move,
     /// A move to the account's trash.
     Delete,
@@ -70,11 +72,12 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 7] = [
+    pub const ALL: [Kind; 8] = [
         Kind::Read,
         Kind::Unread,
         Kind::Flagged,
         Kind::Unflagged,
+        Kind::Answered,
         Kind::Move,
         Kind::Delete,
         Kind::DeletePermanently,
@@ -87,6 +90,7 @@ impl Kind {
             Kind::Unread => "unread",
             Kind::Flagged => "flagged",
             Kind::Unflagged => "unflagged",
+            Kind::Answered => "answered",
             Kind::Move => "move",
             Kind::Delete => "delete",
             Kind::DeletePermanently => "delete-permanently",
@@ -104,6 +108,7 @@ impl Kind {
             Kind::Unread => Some(("\\Seen", false)),
             Kind::Flagged => Some(("\\Flagged", true)),
             Kind::Unflagged => Some(("\\Flagged", false)),
+            Kind::Answered => Some(("\\Answered", true)),
             _ => None,
         }
     }
@@ -117,7 +122,7 @@ impl Kind {
 /// What a request asks for, before it is checked against the copy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Wanted {
-    /// Read, Unread, Flagged or Unflagged.
+    /// Read, Unread, Flagged, Unflagged or Answered.
     Mark(Kind),
     /// To a folder named by its role (`inbox`, `archive`…) or by its name on the server.
     Move(String),

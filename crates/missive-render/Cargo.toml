@@ -1,0 +1,19 @@
+[package]
+name = "missive-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "How Missive draws a message: the reduced form, with the parts it may embed"
+
+# Blitz is pinned to exact versions: it is a beta and its crates move together. Every default
+# feature is off so that nothing able to reach the network (blitz-net, reqwest…) enters the tree;
+# the features turned on are the ones mail needs: system fonts and floats (old mail floats). Blitz
+# only computes styles here, to find what the author hides: it never draws. Its own crate, so that
+# the command line and the daemon never carry it.
+[dependencies]
+base64.workspace = true
+blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts", "floats"] }
+blitz-html = { version = "=0.3.0-beta.4", default-features = false }
+blitz-traits = { version = "=0.3.0-beta.4", default-features = false }
+mail-parser.workspace = true
+percent-encoding.workspace = true
