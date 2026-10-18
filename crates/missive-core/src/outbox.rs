@@ -194,8 +194,12 @@ pub enum Copied {
     Appended { id: i64 },
     /// It stays, tried again later.
     Retried { id: i64, attempts: u32 },
-    /// It will never be in Sent: `why`, for the log.
-    GivenUp { id: i64, why: &'static str },
+    /// It will never be in Sent: `why`, for people.
+    GivenUp {
+        id: i64,
+        message_id: String,
+        why: &'static str,
+    },
 }
 
 /// What [`copy_sent`] did.
@@ -236,6 +240,7 @@ async fn copy_each(
                 store.copy_done(id)?;
                 copies.copied.push(Copied::GivenUp {
                     id,
+                    message_id: copy.message_id,
                     why: "the account has no Sent folder",
                 });
             }
@@ -245,6 +250,7 @@ async fn copy_each(
             store.copy_done(id)?;
             copies.copied.push(Copied::GivenUp {
                 id,
+                message_id: copy.message_id,
                 why: "the Sent folder's name cannot be written in a command",
             });
             continue;
@@ -260,11 +266,11 @@ async fn copy_each(
         let done = match tried {
             Ok(Ok(done)) => done,
             Ok(Err(error)) => {
-                failed(store, id, attempts, copies)?;
+                failed(store, id, copy.message_id, attempts, copies)?;
                 return Err(error);
             }
             Err(_) => {
-                failed(store, id, attempts, copies)?;
+                failed(store, id, copy.message_id, attempts, copies)?;
                 copies.timed_out = true;
                 return Err(SyncError::Connection(ConnectError::Unreachable(
                     "the IMAP server did not answer APPEND in time".to_owned(),
@@ -281,10 +287,13 @@ async fn copy_each(
                 store.copy_done(id)?;
                 copies.copied.push(Copied::GivenUp {
                     id,
+                    message_id: copy.message_id,
                     why: "the server has no such Sent folder",
                 });
             }
-            Done::No { .. } | Done::Bad => failed(store, id, attempts, copies)?,
+            Done::No { .. } | Done::Bad => {
+                failed(store, id, copy.message_id, attempts, copies)?;
+            }
         }
     }
     Ok(())
@@ -294,6 +303,7 @@ async fn copy_each(
 fn failed(
     store: &mut Store,
     id: i64,
+    message_id: String,
     attempts: u32,
     copies: &mut Copies,
 ) -> rusqlite::Result<()> {
@@ -301,6 +311,7 @@ fn failed(
         store.copy_done(id)?;
         copies.copied.push(Copied::GivenUp {
             id,
+            message_id,
             why: "appending it failed too many times",
         });
     } else {

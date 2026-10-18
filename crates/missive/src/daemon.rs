@@ -45,7 +45,7 @@ use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap}
 use missive_core::copy::{Copy, MessageId};
 use missive_core::drafts;
 use missive_core::events::{
-    ActionEvent, DraftEvent, Event, Reader, SendFailed, SendUncertain, Sent, Unread,
+    ActionEvent, DraftEvent, Event, Reader, SendFailed, SendUncertain, Sent, SentCopyFailed, Unread,
 };
 use missive_core::keyring::{Keyring, KeyringError};
 use missive_core::outbox::{self, Copied, Tried};
@@ -1457,10 +1457,24 @@ impl Worker {
                      ({attempts} times so far)",
                     self.key
                 ),
-                Copied::GivenUp { id, why } => log!(
-                    "account {}: the copy of message {id} is not in Sent: {why}",
-                    self.key
-                ),
+                Copied::GivenUp {
+                    id,
+                    message_id,
+                    why,
+                } => {
+                    log!(
+                        "account {}: the copy of message {id} is not in Sent: {why}",
+                        self.key
+                    );
+                    self.events.send(Event::SentCopyFailed(SentCopyFailed {
+                        account: self.id.clone(),
+                        outbox: *id,
+                        message_id: message_id.clone(),
+                        message: format!(
+                            "the message was sent, but its copy is not in Sent: {why}"
+                        ),
+                    }));
+                }
             }
         }
         match copied {

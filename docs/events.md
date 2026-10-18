@@ -244,6 +244,24 @@ shows it.
 | `account`, `outbox`, `message_id` | | as for `sent` |
 | `message` | string | for people |
 
+### `sent-copy-failed`
+
+The copy of a message the server took will never be in the account's Sent folder: appending it
+failed five times, or the server says there is no such folder, or the folder's name cannot be
+written in an IMAP command, or the account turned out to have no Sent folder. The message was
+sent all the same; it leaves the outbox.
+
+```json
+{"protocol": 1, "event": "sent-copy-failed", "account": "alice", "outbox": 3,
+ "message_id": "9c1f…@example.org",
+ "message": "the message was sent, but its copy is not in Sent: appending it failed too many times"}
+```
+
+| Field | Type | |
+|---|---|---|
+| `account`, `outbox`, `message_id` | | as for `sent` |
+| `message` | string | for people |
+
 ### `draft`
 
 A draft was written to the account's Drafts folder, removed from it (its message was sent), or

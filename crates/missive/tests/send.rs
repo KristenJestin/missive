@@ -1075,3 +1075,33 @@ async fn a_daemon_killed_during_the_sent_append_does_not_append_it_twice() {
     eventually(20, "the outbox empty", || env.outbox().is_empty()).await;
     assert_eq!(server.uids("Sent").len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sent_copy_refused_five_times_is_given_up_with_an_event() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = env.watch().await;
+    server.refuse("APPEND");
+    let output = env.compose(&["--json", "--body", BODY]).await;
+    let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    watcher.next("sent").await;
+
+    // Each pass tries the copy again.
+    for _ in 0..10 {
+        if env.outbox().is_empty() {
+            break;
+        }
+        env.run(&["sync"]).await;
+    }
+
+    let given_up = watcher.next("sent-copy-failed").await;
+    assert_eq!(given_up["account"], "alice");
+    assert_eq!(given_up["outbox"], queued["outbox"]);
+    assert_eq!(given_up["message_id"], queued["message_id"]);
+    assert!(
+        given_up["message"].as_str().unwrap().contains("too many"),
+        "{given_up}"
+    );
+    assert!(env.outbox().is_empty());
+    assert!(server.uids("Sent").is_empty());
+}
