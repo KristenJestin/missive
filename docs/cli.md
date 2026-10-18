@@ -92,12 +92,16 @@ An account whose `account.toml` cannot be read or is invalid does not stop the o
 left out, and one line on standard error names its folder and the kind of error (never the
 content of the file). Standard output stays valid, and the exit status is still success.
 
-### `missive account remove <id>`
+### `missive account remove <id> [--force]`
 
-Removes the account's keyring entry, then its settings and certificate. The keyring goes first:
-if it is unavailable, the account stays whole and the command can be run again. Its mail leaves
-the local copy the next time the daemon starts or reloads the configuration (a `sync` does): the
-copy only, nothing is sent to the server. Until then the reading commands skip the account.
+Removes the account's keyring entry, then its settings and certificate. While the account's
+outbox holds messages not sent (`queued`, `claimed`, `sending`, `failed` or `uncertain`; see
+`missive outbox`), it is refused, saying how many, since they would leave with its rows: resend
+or discard them first, or give `--force`. A message whose copy is still to be appended to Sent
+was sent, and does not count. The keyring goes first: if it is unavailable, the account stays
+whole and the command can be run again. Its mail leaves the local copy the next time the daemon
+starts or reloads the configuration (a `sync` does): the copy only, nothing is sent to the
+server. Until then the reading commands skip the account.
 Removing the last account leaves its rows in the copy until another account is configured: a
 configuration folder that is missing or empty is more likely a wrong or unmounted folder than a
 choice, and must not wipe the copy.

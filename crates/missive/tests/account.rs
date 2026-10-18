@@ -5,7 +5,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
+use missive_core::compose::Built;
 use missive_core::fake::{FakeKeyring, FakeServer, PromptAnswer};
+use missive_core::store::Store;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -778,6 +780,51 @@ async fn without_a_terminal_the_password_comes_only_from_password_stdin() {
         stderr(&output)
     );
     setup.nothing_saved();
+}
+
+/// Puts in the local copy, for the account `alice@example.org`, a message queued, one the server
+/// refused and one sent whose copy is still to be appended to Sent.
+fn with_an_outbox(setup: &Setup) {
+    let folder = setup.home.path().join("data/missive");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut store = Store::open(&folder.join("copy.sqlite")).unwrap();
+    let key = store.account(USER).unwrap();
+    let built = |n: u32| Built {
+        sender: USER.to_owned(),
+        recipients: vec!["bob@example.com".to_owned()],
+        message_id: format!("{n}@example.org"),
+        raw: format!("Subject: {n}\r\n\r\nHello\r\n").into_bytes(),
+        bcc_header: None,
+    };
+    store.enqueue(key, &built(1), true, None).unwrap();
+    let refused = store.enqueue(key, &built(2), true, None).unwrap();
+    store
+        .send_failed(refused, "the server answered 550")
+        .unwrap();
+    let sent = store.enqueue(key, &built(3), true, None).unwrap();
+    store.sent(sent, true).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_with_unsent_messages_is_refused_without_force_and_says_how_many() {
+    let setup = Setup::new().await;
+    succeeded(&setup.add_with_certificate().await);
+    with_an_outbox(&setup);
+
+    let output = setup.run(&["account", "remove", USER]).await;
+
+    failed(&output);
+    let said = stderr(&output);
+    assert!(said.contains("2 messages"), "{said}");
+    assert!(said.contains("--force"), "{said}");
+    assert_eq!(setup.keyring.items().len(), 1);
+    let list = setup.run(&["account", "list", "--json"]).await;
+    assert!(stdout(&list).contains(USER), "{}", stdout(&list));
+
+    succeeded(&setup.run(&["account", "remove", USER, "--force"]).await);
+    assert!(setup.keyring.items().is_empty());
+    let list = setup.run(&["account", "list", "--json"]).await;
+    assert_eq!(stdout(&list).trim(), "[]");
 }
 
 #[tokio::test(flavor = "multi_thread")]

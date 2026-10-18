@@ -133,10 +133,14 @@ enum AccountCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove an account: its settings, its certificate and its keyring entry.
+    /// Remove an account: its settings, its certificate and its keyring entry. Refused while
+    /// its outbox holds messages not sent, unless --force.
     Remove {
         /// The account's identifier, as `account list` shows it.
         id: String,
+        /// Remove it even though its outbox holds messages not sent: they are dropped with it.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -214,7 +218,7 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Account(AccountCommand::Add(args)) => add(args).await,
         Command::Account(AccountCommand::List { json }) => list(json),
-        Command::Account(AccountCommand::Remove { id }) => remove(&id).await,
+        Command::Account(AccountCommand::Remove { id, force }) => remove(&id, force).await,
         Command::Sync { account } => sync(account).await,
         Command::Watch => watch::run().await.map_err(Failure),
         Command::Daemon(args) => daemon::run(daemon::Options {
@@ -420,18 +424,43 @@ fn describe(server: &Server) -> String {
     )
 }
 
-async fn remove(id: &str) -> Result<()> {
+async fn remove(id: &str, force: bool) -> Result<()> {
     let store = AccountStore::from_env()?;
     if !valid_id(id) || !store.exists(id) {
         return Err(Failure(format!(
             "no account {id} (missive account list shows them)"
         )));
     }
+    if !force {
+        let unsent = unsent(id)?;
+        if unsent > 0 {
+            let messages = if unsent == 1 { "message" } else { "messages" };
+            return Err(Failure(format!(
+                "the outbox of {id} holds {unsent} {messages} not sent, which removing the \
+                 account drops (missive outbox lists them): resend or discard them first, or \
+                 remove it all the same with --force"
+            )));
+        }
+    }
     // The keyring first: if it is unavailable, the account stays whole and can be removed later.
     Keyring::open().await?.delete(id).await?;
     store.remove(id)?;
     println!("Removed the account {id}.");
     Ok(())
+}
+
+/// How many messages of the account's outbox are not sent: all but those whose copy is left to
+/// append to Sent. Read from the local copy, as `status` reads it.
+fn unsent(id: &str) -> Result<usize> {
+    let path = missive_core::store::Store::default_path()?;
+    let Some(copy) = missive_core::copy::Copy::open(&path)? else {
+        return Ok(0);
+    };
+    Ok(copy
+        .outbox(id)?
+        .iter()
+        .filter(|message| message.state != "sent")
+        .count())
 }
 
 async fn sync(account: Option<String>) -> Result<()> {
