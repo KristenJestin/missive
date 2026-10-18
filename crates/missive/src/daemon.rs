@@ -669,7 +669,7 @@ impl Worker {
         }
     }
 
-    /// Idles in the selected folder for at most `timeout`, and says what ended it.
+    /// Idles in the selected folder for at most `timeout` in all, and says what ended it.
     async fn idle(
         &mut self,
         session: ImapSession,
@@ -680,14 +680,23 @@ impl Worker {
             return (Wake::Stop, Err(error.into()));
         }
         let (result, asked) = {
+            // The wait's own timeout only counts silence, and a server's keepalives
+            // (`* OK Still here`) break it: the sleep bounds the whole of it.
             let (wait, interrupt) = handle.wait_with_timeout(timeout);
             tokio::pin!(wait);
+            let renewal = tokio::time::sleep(timeout);
+            tokio::pin!(renewal);
             let mut interrupt = Some(interrupt);
             let mut asked = None;
-            // A request or a stop interrupts IDLE; the wait then ends, and the session is whole.
+            // A request, a stop or the end of the time interrupts IDLE; the wait then ends, and
+            // the session is whole.
             let result = loop {
                 tokio::select! {
                     result = &mut wait => break result,
+                    _ = &mut renewal, if interrupt.is_some() => {
+                        asked = Some(Wake::Renew);
+                        interrupt = None;
+                    }
                     request = self.requests.recv(), if interrupt.is_some() => {
                         asked = Some(match request {
                             Some(waiter) => {

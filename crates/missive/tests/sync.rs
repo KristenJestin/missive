@@ -820,6 +820,27 @@ async fn a_session_lost_at_every_pass_answers_the_sync_and_records_unreachable()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn idle_keepalives_do_not_keep_the_other_folders_from_being_checked() {
+    let server = mailbox()
+        .idle_keepalive(Duration::from_millis(200))
+        .start()
+        .await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "1"]).await;
+    succeeded(&env.sync().await);
+    eventually(10, "IDLE", || server.imap_log().iter().any(|c| c == "IDLE")).await;
+
+    let uid = server.deliver("Sent", message(8));
+
+    eventually(10, "the new sent message", || {
+        env.uids("Sent").contains(&uid)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_new_message_in_another_folder_comes_with_the_periodic_check() {
     let server = mailbox().start().await;
     let env = Env::new().await;
