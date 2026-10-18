@@ -8,7 +8,7 @@ use std::io::Write;
 use clap::{Args, ValueEnum};
 use missive_core::account::{AccountStore, Listing};
 use missive_core::body::{self, Attachment};
-use missive_core::copy::{Copy, FolderRef, Hit, List, NotFound, Person, Search};
+use missive_core::copy::{Copy, FolderRef, Hit, List, NotFound, Person, Search, Stored};
 use missive_core::protocol::pid_path;
 use missive_core::store::Store;
 use serde::Serialize;
@@ -90,10 +90,10 @@ pub struct ShowArgs {
     raw: bool,
 }
 
-/// The exit status of `show` when the identifier names no message.
+/// The exit status of `show` and `open` when the identifier names no message.
 pub const NOT_FOUND: u8 = 3;
 
-/// Why `show` failed: the identifier names no message, or something else went wrong.
+/// Why `show` or `open` failed: the identifier names no message, or something else went wrong.
 pub enum ShowError {
     NotFound(String),
     Failed(String),
@@ -435,19 +435,24 @@ struct Shown {
     attachments: Vec<Attachment>,
 }
 
-pub fn show(args: ShowArgs) -> std::result::Result<(), ShowError> {
+/// The message an identifier names, for `show` and `open`.
+pub fn message(id: &str) -> std::result::Result<Stored, ShowError> {
     let configured = configured()?;
     let Some(copy) = open()? else {
         return Err(ShowError::NotFound(
             "no such message in the local copy".to_owned(),
         ));
     };
-    let stored = match copy.message(&args.id)? {
+    match copy.message(id)? {
         // A removed account's mail may stay in the copy: it is not shown, as `list` does not.
-        Ok(stored) if configured.contains(&stored.hit.account) => stored,
-        Ok(_) => return Err(ShowError::NotFound(NotFound::Unknown.to_string())),
-        Err(not_found) => return Err(ShowError::NotFound(not_found.to_string())),
-    };
+        Ok(stored) if configured.contains(&stored.hit.account) => Ok(stored),
+        Ok(_) => Err(ShowError::NotFound(NotFound::Unknown.to_string())),
+        Err(not_found) => Err(ShowError::NotFound(not_found.to_string())),
+    }
+}
+
+pub fn show(args: ShowArgs) -> std::result::Result<(), ShowError> {
+    let stored = message(&args.id)?;
     if args.raw {
         std::io::stdout().write_all(&stored.raw)?;
         return Ok(());
