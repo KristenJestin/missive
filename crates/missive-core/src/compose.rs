@@ -11,6 +11,7 @@
 use mail_builder::MessageBuilder;
 use mail_builder::headers::Header;
 use mail_builder::headers::address::Address;
+use mail_parser::{MessageParser, MimeHeaders};
 
 use crate::account::Account;
 
@@ -82,11 +83,16 @@ pub struct Draft {
 }
 
 impl Draft {
-    /// Whether it can be sent: it has a recipient.
+    /// Whether it can be sent: it has a recipient, and can be written.
     pub fn check(&self) -> Result<(), String> {
         if self.to.is_empty() && self.cc.is_empty() && self.bcc.is_empty() {
             return Err("the message has no recipient (--to, --cc or --bcc)".to_owned());
         }
+        self.check_fields()
+    }
+
+    /// Whether it can be written as a message, recipient or not: what a draft needs.
+    pub fn check_fields(&self) -> Result<(), String> {
         if self
             .subject
             .as_deref()
@@ -100,6 +106,50 @@ impl Draft {
             }
         }
         Ok(())
+    }
+}
+
+impl Draft {
+    /// What a message saved as a draft holds: its recipients (Bcc included, which a draft keeps),
+    /// its subject, its text and its attachments. An address Missive cannot send to is refused:
+    /// the draft could not be written again as it is. A message with only HTML gives its text.
+    pub fn read(raw: &[u8]) -> Result<Draft, String> {
+        let parsed = MessageParser::default()
+            .parse(raw)
+            .ok_or_else(|| "the draft cannot be read as a message".to_owned())?;
+        let mailboxes = |address: Option<&mail_parser::Address>| -> Result<Vec<Mailbox>, String> {
+            address
+                .into_iter()
+                .flat_map(|address| address.iter())
+                .filter_map(|mailbox| {
+                    let address = mailbox.address()?;
+                    Some(Mailbox::parse(address).map(|parsed| Mailbox {
+                        name: mailbox.name().map(str::to_owned).filter(|n| !n.is_empty()),
+                        address: parsed.address,
+                    }))
+                })
+                .collect()
+        };
+        let mut attachments = Vec::new();
+        for (index, part) in parsed.attachments().enumerate() {
+            attachments.push(Attachment {
+                name: part
+                    .attachment_name()
+                    .map_or_else(|| format!("attachment-{}", index + 1), str::to_owned),
+                data: part.contents().to_vec(),
+            });
+        }
+        Ok(Draft {
+            to: mailboxes(parsed.to())?,
+            cc: mailboxes(parsed.cc())?,
+            bcc: mailboxes(parsed.bcc())?,
+            subject: parsed.subject().map(str::to_owned),
+            body: parsed
+                .body_text(0)
+                .map(|text| text.into_owned())
+                .unwrap_or_default(),
+            attachments,
+        })
     }
 }
 
@@ -119,17 +169,41 @@ pub struct Built {
     pub bcc_header: Option<Vec<u8>>,
 }
 
+impl Built {
+    /// The message as it is kept in the Drafts folder: its Bcc header, then the message.
+    pub fn with_bcc(&self) -> Vec<u8> {
+        let mut raw = self.bcc_header.clone().unwrap_or_default();
+        raw.extend_from_slice(&self.raw);
+        raw
+    }
+}
+
 /// Builds the message `account` sends for `draft`, dated `now` (seconds since the epoch). The
 /// Message-ID is random, at the domain of the account's address.
 pub fn build(account: &Account, draft: &Draft, now: i64) -> Result<Built, String> {
     draft.check()?;
+    write(account, draft, now, None)
+}
+
+/// Builds `draft` as [`build`] does, but without asking for a recipient (a draft may have none
+/// yet), and under `message_id` when given: every version of a draft keeps the same one.
+pub fn write(
+    account: &Account,
+    draft: &Draft,
+    now: i64,
+    message_id: Option<&str>,
+) -> Result<Built, String> {
+    draft.check_fields()?;
     let domain = account
         .address
         .rsplit_once('@')
         .map(|(_, domain)| domain)
         .filter(|domain| !domain.is_empty())
         .ok_or_else(|| "the account's address has no domain".to_owned())?;
-    let message_id = format!("{}@{domain}", random_hex());
+    let message_id = match message_id {
+        Some(id) => id.to_owned(),
+        None => format!("{}@{domain}", random_hex()),
+    };
 
     let mut message = MessageBuilder::new()
         .from(Address::new_address(
@@ -215,7 +289,6 @@ fn random_hex() -> String {
 mod tests {
     use super::*;
     use crate::account::{Security, Server};
-    use mail_parser::{MessageParser, MimeHeaders};
 
     fn account() -> Account {
         let server = Server {
@@ -397,5 +470,42 @@ mod tests {
                 "{body:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_draft_reads_back_as_it_was_written_bcc_included() {
+        let draft = Draft {
+            to: vec![mailbox("Zoé Ça <zoe@example.com>")],
+            cc: vec![mailbox("carl@example.net")],
+            bcc: vec![mailbox("hidden@example.net")],
+            subject: Some("Réunion ☕".to_owned()),
+            body: "Bonjour,\r\nà demain.\r\n".to_owned(),
+            attachments: vec![Attachment {
+                name: "notes é.txt".to_owned(),
+                data: b"some notes".to_vec(),
+            }],
+        };
+        let built = write(&account(), &draft, 0, Some("same@example.org")).unwrap();
+        assert_eq!(built.message_id, "same@example.org");
+
+        assert_eq!(Draft::read(&built.with_bcc()).unwrap(), draft);
+        // Without its Bcc header, the message sent reads back without them.
+        assert!(Draft::read(&built.raw).unwrap().bcc.is_empty());
+    }
+
+    #[test]
+    fn a_draft_needs_no_recipient_but_a_message_to_send_does() {
+        let draft = Draft {
+            subject: Some("Later".to_owned()),
+            ..Draft::default()
+        };
+        let built = write(&account(), &draft, 0, None).unwrap();
+        assert_eq!(Draft::read(&built.raw).unwrap(), draft);
+        assert!(build(&account(), &draft, 0).is_err());
+        let broken = Draft {
+            subject: Some("a\nb".to_owned()),
+            ..Draft::default()
+        };
+        assert!(write(&account(), &broken, 0, None).is_err());
     }
 }

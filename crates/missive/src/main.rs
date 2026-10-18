@@ -90,8 +90,9 @@ enum Command {
     /// the local copy at once, applied on the server when the account is connected; starts the
     /// daemon when none runs.
     Delete(act::DeleteArgs),
-    /// Write a message, with files attached, and with --send send it: it goes into the outbox at
-    /// once and is sent as soon as the server can be reached; starts the daemon when none runs.
+    /// Write a message, with files attached: saved as a draft in the account's Drafts folder, or
+    /// with --send sent (through the outbox, at once, and as soon as the server can be reached).
+    /// --draft picks a draft up again. Starts the daemon when none runs.
     Compose(compose::ComposeArgs),
 }
 

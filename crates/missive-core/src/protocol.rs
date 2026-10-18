@@ -69,6 +69,35 @@ pub enum Command {
     /// Writes a message into the account's outbox, to be sent as soon as its server can be
     /// reached; answered once it is in the outbox.
     Send(Send),
+    /// Saves a draft, a new one or a new version of one, and with `send` sends it; answered once
+    /// it is in the local copy (and in the outbox).
+    Draft(SaveDraft),
+}
+
+/// A draft to save: the fields given replace those of the draft named, the others are kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveDraft {
+    pub account: String,
+    /// The draft to pick up again: its Message-ID, or the identifier of a message of the Drafts
+    /// folder. `None` for a new draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bcc: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<Attached>>,
+    /// Sends the draft (through the outbox); it is removed from the Drafts folder once the
+    /// server took the message.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub send: bool,
 }
 
 /// A message to send: addresses as `name@example.org` or `Name <name@example.org>`.
@@ -121,6 +150,7 @@ impl Command {
             Command::Move { .. } => "move",
             Command::Delete { .. } => "delete",
             Command::Send(_) => "send",
+            Command::Draft(_) => "draft",
         }
     }
 }
@@ -140,7 +170,8 @@ pub struct Answer {
     /// The number of a message put in the outbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbox: Option<i64>,
-    /// The `Message-ID` of a message put in the outbox, without angle brackets.
+    /// The `Message-ID` of a message put in the outbox, or of a draft saved, without angle
+    /// brackets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     /// When not `ok`: `bad-request`, `unsupported-protocol`, `unknown-request`,
@@ -202,7 +233,7 @@ pub fn read_request(line: &str) -> Result<Request, Answer> {
     }
     let known = matches!(
         name,
-        Some("sync" | "subscribe" | "mark" | "move" | "delete" | "send")
+        Some("sync" | "subscribe" | "mark" | "move" | "delete" | "send" | "draft")
     );
     serde_json::from_value(value).map_err(|_| {
         if known || name.is_none() {
@@ -329,6 +360,34 @@ mod tests {
                 .error
                 .unwrap(),
             "bad-request"
+        );
+    }
+
+    #[test]
+    fn a_draft_request_reads_with_only_the_fields_given() {
+        let line = r#"{"protocol":1,"request":"draft","account":"alice","draft":"1@example.org","subject":"Hi","send":true}"#;
+        let request = Request {
+            protocol: 1,
+            command: Command::Draft(SaveDraft {
+                account: "alice".to_owned(),
+                draft: Some("1@example.org".to_owned()),
+                subject: Some("Hi".to_owned()),
+                send: true,
+                ..SaveDraft::default()
+            }),
+        };
+        assert_eq!(read_request(line), Ok(request.clone()));
+        assert_eq!(serde_json::to_string(&request).unwrap(), line);
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"draft","account":"a","to":[]}"#),
+            Ok(Request {
+                protocol: 1,
+                command: Command::Draft(SaveDraft {
+                    account: "a".to_owned(),
+                    to: Some(Vec::new()),
+                    ..SaveDraft::default()
+                })
+            })
         );
     }
 

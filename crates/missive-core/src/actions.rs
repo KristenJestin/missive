@@ -210,10 +210,21 @@ pub struct Applied {
 }
 
 /// The session, each of whose commands is given [`COMMAND_TIMEOUT`] (or the timeout asked).
-struct Server<'a> {
+pub(crate) struct Server<'a> {
     session: &'a mut ImapSession,
     timeout: Duration,
-    timed_out: bool,
+    /// Whether a command got no answer in time.
+    pub(crate) timed_out: bool,
+}
+
+impl<'a> Server<'a> {
+    pub(crate) fn new(session: &'a mut ImapSession, timeout: Duration) -> Server<'a> {
+        Server {
+            session,
+            timeout,
+            timed_out: false,
+        }
+    }
 }
 
 impl Server<'_> {
@@ -230,7 +241,7 @@ impl Server<'_> {
         })
     }
 
-    async fn run_done(
+    pub(crate) async fn run_done(
         &mut self,
         command: &str,
         each: impl FnMut(&Response<'_>),
@@ -240,7 +251,10 @@ impl Server<'_> {
         self.timed(result)
     }
 
-    async fn select(&mut self, name: &str) -> std::result::Result<Option<u32>, SyncError> {
+    pub(crate) async fn select(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<Option<u32>, SyncError> {
         let result = tokio::time::timeout(self.timeout, sync::select(self.session, name)).await;
         self.timed(result)
     }
@@ -254,8 +268,23 @@ impl Server<'_> {
         self.timed(result)
     }
 
-    async fn search(&mut self, criteria: &str) -> std::result::Result<Option<Vec<u32>>, SyncError> {
+    pub(crate) async fn search(
+        &mut self,
+        criteria: &str,
+    ) -> std::result::Result<Option<Vec<u32>>, SyncError> {
         let result = tokio::time::timeout(self.timeout, sync::search(self.session, criteria)).await;
+        self.timed(result)
+    }
+
+    /// [`sync::append`]; `name` is quoted already.
+    pub(crate) async fn append(
+        &mut self,
+        name: &str,
+        flags: &str,
+        raw: &[u8],
+    ) -> std::result::Result<Done, SyncError> {
+        let result =
+            tokio::time::timeout(self.timeout, sync::append(self.session, name, flags, raw)).await;
         self.timed(result)
     }
 }
@@ -272,11 +301,7 @@ pub async fn apply(
     timeout: Duration,
 ) -> (Applied, std::result::Result<(), SyncError>) {
     let mut applied = Applied::default();
-    let mut server = Server {
-        session,
-        timeout,
-        timed_out: false,
-    };
+    let mut server = Server::new(session, timeout);
     let result = round(
         &mut server,
         store,
@@ -493,7 +518,10 @@ async fn one(
 /// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` of the same UIDs. An expunge the
 /// server refused takes the flag back (best effort): left there, another client's `EXPUNGE`
 /// would remove messages the copy shows, once the action is refused.
-async fn remove(server: &mut Server<'_>, set: &str) -> std::result::Result<Done, SyncError> {
+pub(crate) async fn remove(
+    server: &mut Server<'_>,
+    set: &str,
+) -> std::result::Result<Done, SyncError> {
     let done = server
         .run_done(
             &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
