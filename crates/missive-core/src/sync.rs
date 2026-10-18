@@ -36,7 +36,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use async_imap::imap_proto::{
-    AttributeValue, MailboxDatum, NameAttribute, Response, ResponseCode, Status,
+    AttributeValue, MailboxDatum, NameAttribute, RequestId, Response, ResponseCode, Status,
 };
 use async_imap::types::Flag;
 
@@ -408,6 +408,107 @@ async fn run(
             parsed => each(parsed),
         }
     }
+}
+
+/// Reads the next response on the connection and hands it to `each`, as [`run`] does; a
+/// connection closed is an error.
+async fn read<T>(session: &mut ImapSession, each: impl FnOnce(&Response<'_>) -> T) -> Result<T> {
+    let Some(response) = session
+        .read_response()
+        .await
+        .map_err(async_imap::error::Error::Io)?
+    else {
+        return Err(async_imap::error::Error::ConnectionLost.into());
+    };
+    Ok(each(response.parsed()))
+}
+
+/// `IDLE` in the selected folder, once the server started it: see [`idle`].
+pub struct Idle {
+    tag: RequestId,
+    /// The server told of a change before it started IDLE.
+    news: bool,
+}
+
+/// Sends `IDLE` and reads its answer until the server starts it (its `+`). `None` when the
+/// server answered it with its tagged answer instead (`NO` or `BAD`, with or without text): the
+/// command is over, the session is as it was, and does without IDLE. The answer is read here,
+/// like the others: `async-imap`'s `Handle::init` panics on a `BAD` without text.
+pub async fn idle(session: &mut ImapSession) -> Result<Option<Idle>> {
+    let tag = session.run_command("IDLE").await?;
+    let mut news = false;
+    loop {
+        let answer = read(session, |response| match response {
+            Response::Continue { .. } => Some(true),
+            Response::Done { tag: done, .. } if *done == tag => Some(false),
+            response => {
+                news |= is_news(response);
+                None
+            }
+        })
+        .await?;
+        match answer {
+            Some(true) => return Ok(Some(Idle { tag, news })),
+            Some(false) => return Ok(None),
+            None => {}
+        }
+    }
+}
+
+impl Idle {
+    /// Waits until the server tells of a change in the folder; its keepalives (`* OK …`) are
+    /// not one. It can be dropped at any point and called again: a response is taken from the
+    /// connection only whole, and one that tells a change is returned at once.
+    pub async fn news(&mut self, session: &mut ImapSession) -> Result<()> {
+        if std::mem::take(&mut self.news) {
+            return Ok(());
+        }
+        loop {
+            let ended = read(session, |response| match response {
+                Response::Done { tag, .. } if *tag == self.tag => Some(true),
+                response => is_news(response).then_some(false),
+            })
+            .await?;
+            match ended {
+                Some(true) => {
+                    return Err(SyncError::protocol("the IMAP server ended IDLE on its own"));
+                }
+                Some(false) => return Ok(()),
+                None => {}
+            }
+        }
+    }
+
+    /// Ends IDLE (`DONE`) and reads until its tagged `OK`. What the server tells meanwhile is
+    /// left to the sync that follows.
+    pub async fn done(self, session: &mut ImapSession) -> Result<()> {
+        session.run_command_untagged("DONE").await?;
+        loop {
+            let ended = read(session, |response| match response {
+                Response::Done { tag, status, .. } if *tag == self.tag => {
+                    Some(matches!(status, Status::Ok))
+                }
+                _ => None,
+            })
+            .await?;
+            match ended {
+                Some(true) => return Ok(()),
+                Some(false) => return Err(SyncError::protocol("the IMAP server did not end IDLE")),
+                None => {}
+            }
+        }
+    }
+}
+
+/// Whether a response during IDLE tells of a change: anything but a keepalive.
+fn is_news(response: &Response<'_>) -> bool {
+    !matches!(
+        response,
+        Response::Data {
+            status: Status::Ok,
+            ..
+        } | Response::Continue { .. }
+    )
 }
 
 /// What a sync needs from `EXAMINE`.
