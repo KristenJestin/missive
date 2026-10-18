@@ -1212,7 +1212,7 @@ async fn show_a_message_with_only_html_gives_it_as_written_and_prints_it_as_text
     // No text part: the JSON does not make one up.
     assert_eq!(message["text"], Value::Null);
     // For people, the HTML as text: no tag, no style, no script, and the paragraphs stay apart.
-    // The address a link goes to stays in the HTML of the JSON; the text has the link's words.
+    // A link keeps its words and gets its target after them; the JSON holds the HTML as written.
     succeeded(&words);
     // After the headers.
     let text = stdout(&words).split_once("\n\n").unwrap().1.to_owned();

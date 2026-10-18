@@ -3,6 +3,7 @@
 //! Nothing here interprets the HTML: it is handed back as the sender wrote it, and reduced to
 //! text only for people, by dropping its markup.
 
+use mail_parser::decoders::html::html_to_text;
 use mail_parser::{Message, MessageParser, MimeHeaders, PartType};
 use serde::Serialize;
 
@@ -64,8 +65,14 @@ pub fn read(raw: &[u8]) -> Body {
     );
     let readable = match &text {
         Some(text) => text.clone(),
-        None => (0..message.text_body_count())
-            .filter_map(|part| message.body_text(part))
+        None => message
+            .text_body
+            .iter()
+            .filter_map(|id| match &message.parts.get(*id as usize)?.body {
+                PartType::Html(html) => Some(html_to_text(&with_link_targets(html))),
+                PartType::Text(text) => Some(text.to_string()),
+                _ => None,
+            })
             .collect::<Vec<_>>()
             .join("\n"),
     };
@@ -165,6 +172,73 @@ fn references(html: &str, cid: &str) -> bool {
             .next()
             .is_none_or(|c| matches!(c, '"' | '\'' | ')' | '>' | ' ' | '\t' | '\r' | '\n'))
     })
+}
+
+/// `html` with each link followed by its target, `text [url]`, so that the text keeps what the
+/// markup said. Only `http`, `https` and `mailto` targets are kept: nothing else is something a
+/// person can follow, and nothing is fetched.
+fn with_link_targets(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut copied = 0;
+    // The target of the link being read, and where its text starts.
+    let mut open: Option<(String, usize)> = None;
+    let mut at = 0;
+    while let Some(found) = html[at..].find('<') {
+        let start = at + found;
+        let Some(length) = html[start..].find('>') else {
+            break;
+        };
+        let end = start + length + 1;
+        let tag = &html[start + 1..end - 1];
+        let name = tag.split(|c: char| c.is_ascii_whitespace()).next();
+        if name.is_some_and(|name| name.eq_ignore_ascii_case("a")) {
+            open = href(tag).map(|url| (url, end));
+        } else if tag.eq_ignore_ascii_case("/a")
+            && let Some((url, text_start)) = open.take()
+        {
+            // A link that is its own text says it once.
+            if html_to_text(&html[text_start..start]).trim() != html_to_text(&url).trim() {
+                out.push_str(&html[copied..start]);
+                out.push_str(" [");
+                // The target goes back through the text reader: it must hold no markup.
+                out.push_str(&url.replace('<', "&lt;").replace('>', "&gt;"));
+                out.push(']');
+                copied = start;
+            }
+        }
+        at = end;
+    }
+    out.push_str(&html[copied..]);
+    out
+}
+
+/// The `href` of an opening `<a …>` tag (its text between the brackets), when it is a target
+/// worth showing.
+fn href(tag: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+    let value = loop {
+        let at = from + lower[from..].find("href")?;
+        from = at + 4;
+        // The attribute name stands alone: `data-href=` is another one.
+        let before = lower[..at].chars().next_back();
+        if before.is_some_and(|c| !c.is_ascii_whitespace() && c != '"' && c != '\'') {
+            continue;
+        }
+        let after = tag[from..].trim_start();
+        let Some(after) = after.strip_prefix('=') else {
+            continue;
+        };
+        let after = after.trim_start();
+        break match after.chars().next()? {
+            quote @ ('"' | '\'') => after[1..].split(quote).next()?,
+            _ => after.split(|c: char| c.is_ascii_whitespace()).next()?,
+        };
+    };
+    let value = value.trim();
+    let scheme = value.split(':').next()?.to_ascii_lowercase();
+    (value.contains(':') && matches!(scheme.as_str(), "http" | "https" | "mailto"))
+        .then(|| value.to_owned())
 }
 
 #[cfg(test)]
@@ -313,5 +387,61 @@ mod tests {
              --b\r\nContent-Type: text/plain\r\n\r\nPlain\r\n\
              --b\r\nContent-Type: text/html\r\n\r\n<p>Plain</p>\r\n--b--\r\n"
         ));
+    }
+
+    #[test]
+    fn the_links_of_an_html_message_are_kept_in_the_text() {
+        let read = |html: &str| {
+            read(format!("Content-Type: text/html\r\n\r\n{html}").as_bytes())
+                .readable
+                .trim()
+                .to_owned()
+        };
+        assert_eq!(
+            read("<p>Go to <a href=\"https://example.org/a?x=1&amp;y=2\">the site</a> now</p>"),
+            "Go to the site [https://example.org/a?x=1&y=2] now"
+        );
+        assert_eq!(
+            read("<A class=x HREF='mailto:bob@example.org'>Write</A>"),
+            "Write [mailto:bob@example.org]"
+        );
+        // A link that is its own text says it once.
+        assert_eq!(
+            read("<a href=\"https://example.org/\">https://example.org/</a>"),
+            "https://example.org/"
+        );
+        // Only what a person can follow with nothing run or fetched: no script, no data, no
+        // relative link, and an anchor with no target stays its text.
+        for href in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "/relative",
+            "ftp://example.org/f",
+            "",
+        ] {
+            assert_eq!(
+                read(&format!("<a href=\"{href}\">Click</a>")),
+                "Click",
+                "{href:?}"
+            );
+        }
+        assert_eq!(read("<a name=top>Top</a>"), "Top");
+        // A target holding markup cannot make some.
+        assert_eq!(
+            read("<a href=\"https://example.org/<b\">T</a>"),
+            "T [https://example.org/<b]"
+        );
+    }
+
+    #[test]
+    fn the_links_are_left_out_when_the_message_has_a_text_part() {
+        let both = read(
+            b"Content-Type: multipart/alternative; boundary=b\r\n\r\n\
+              --b\r\nContent-Type: text/plain\r\n\r\nPlain\r\n\
+              --b\r\nContent-Type: text/html\r\n\r\n<a href=\"https://example.org/\">Link</a>\r\n--b--\r\n",
+        );
+        assert_eq!(both.readable, "Plain");
+        // The HTML itself is still handed back as written.
+        assert!(both.html.unwrap().contains("href"));
     }
 }
