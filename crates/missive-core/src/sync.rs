@@ -103,6 +103,25 @@ pub struct Folder {
     pub row: FolderRow,
 }
 
+/// Why a folder could not be synced now: told by its kind, never by what the server said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skip {
+    /// The server answered `NO` to a command of the sync.
+    Refused,
+    /// The server answered `OK` with something no sync can use, or the folder's name cannot be
+    /// sent.
+    Unusable,
+}
+
+impl Skip {
+    pub fn name(self) -> &'static str {
+        match self {
+            Skip::Refused => "refused",
+            Skip::Unusable => "unusable",
+        }
+    }
+}
+
 /// What a sync changed in the copy: counts only, never what the mail says.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Changes {
@@ -201,8 +220,8 @@ pub async fn folders(
 }
 
 /// Syncs one folder (see the module's documentation), fetching new messages `batch` at a time.
-/// `None` when the folder cannot be synced now: the server refused to examine or to list it (it
-/// was deleted since it was listed, say), or answered with something no sync can use (no
+/// A [`Skip`] when the folder cannot be synced now: the server refused to examine or to list it
+/// (it was deleted since it was listed, say), or answered with something no sync can use (no
 /// UIDVALIDITY or EXISTS, a listing shorter than the folder), or its name cannot be sent. The
 /// copy of that folder is left as it is, and the other folders are synced all the same; only a
 /// `BAD` or a lost connection is an error.
@@ -211,9 +230,10 @@ pub async fn folder(
     store: &mut Store,
     folder: &mut Folder,
     batch: usize,
-) -> Result<Option<Changes>> {
-    let Some(mailbox) = examine(session, &folder.name).await? else {
-        return Ok(None);
+) -> Result<std::result::Result<Changes, Skip>> {
+    let mailbox = match open_folder(session, &folder.name, "EXAMINE").await? {
+        Ok(mailbox) => mailbox,
+        Err(skip) => return Ok(Err(skip)),
     };
     let mut changes = Changes::default();
     if folder.row.uidvalidity != Some(mailbox.uidvalidity) {
@@ -239,10 +259,10 @@ pub async fn folder(
         })
         .await?;
         if ended == Ended::No {
-            return Ok(None);
+            return Ok(Err(Skip::Refused));
         }
         if !complete(listing.len(), mailbox.exists, expunged) {
-            return Ok(None);
+            return Ok(Err(Skip::Unusable));
         }
         let flags = match folder.row.highest_modseq {
             _ if local.is_empty() => Some(HashMap::new()),
@@ -258,15 +278,15 @@ pub async fn folder(
                 .map(|(flags, _)| flags),
         };
         let Some(flags) = flags else {
-            return Ok(None);
+            return Ok(Err(Skip::Refused));
         };
         (listing, flags)
     } else {
         let Some((flags, expunged)) = fetch_flags(session, "(FLAGS)").await? else {
-            return Ok(None);
+            return Ok(Err(Skip::Refused));
         };
         if !complete(flags.len(), mailbox.exists, expunged) {
-            return Ok(None);
+            return Ok(Err(Skip::Unusable));
         }
         (flags.keys().copied().collect(), flags)
     };
@@ -292,7 +312,7 @@ pub async fn folder(
         .copied()
         .collect();
     if missing.is_empty() {
-        return Ok(Some(changes));
+        return Ok(Ok(changes));
     }
     // The sizes of what is missing, in commands of a bounded length. A refusal (`NO`) keeps the
     // sizes that came before it: a message the server cannot read must not hold the others back.
@@ -349,7 +369,7 @@ pub async fn folder(
             changes.refused += uids.len().saturating_sub(messages.len());
         }
     }
-    Ok(Some(changes))
+    Ok(Ok(changes))
 }
 
 /// Cuts the messages to fetch, `(uid, size)` in the order given, into batches of at most `count`
@@ -650,8 +670,17 @@ pub(crate) async fn search(session: &mut ImapSession, criteria: &str) -> Result<
 }
 
 async fn open(session: &mut ImapSession, name: &str, command: &str) -> Result<Option<Examined>> {
+    Ok(open_folder(session, name, command).await?.ok())
+}
+
+/// [`open`], telling why a folder cannot be opened now.
+async fn open_folder(
+    session: &mut ImapSession,
+    name: &str,
+    command: &str,
+) -> Result<std::result::Result<Examined, Skip>> {
     let Some(name) = quote(name) else {
-        return Ok(None);
+        return Ok(Err(Skip::Unusable));
     };
     let (mut uidvalidity, mut exists, mut highest_modseq) = (None, None, None);
     let ended = run(
@@ -672,7 +701,7 @@ async fn open(session: &mut ImapSession, name: &str, command: &str) -> Result<Op
     )
     .await?;
     if ended == Ended::No {
-        return Ok(None);
+        return Ok(Err(Skip::Refused));
     }
     Ok(uidvalidity
         .zip(exists)
@@ -680,7 +709,8 @@ async fn open(session: &mut ImapSession, name: &str, command: &str) -> Result<Op
             uidvalidity,
             exists,
             highest_modseq,
-        }))
+        })
+        .ok_or(Skip::Unusable))
 }
 
 /// Whether a listing of `listed` messages can be complete, when `EXAMINE` said `exists` and the

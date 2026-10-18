@@ -567,6 +567,68 @@ async fn status_says_the_state_the_last_sync_and_the_message_count() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn status_names_the_folders_skipped_in_the_last_pass_from_the_copy_alone() {
+    let env = Env::filled().await;
+    assert_eq!(
+        json(&env.read(&["status", "--json"]).await)["accounts"][0]["skipped"],
+        json!([])
+    );
+    // What the daemon writes at the end of a pass; no daemon runs here.
+    rusqlite::Connection::open(env.copy_path())
+        .unwrap()
+        .execute(
+            "UPDATE account SET skipped = ?1",
+            [r#"[{"folder":"sent","kind":"refused"},{"folder":"Receipts","kind":"unusable"}]"#],
+        )
+        .unwrap();
+
+    let status = json(&env.read(&["status", "--json"]).await);
+    let words = env.read(&["status"]).await;
+
+    let alice = &status["accounts"][0];
+    assert_eq!(alice["state"], "ready");
+    assert_eq!(
+        alice["skipped"],
+        json!([
+            { "folder": "sent", "kind": "refused" },
+            { "folder": "Receipts", "kind": "unusable" },
+        ])
+    );
+    assert!(
+        stdout(&words)
+            .lines()
+            .nth(1)
+            .unwrap()
+            .ends_with("\t8 messages\tskipped: sent (refused), Receipts (unusable)"),
+        "{}",
+        stdout(&words)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_from_before_the_skipped_folders_says_none_skipped() {
+    let env = Env::new().await;
+    let server = mailbox().start().await;
+    env.add_account("alice", &server).await;
+    std::fs::create_dir_all(env.copy_path().parent().unwrap()).unwrap();
+    {
+        let connection = rusqlite::Connection::open(env.copy_path()).unwrap();
+        connection
+            .execute_batch(include_str!("../../missive-core/src/store/schema-1.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute_batch("INSERT INTO account (key, id, state) VALUES (1, 'alice', 'ready')")
+            .unwrap();
+    }
+
+    let status = json(&env.read(&["status", "--json"]).await);
+
+    assert_eq!(status["accounts"][0]["state"], "ready");
+    assert_eq!(status["accounts"][0]["skipped"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_account_not_yet_in_the_copy_is_never_synced_and_a_removed_one_is_not_shown() {
     let env = Env::filled().await;
     let server = mailbox().start().await;
@@ -579,7 +641,10 @@ async fn an_account_not_yet_in_the_copy_is_never_synced_and_a_removed_one_is_not
 
     assert_eq!(
         status["accounts"],
-        json!([{ "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0 }])
+        json!([{
+            "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0,
+            "skipped": [],
+        }])
     );
     let unread = json(&env.read(&["unread", "--json"]).await);
     assert_eq!(
@@ -655,7 +720,8 @@ async fn with_no_copy_yet_the_commands_say_so_and_give_zeros_and_create_nothing(
     assert_eq!(
         json(&status),
         json!({ "daemon": "stopped", "accounts": [
-            { "id": "alice", "state": null, "syncing": false, "last_sync": null, "messages": 0 }
+            { "id": "alice", "state": null, "syncing": false, "last_sync": null, "messages": 0,
+              "skipped": [] }
         ]})
     );
     assert!(

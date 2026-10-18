@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::copy::{Copy, CopyError, message_id};
 use crate::protocol::PROTOCOL;
+use crate::store::SkippedFolder;
 
 /// The name an unread count gives the folders that have no role.
 const NO_ROLE: &str = "other";
@@ -36,6 +37,8 @@ pub enum Event {
         new: usize,
         removed: usize,
         flags: usize,
+        /// The folders the pass left as they were, none counted in `folders`.
+        skipped: Vec<SkippedFolder>,
     },
     /// An action was applied on the server, is tried again later, or was refused.
     Action(ActionEvent),

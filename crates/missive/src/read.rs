@@ -10,7 +10,7 @@ use missive_core::account::{AccountStore, Listing};
 use missive_core::body::{self, Attachment};
 use missive_core::copy::{Copy, FolderRef, Hit, List, NotFound, Person, Search, Stored};
 use missive_core::protocol::pid_path;
-use missive_core::store::Store;
+use missive_core::store::{SkippedFolder, Store};
 use serde::Serialize;
 
 /// The folder roles a search can be narrowed to.
@@ -182,6 +182,9 @@ struct AccountStatus {
     syncing: bool,
     last_sync: Option<i64>,
     messages: u64,
+    /// The folders the last complete pass left as they were: told apart from the state, which
+    /// stays `ready`.
+    skipped: Vec<SkippedFolder>,
     #[serde(skip)]
     in_copy: bool,
 }
@@ -204,6 +207,7 @@ pub fn status(json: bool) -> Result<()> {
                     syncing: false,
                     last_sync: None,
                     messages: 0,
+                    skipped: Vec::new(),
                     in_copy: false,
                 };
             };
@@ -216,6 +220,7 @@ pub fn status(json: bool) -> Result<()> {
                 syncing: syncing && running,
                 last_sync: row.last_sync,
                 messages: row.messages,
+                skipped: row.skipped.clone(),
                 in_copy: true,
             }
         })
@@ -239,13 +244,25 @@ pub fn status(json: bool) -> Result<()> {
             Some(seconds) => format!("last sync {}", utc(seconds)),
             None => "never synced".to_owned(),
         };
+        let skipped = if account.skipped.is_empty() {
+            String::new()
+        } else {
+            let folders: Vec<String> = account
+                .skipped
+                .iter()
+                .map(|s| format!("{} ({})", s.folder, s.kind))
+                .collect();
+            format!("\tskipped: {}", folders.join(", "))
+        };
         match (&account.state, account.in_copy) {
             (None, false) => println!("{}\tnever synced\t{messages}", account.id),
             (None, true) => println!(
-                "{}\tunknown (the daemon is not running)\t{synced}\t{messages}",
+                "{}\tunknown (the daemon is not running)\t{synced}\t{messages}{skipped}",
                 account.id
             ),
-            (Some(state), _) => println!("{}\t{state}\t{synced}\t{messages}", account.id),
+            (Some(state), _) => {
+                println!("{}\t{state}\t{synced}\t{messages}{skipped}", account.id)
+            }
         }
     }
     Ok(())

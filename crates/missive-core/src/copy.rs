@@ -23,7 +23,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 
-use crate::store::SCHEMA_VERSION;
+use crate::store::{SCHEMA_VERSION, SkippedFolder};
 
 /// Roles whose unread messages are left out of every total: nobody wants a badge for spam.
 const NOT_COUNTED: [&str; 2] = ["trash", "junk"];
@@ -42,6 +42,9 @@ const ATTACHMENTS_VERSION: i64 = 3;
 
 /// The first schema version that has the queue of actions, and messages waiting for a move.
 const QUEUE_VERSION: i64 = 4;
+
+/// The first schema version that records the folders a pass skipped.
+const SKIPPED_VERSION: i64 = 5;
 
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
@@ -134,6 +137,8 @@ pub struct AccountRow {
     /// When the last complete sync ended, in seconds since the epoch.
     pub last_sync: Option<i64>,
     pub messages: u64,
+    /// The folders the last complete pass left as they were.
+    pub skipped: Vec<SkippedFolder>,
 }
 
 /// A folder of an account.
@@ -364,18 +369,24 @@ impl Copy {
 
     /// Every account the copy holds, by identifier.
     pub fn accounts(&self) -> Result<Vec<AccountRow>> {
-        let mut statement = self.connection.prepare_cached(
+        let skipped = if self.version >= SKIPPED_VERSION {
+            "account.skipped"
+        } else {
+            "'[]'"
+        };
+        let mut statement = self.connection.prepare_cached(&format!(
             "SELECT account.id, account.state, account.last_sync,
                     (SELECT count(*) FROM message JOIN folder ON folder.id = message.folder
-                      WHERE folder.account = account.key)
-               FROM account ORDER BY account.id",
-        )?;
+                      WHERE folder.account = account.key), {skipped}
+               FROM account ORDER BY account.id"
+        ))?;
         let rows = statement.query_map([], |r| {
             Ok(AccountRow {
                 id: r.get(0)?,
                 state: r.get(1)?,
                 last_sync: r.get(2)?,
                 messages: r.get::<_, i64>(3)? as u64,
+                skipped: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -860,9 +871,32 @@ mod tests {
                 id: "bob".to_owned(),
                 state: "auth-refused".to_owned(),
                 last_sync: None,
-                messages: 0
+                messages: 0,
+                skipped: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn accounts_say_the_folders_the_last_pass_skipped_and_a_pass_without_one_clears_them() {
+        let (_dir, store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        let skipped = vec![
+            SkippedFolder {
+                folder: "sent".to_owned(),
+                kind: "refused".to_owned(),
+            },
+            SkippedFolder {
+                folder: "Receipts".to_owned(),
+                kind: "unusable".to_owned(),
+            },
+        ];
+
+        store.set_skipped(alice, &skipped).unwrap();
+        assert_eq!(copy.accounts().unwrap()[0].skipped, skipped);
+
+        store.set_skipped(alice, &[]).unwrap();
+        assert_eq!(copy.accounts().unwrap()[0].skipped, []);
     }
 
     #[test]

@@ -45,11 +45,11 @@ use std::time::Duration;
 
 use mail_parser::{Address, MessageParser};
 use rusqlite::{Connection, Transaction, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The schema version this build writes. A copy written by a later version is refused rather
 /// than misread.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Each step brings the schema from the version before it: `MIGRATIONS[0]` from nothing to 1.
 const MIGRATIONS: &[&str] = &[
@@ -57,6 +57,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema-2.sql"),
     include_str!("store/schema-3.sql"),
     include_str!("store/schema-4.sql"),
+    include_str!("store/schema-5.sql"),
 ];
 
 mod queue;
@@ -74,6 +75,16 @@ pub struct FolderRow {
     pub id: i64,
     pub uidvalidity: Option<u32>,
     pub highest_modseq: Option<u64>,
+}
+
+/// A folder a pass left as it was (`docs/cli.md`, `status`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedFolder {
+    /// The folder's role, else its name.
+    pub folder: String,
+    /// `refused` (the server answered `NO`) or `unusable` (an answer no sync can use). Never
+    /// what the server said.
+    pub kind: String,
 }
 
 /// A message fetched from the server, ready to be written.
@@ -151,6 +162,18 @@ impl Store {
                 params![account, state],
             )?;
         }
+        Ok(())
+    }
+
+    /// Records the folders the pass that just ended left as they were; none clears the last one.
+    pub fn set_skipped(&self, account: i64, skipped: &[SkippedFolder]) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE account SET skipped = ?2 WHERE key = ?1",
+            params![
+                account,
+                serde_json::to_string(skipped).expect("folders serialize")
+            ],
+        )?;
         Ok(())
     }
 
