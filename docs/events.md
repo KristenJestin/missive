@@ -56,7 +56,14 @@ sync of a folder that appears later, and the refill of a folder after the server
 (a new `UIDVALIDITY`) bring mail the user already has: telling it one message at a time would be
 a flood of notifications for mail that is not new. The counts of those syncs are in `sync-ended`,
 and their effect on the unread counts in `unread`. After a pause (the daemon was stopped, or the
-computer asleep), the mail that came meanwhile is announced by the first sync that follows.
+computer asleep), the mail that came meanwhile is announced by the first sync that follows,
+within the limit below.
+
+**At most 20 per folder and per sync.** After a long pause thousands of messages can be new at
+once, and a notification each would be noise. A sync of a folder tells the first 20 of its new
+messages (the oldest, in the order the server numbered them) and no more: the rest are in the
+`unread` event that ends the sync of that folder, and in the `new` count of `sync-ended` when the
+sync is a pass over the account. The next sync does not tell them later.
 
 **The identifier** is `<account>/<folder>/<uidvalidity>/<uid>`: the account's identifier, the
 folder's number in the local copy, the folder's UIDVALIDITY and the message's UID. A program

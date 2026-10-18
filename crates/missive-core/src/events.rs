@@ -164,23 +164,24 @@ impl Reader {
         )
     }
 
-    /// The messages of a folder with a UID above `after`, oldest first. A server numbers new
-    /// messages above every one it numbered before, so these are what arrived since `after` was
-    /// the highest UID.
+    /// The first `limit` messages of a folder with a UID above `after`, oldest first. A server
+    /// numbers new messages above every one it numbered before, so these are what arrived since
+    /// `after` was the highest UID.
     pub fn arrived(
         &self,
         account: &str,
         role: Option<&str>,
         folder: i64,
         after: u32,
+        limit: usize,
     ) -> rusqlite::Result<Vec<NewMessage>> {
         self.0
             .prepare(
                 "SELECT folder.uidvalidity, message.uid, message.sender, message.subject \
                  FROM message JOIN folder ON folder.id = message.folder \
-                 WHERE message.folder = ?1 AND message.uid > ?2 ORDER BY message.uid",
+                 WHERE message.folder = ?1 AND message.uid > ?2 ORDER BY message.uid LIMIT ?3",
             )?
-            .query_map(params![folder, after], |r| {
+            .query_map(params![folder, after, limit as i64], |r| {
                 let sender: String = r.get(2)?;
                 Ok(NewMessage {
                     account: account.to_owned(),
@@ -341,7 +342,9 @@ mod tests {
             .insert(inbox, &[message(5, ""), message(6, "")])
             .unwrap();
 
-        let arrived = reader.arrived("alice", Some("inbox"), inbox, 4).unwrap();
+        let arrived = reader
+            .arrived("alice", Some("inbox"), inbox, 4, 20)
+            .unwrap();
 
         assert_eq!(arrived.len(), 2);
         assert_eq!(arrived[0].message, format!("alice/{inbox}/17/5"));
@@ -355,6 +358,9 @@ mod tests {
             })
         );
         assert_eq!(arrived[1].subject.as_deref(), Some("Number 6"));
+        let first = reader.arrived("alice", Some("inbox"), inbox, 4, 1).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].subject.as_deref(), Some("Number 5"));
     }
 
     #[test]

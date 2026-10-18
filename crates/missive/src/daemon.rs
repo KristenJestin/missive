@@ -58,6 +58,10 @@ const EVENT_BUFFER: usize = 256;
 /// How many lines wait for a connection's socket: a watcher whose socket is full holds these and
 /// nothing else of the daemon's.
 const LINE_QUEUE: usize = 16;
+/// How many `new-message` events a folder gets in one sync: after a long pause thousands of
+/// messages may be new at once, and a notification each would be noise. The `unread` event
+/// carries the counts.
+const NEW_MESSAGE_CAP: usize = 20;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -954,10 +958,13 @@ impl Worker {
         let Some(last_uid) = last_uid else {
             return;
         };
-        match self
-            .reader
-            .arrived(&self.id, folder.role, folder.row.id, last_uid)
-        {
+        match self.reader.arrived(
+            &self.id,
+            folder.role,
+            folder.row.id,
+            last_uid,
+            NEW_MESSAGE_CAP,
+        ) {
             Ok(messages) => {
                 for message in messages {
                     self.events.send(Event::NewMessage(message));

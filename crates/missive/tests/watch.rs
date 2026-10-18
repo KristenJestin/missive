@@ -495,6 +495,31 @@ async fn a_sync_that_ends_in_an_error_after_a_batch_still_announces_what_the_bat
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_pass_announces_at_most_twenty_new_messages_per_folder_and_the_counts_say_the_rest() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    let _daemon = idling(&server, &env).await;
+    let mut watcher = env.watch();
+    watcher.snapshot(1).await;
+
+    // All in the same pass: the daemon wakes up on the first and the sync finds the 25.
+    for n in 10..35 {
+        server.deliver("INBOX", message(n));
+    }
+
+    let (events, unread) = watcher.until("unread").await;
+    let announced: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event"] == "new-message")
+        .collect();
+    assert_eq!(announced.len(), 20);
+    // The first twenty, in the order they came; the rest is in the unread counts.
+    assert_eq!(announced[0]["subject"], format!("{SUBJECT} 10"));
+    assert_eq!(announced[19]["subject"], format!("{SUBJECT} 29"));
+    assert_eq!(unread, alice_unread(27, 29));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_total_leaves_out_junk_and_trash_in_the_event_and_in_missive_unread() {
     let server = mailbox()
         .folder(
