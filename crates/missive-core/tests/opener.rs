@@ -2,7 +2,7 @@
 //! bus: the real session bus is never touched.
 
 use missive_core::fake::{FakePortal, PortalAnswer};
-use missive_core::opener::{followable, open_uri_with_portal};
+use missive_core::opener::{followable, mail_link, open_uri_with_portal};
 
 async fn connect(portal: &FakePortal) -> zbus::Connection {
     zbus::connection::Builder::address(portal.address())
@@ -51,4 +51,25 @@ fn only_web_and_mail_links_are_followed() {
     ] {
         assert!(!followable(uri), "{uri}");
     }
+}
+
+#[test]
+fn a_mail_link_keeps_only_its_subject_body_and_cc() {
+    assert_eq!(
+        mail_link(
+            "mailto:carol@example.com?subject=Hi&attach=/home/a/.ssh/id_ed25519&body=Yes\
+             &%61ttachment=x&BCC=eve@example.net&cc=dave@example.net&Subject=Two#frag"
+        ),
+        "mailto:carol@example.com?subject=Hi&body=Yes&cc=dave@example.net&Subject=Two"
+    );
+    assert_eq!(
+        mail_link("MAILTO:carol@example.com?attach=x"),
+        "MAILTO:carol@example.com"
+    );
+}
+
+#[test]
+fn a_web_link_is_left_as_it_is() {
+    let uri = "https://www.example.org/a?attach=x&bcc=y#z";
+    assert_eq!(mail_link(uri), uri);
 }

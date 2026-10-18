@@ -4801,6 +4801,7 @@ dependencies = [
  "mail-parser",
  "mime_guess",
  "missive-core",
+ "percent-encoding",
  "rcgen",
  "rusqlite",
  "rustix",

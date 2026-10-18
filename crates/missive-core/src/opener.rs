@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 use futures_util::StreamExt;
+use percent_encoding::percent_decode_str;
 use serde::Serialize;
 use zbus::message::Type;
 use zbus::zvariant::{DynamicType, Fd, OwnedValue, Value};
@@ -75,6 +76,7 @@ pub async fn open_uri(uri: &str) -> Result<(), String> {
     if !followable(uri) {
         return Err("only http, https and mailto links are opened".to_owned());
     }
+    let uri = &mail_link(uri);
     let fall_back =
         settle(async { open_uri_with_portal(&Connection::session().await?, uri).await }).await;
     if fall_back {
@@ -90,6 +92,37 @@ pub async fn open_uri(uri: &str) -> Result<(), String> {
 pub async fn open_uri_with_portal(connection: &Connection, uri: &str) -> zbus::Result<bool> {
     let options = HashMap::from([("handle_token", Value::from(token()))]);
     portal(connection, "OpenURI", &("", uri, options)).await
+}
+
+/// The fields a `mailto:` link may fill in the user's mail client. The others are left out: a
+/// message must not be able to attach a file (`attach`, `attachment`) or add a hidden
+/// recipient (`bcc`) behind the user's back.
+const MAIL_FIELDS: &[&str] = &["subject", "body", "cc"];
+
+/// A `mailto:` link with only its address and [`MAIL_FIELDS`]; any other link as it is.
+pub fn mail_link(uri: &str) -> String {
+    let Some(scheme) = uri.get(..7).filter(|s| s.eq_ignore_ascii_case("mailto:")) else {
+        return uri.to_owned();
+    };
+    let rest = &uri[scheme.len()..];
+    let rest = rest.split_once('#').map_or(rest, |(rest, _)| rest);
+    let (address, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|field| {
+            let name = field.split_once('=').map_or(*field, |(name, _)| name);
+            let name = percent_decode_str(name).decode_utf8_lossy();
+            MAIL_FIELDS
+                .iter()
+                .any(|kept| name.eq_ignore_ascii_case(kept))
+        })
+        .collect();
+    let mut link = format!("{scheme}{address}");
+    if !kept.is_empty() {
+        link.push('?');
+        link.push_str(&kept.join("&"));
+    }
+    link
 }
 
 /// Whether a link is one Missive opens on a click.
