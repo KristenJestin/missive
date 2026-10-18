@@ -467,6 +467,34 @@ async fn a_message_delivered_to_the_inbox_gives_one_new_message_event_and_one_un
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_sync_that_ends_in_an_error_after_a_batch_still_announces_what_the_batch_brought() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    let _daemon = idling(&server, &env).await;
+    let mut watcher = env.watch();
+    watcher.snapshot(1).await;
+    // The server drops the connection after the first whole message of the batch of the two that
+    // follow (a line of the answer, the seven of the message, its closing parenthesis).
+    server.cut("UID FETCH 4:5 (UID FLAGS", 9);
+
+    server.deliver("INBOX", message(7));
+    server.deliver("INBOX", message(8));
+
+    // The message that came is in the copy, so it is told now: the next pass will not find it
+    // above the highest UID any more.
+    let (_, first) = watcher.until("new-message").await;
+    assert_eq!(first["message"], env.inbox_message_id("alice", 4));
+    assert_eq!(first["subject"], format!("{SUBJECT} 7"));
+    let (_, unread) = watcher.until("unread").await;
+    assert_eq!(unread, alice_unread(3, 5));
+    // The pass that follows the reconnection brings the other one.
+    let (_, second) = watcher.until("new-message").await;
+    assert_eq!(second["message"], env.inbox_message_id("alice", 5));
+    let (_, unread) = watcher.until("unread").await;
+    assert_eq!(unread, alice_unread(4, 6));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_total_leaves_out_junk_and_trash_in_the_event_and_in_missive_unread() {
     let server = mailbox()
         .folder(

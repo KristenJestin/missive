@@ -886,8 +886,20 @@ impl Worker {
         let last_uid = (self.completed && folder.row.uidvalidity.is_some())
             .then(|| self.reader.last_uid(folder.row.id).ok())
             .flatten();
+        let validity = folder.row.uidvalidity;
         let changes =
-            sync::folder(session, &mut self.store, folder, self.options.batch_size).await?;
+            match sync::folder(session, &mut self.store, folder, self.options.batch_size).await {
+                Ok(changes) => changes,
+                Err(e) => {
+                    // The batches that came before the error are in the copy, and the next pass
+                    // starts from their highest UID: they are told now or never.
+                    if folder.row.uidvalidity == validity {
+                        self.announce(folder, last_uid).await;
+                    }
+                    self.events.unread(&self.copy);
+                    return Err(e);
+                }
+            };
         let role = folder.role.unwrap_or("no role");
         match changes {
             Some(changes) => {
@@ -927,27 +939,33 @@ impl Worker {
         if changes.new == 0 && changes.removed == 0 && changes.flags == 0 && changes.rebuilt == 0 {
             return;
         }
-        if let Some(last_uid) = last_uid
-            && changes.new > 0
-            && changes.rebuilt == 0
-        {
-            match self
-                .reader
-                .arrived(&self.id, folder.role, folder.row.id, last_uid)
-            {
-                Ok(messages) => {
-                    for message in messages {
-                        self.events.send(Event::NewMessage(message));
-                        // The daemon runs on one thread: without this, a burst of mail would
-                        // fill the channel before any watcher, however quick, could take its
-                        // events out of it.
-                        tokio::task::yield_now().await;
-                    }
-                }
-                Err(e) => log!("account {}: cannot read the new messages ({e})", self.key),
-            }
+        if changes.new > 0 && changes.rebuilt == 0 {
+            self.announce(folder, last_uid).await;
         }
         self.events.unread(&self.copy);
+    }
+
+    /// Tells the watchers of the messages of a folder above `last_uid`, the highest UID it held
+    /// before this sync. `None` when its mail is not news: see [`Worker::folder`].
+    async fn announce(&mut self, folder: &Folder, last_uid: Option<u32>) {
+        let Some(last_uid) = last_uid else {
+            return;
+        };
+        match self
+            .reader
+            .arrived(&self.id, folder.role, folder.row.id, last_uid)
+        {
+            Ok(messages) => {
+                for message in messages {
+                    self.events.send(Event::NewMessage(message));
+                    // The daemon runs on one thread: without this, a burst of mail would
+                    // fill the channel before any watcher, however quick, could take its
+                    // events out of it.
+                    tokio::task::yield_now().await;
+                }
+            }
+            Err(e) => log!("account {}: cannot read the new messages ({e})", self.key),
+        }
     }
 
     /// Idles in the selected folder for at most `timeout` in all, and says what ended it.
