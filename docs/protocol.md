@@ -130,6 +130,9 @@ reached:
 | `subject` | string, absent for none | |
 | `body` | string, empty when absent | the text |
 | `attachments` | array, empty when absent | each a file's `name` (no folder) and its content, `data`, in base64 |
+| `in_reply_to` | string, absent for none | the `Message-ID`, without angle brackets, of the message this one answers, written as its `In-Reply-To` header |
+| `references` | array of strings, empty when absent | the thread's `Message-ID`s without angle brackets, written as the `References` header |
+| `answers` | string, absent for none | the identifier of the message this one is a reply to: once the server took the reply (never before), that message is marked answered (`\Answered`), through the queue of actions, and the `action` event `answered` tells it. A message gone since is not an error |
 
 The daemon builds the message (see `missive compose` in `docs/cli.md`), writes it to the outbox
 in the local copy, and answers: nothing waits for the server.
@@ -157,6 +160,7 @@ Saves a draft: a new one, or a new version of the draft `draft` names. With `sen
 | `draft` | string, absent for a new draft | the draft to pick up again: its identifier (its `Message-ID`), or the identifier of a message of the account's Drafts folder, as `list` prints it |
 | `to`, `cc`, `bcc`, `subject`, `body`, `attachments` | as for `send`, each absent to keep the draft's own | the fields that replace the draft's; for a new draft, those absent are empty. No recipient is needed |
 | `in_reply_to` | string, absent to keep the draft's own | the `Message-ID`, without angle brackets, of the message the draft answers |
+| `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered, sent or not |
 | `send` | boolean, `false` when absent | send the draft, as it is once changed (at least one recipient then); it is removed from the Drafts folder once the server took the message |
 
 The daemon saves the draft in the local copy (and, with `send`, puts the message in the outbox),

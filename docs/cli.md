@@ -669,7 +669,7 @@ whose move waits, an account that is not configured.
 
 ## Sending
 
-### `missive compose [--account <id>] [--draft <draft id>] [--to <address>]… [--cc <address>]… [--bcc <address>]… [--subject <text>] [--body-file <path> | --body <text or ->] [--attach <path>]… [--send] [--json]`
+### `missive compose [--account <id>] [--draft <draft id> | --reply <message id> | --reply-all <message id> | --forward <message id>] [--to <address>]… [--cc <address>]… [--bcc <address>]… [--subject <text>] [--body-file <path> | --body <text or ->] [--attach <path>]… [--send] [--json]`
 
 Writes a message: saved as a draft, or with `--send` sent. An address is `name@example.org` or
 `Name <name@example.org>` (the name may be in any script; the address is ASCII). `--body -`
@@ -704,9 +704,46 @@ one line says the draft is saved, with its identifier. With `--json`, one object
 {"id": "4b2e…@example.org"}
 ```
 
+#### Replying and forwarding
+
+`--reply`, `--reply-all` and `--forward` take a message's identifier (as `search` and `list`
+print it) and start a new message from that message of the local copy. They combine with the
+other options (`--body`, `--attach`, `--send`, or a draft without `--send`), exclude one another
+and `--draft`, and exit with 3 when the identifier names no message. The account is the one that
+received the message, unless `--account` says otherwise.
+
+What is worked out from the message is replaced, field by field, by what is given: `--to`
+replaces the recipients, `--cc` the copies of a reply all, `--subject` the subject. `--body` is
+the text above the quote.
+
+- **Reply** goes to the `Reply-To` of the message, else its `From`. **Reply all** also goes to the
+  message's `To`, and its `Cc` becomes the reply's `Cc`, but the account's own address is left
+  out (case does not matter) and no address is written twice. An address Missive cannot send to
+  (not ASCII, say) in the message stops the reply, and `--to` can name the recipients instead.
+- The subject gets one `Re: `: a subject that already starts with `Re:`, in any case, is kept as
+  it is.
+- The thread: `In-Reply-To` is the message's `Message-ID`; `References` is the message's own
+  `References` (else its `In-Reply-To`) followed by that `Message-ID`, each identifier once.
+  Beyond 20 identifiers it keeps the first and the latest 19. A message without a `Message-ID`
+  gives no `In-Reply-To`, and its `References` go on as they were.
+- The text of the message (its HTML reduced to text when it has none) is quoted below the
+  `--body`, each line prefixed by `> `, under a line `On 2026-10-17 07:30 +0200, Alice Example
+  wrote:` (the date in the offset the message carries, the same in every language; without a
+  date or a name the line says what it can).
+- After a reply is **sent** (the server took it), never before, the message gets `\Answered`:
+  it is shown at once in the local copy, and the flag is applied on the server through the
+  queue of actions, as `missive mark` does. A reply that is only saved as a draft marks nothing,
+  and neither does one the server refuses. A message that was moved or deleted meanwhile is not
+  marked.
+- **Forward** has a subject `Fwd: ` (a subject that already starts with `Fwd:` or `Fw:` is kept),
+  no `In-Reply-To` and no `References`, and the message goes along as an attachment of type
+  `message/rfc822`, named after its subject (`<subject>.eml`), byte for byte as the local copy
+  keeps it (it is encoded in base64 on the wire, as every attachment is). `--to` names the
+  recipients. A forward does not mark the message.
+
 The exit status is 1 when the message cannot be written as asked: no recipient (with `--send`),
 an address that is not one, a file that cannot be read, an account that is not configured. It is
-3 when `--draft` names no draft.
+3 when `--draft` names no draft, or `--reply`, `--reply-all` or `--forward` no message.
 
 #### Drafts
 
