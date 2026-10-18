@@ -73,6 +73,10 @@ pub struct Account {
     pub user: String,
     pub imap: Server,
     pub smtp: Server,
+    /// Whether the SMTP server keeps a copy of what it sends in the Sent folder itself (Proton
+    /// Mail Bridge does): Missive then appends none. Absent from the files written before it.
+    #[serde(default)]
+    pub server_saves_sent: bool,
 }
 
 /// Whether `id` can name an account: it becomes a folder name and a keyring attribute, and is
@@ -307,6 +311,27 @@ mod tests {
     }
 
     #[test]
+    fn an_account_file_written_before_server_saves_sent_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AccountStore::new(dir.path());
+        let folder = dir.path().join("accounts/alice");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("account.toml"),
+            "name = \"Alice\"\naddress = \"alice@example.org\"\nuser = \"alice@example.org\"\n\
+             [imap]\nhost = \"imap.example.org\"\nport = 993\nsecurity = \"tls\"\n\
+             [smtp]\nhost = \"smtp.example.org\"\nport = 465\nsecurity = \"tls\"\n",
+        )
+        .unwrap();
+
+        let mut account = store.get("alice").unwrap().unwrap();
+        assert!(!account.server_saves_sent);
+        account.server_saves_sent = true;
+        let text = toml::to_string(&account).unwrap();
+        assert_eq!(toml::from_str::<Account>(&text).unwrap(), account);
+    }
+
+    #[test]
     fn an_account_is_saved_listed_and_removed() {
         let dir = tempfile::tempdir().unwrap();
         let store = AccountStore::new(dir.path());
@@ -324,6 +349,7 @@ mod tests {
                 port: 587,
                 security: Security::Starttls,
             },
+            server_saves_sent: false,
         };
         let certificate = CertificateDer::from(vec![1, 2, 3, 4, 5]);
 

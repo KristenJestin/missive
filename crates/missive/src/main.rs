@@ -162,6 +162,10 @@ struct AddArgs {
     /// authorities: for a local bridge with its own self-signed certificate.
     #[arg(long, value_name = "FILE.PEM")]
     certificate: Option<PathBuf>,
+    /// The SMTP server keeps a copy of what it sends in the Sent folder itself (Proton Mail
+    /// Bridge does): Missive then does not append its own.
+    #[arg(long)]
+    server_saves_sent: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -304,6 +308,7 @@ async fn add(args: AddArgs) -> Result<()> {
         user,
         imap,
         smtp,
+        server_saves_sent: args.server_saves_sent,
     };
     let tls = client_config(certificate.clone());
     check_imap(&account.imap, &account.user, &password, tls.clone())
