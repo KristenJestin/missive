@@ -159,9 +159,13 @@ pub fn build(account: &Account, draft: &Draft, now: i64) -> Result<Built, String
             attachment.data.as_slice(),
         );
     }
-    let raw = message
+    let mut raw = message
         .write_to_vec()
         .map_err(|e| format!("the message could not be written ({e})"))?;
+    // DATA ends the message's last line: done here, what is stored is what is sent.
+    if !raw.ends_with(b"\r\n") {
+        raw.extend_from_slice(b"\r\n");
+    }
 
     let bcc_header = (!draft.bcc.is_empty()).then(|| {
         let mut header = b"Bcc: ".to_vec();
@@ -375,5 +379,23 @@ mod tests {
         let two = build(&account(), &draft, 0).unwrap();
         assert_ne!(one.message_id, two.message_id);
         assert_eq!(one.bcc_header, None);
+    }
+
+    #[test]
+    fn a_message_ends_with_crlf_as_data_sends_it() {
+        for body in ["", "no final line break", "one\n"] {
+            let draft = Draft {
+                to: vec![mailbox("zoe@example.com")],
+                body: body.to_owned(),
+                ..Draft::default()
+            };
+            let built = build(&account(), &draft, 0).unwrap();
+            assert!(built.raw.ends_with(b"\r\n"), "{body:?}");
+            assert_eq!(
+                crate::submit::dot_stuffed(&built.raw),
+                built.raw,
+                "{body:?}"
+            );
+        }
     }
 }
