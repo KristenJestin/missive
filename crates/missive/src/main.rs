@@ -1,3 +1,4 @@
+mod act;
 mod daemon;
 mod read;
 mod watch;
@@ -73,6 +74,16 @@ enum Command {
     /// server sent. The HTML is never interpreted. Reads the local copy only; exits with 3 when
     /// the identifier names no message.
     Show(read::ShowArgs),
+    /// Mark messages read or unread, flagged or not. Shown in the local copy at once, applied on
+    /// the server when the account is connected; starts the daemon when none runs.
+    Mark(act::MarkArgs),
+    /// Move messages to another folder of their account. Shown in the local copy at once, applied
+    /// on the server when the account is connected; starts the daemon when none runs.
+    Move(act::MoveArgs),
+    /// Move messages to the trash, or with --permanently delete them for good from it. Shown in
+    /// the local copy at once, applied on the server when the account is connected; starts the
+    /// daemon when none runs.
+    Delete(act::DeleteArgs),
 }
 
 #[derive(Args)]
@@ -198,6 +209,9 @@ async fn main() -> ExitCode {
             }
             Err(read::ShowError::Failed(message)) => Err(Failure(message)),
         },
+        Command::Mark(args) => acted(act::mark(args).await),
+        Command::Move(args) => acted(act::move_to(args).await),
+        Command::Delete(args) => acted(act::delete(args).await),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -205,6 +219,18 @@ async fn main() -> ExitCode {
             eprintln!("missive: {message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// An action's result, with the exit status of an identifier that names no message.
+fn acted(result: std::result::Result<(), act::ActError>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(act::ActError::NotFound(message)) => {
+            eprintln!("missive: {message}");
+            std::process::exit(act::NOT_FOUND.into());
+        }
+        Err(act::ActError::Failed(message)) => Err(Failure(message)),
     }
 }
 
