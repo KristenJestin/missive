@@ -11,10 +11,14 @@ license = "MIT"
 # C toolchain for a crypto library.
 [workspace.dependencies]
 missive-core = { path = "crates/missive-core" }
+# Cleans a message's HTML for "view original", by allow-list, on html5ever (the parser of Servo).
+ammonia = "4"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
+# The tokenizer ammonia is built on, to find the stylesheets of a message.
+html5ever = "0.40"
 # Reads messages for the local copy: their envelope, from the raw message kept beside it.
 mail-parser = "0.11"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
