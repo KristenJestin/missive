@@ -31,6 +31,9 @@
 //! takes its change back from the copy. A UID the server no longer has is not an error: the
 //! command changes nothing for it, and the next sync removes it from the copy.
 //!
+//! A removal whose `UID EXPUNGE` was refused takes its `\Deleted` back, so that no other
+//! client's `EXPUNGE` removes the message later.
+//!
 //! A `UID COPY` whose answer was never read (the connection was cut) may or may not have
 //! copied: before copying again, the target's UIDNEXT tells whether anything arrived there since,
 //! and if so, each message is looked for there by its `Message-ID`. A message without one is
@@ -487,7 +490,9 @@ async fn one(
     copy_then_remove(server, store, action, &set, &target_name).await
 }
 
-/// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` of the same UIDs.
+/// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` of the same UIDs. An expunge the
+/// server refused takes the flag back (best effort): left there, another client's `EXPUNGE`
+/// would remove messages the copy shows, once the action is refused.
 async fn remove(server: &mut Server<'_>, set: &str) -> std::result::Result<Done, SyncError> {
     let done = server
         .run_done(
@@ -498,7 +503,18 @@ async fn remove(server: &mut Server<'_>, set: &str) -> std::result::Result<Done,
     if !matches!(done, Done::Ok(_)) {
         return Ok(done);
     }
-    server.run_done(&format!("UID EXPUNGE {set}"), |_| {}).await
+    let done = server
+        .run_done(&format!("UID EXPUNGE {set}"), |_| {})
+        .await?;
+    if !matches!(done, Done::Ok(_)) {
+        server
+            .run_done(
+                &format!("UID STORE {set} -FLAGS.SILENT (\\Deleted)"),
+                |_| {},
+            )
+            .await?;
+    }
+    Ok(done)
 }
 
 /// A move without MOVE: see the module's documentation. The source folder is selected.

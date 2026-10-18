@@ -172,7 +172,9 @@ An action on messages of several folders is one action per folder, each with its
   `no-such-folder` (the target of a move does not exist on the server), `unsupported` (the server
   can neither `MOVE` nor `UID EXPUNGE`, so moving or deleting for good would also remove the
   messages another client marked deleted), `refused` (the server refused it 5 times, or as
-  malformed) or `connection` (it failed 5 times that way).
+  malformed) or `connection` (it failed 5 times that way). A move or a permanent delete whose
+  `UID EXPUNGE` the server refused takes its `\Deleted` flag back on the server, so that another
+  client's `EXPUNGE` does not remove the message later.
 
 ### `lagged`
 

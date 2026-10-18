@@ -1378,3 +1378,51 @@ async fn an_action_command_that_never_answers_times_out_drops_the_connection_and
     .await;
     new_mail_is_synced(&server, &env, 6).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_uid_expunge_takes_the_deleted_flag_back_on_the_server() {
+    // NO, until the limit refuses the move.
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    succeeded(
+        &env.act(&["move", &env.id("INBOX", 3), "--to", "archive"])
+            .await,
+    );
+    eventually(10, "a first NO", || tries(&server, "UID EXPUNGE") == 1).await;
+    for pass in 2..=5 {
+        succeeded(&sync_soon(&env).await);
+        eventually(10, "one more try", || tries(&server, "UID EXPUNGE") == pass).await;
+    }
+    eventually(10, "the move refused", || env.queue() == 0).await;
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(server.flags("INBOX", 3), Some(Vec::new()));
+    // What another client marked is left alone.
+    assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
+    assert!(
+        server
+            .imap_log()
+            .iter()
+            .any(|c| c == "UID STORE 3 -FLAGS.SILENT (\\Deleted)"),
+        "{:?}",
+        server.imap_log()
+    );
+
+    // BAD: refused at once, the move and a permanent delete alike.
+    let (server, env, _daemon) = started(mailbox().without_move().bad("UID EXPUNGE")).await;
+    succeeded(
+        &env.act(&["move", &env.id("INBOX", 3), "--to", "archive"])
+            .await,
+    );
+    succeeded(
+        &env.act(&["delete", "--permanently", &env.id("Trash", 1)])
+            .await,
+    );
+    eventually(20, "both refused", || env.queue() == 0).await;
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(server.flags("INBOX", 3), Some(Vec::new()));
+    assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
+    assert_eq!(server.uids("Trash"), [1, 2]);
+    assert_eq!(server.flags("Trash", 1), Some(Vec::new()));
+    assert_eq!(server.flags("Trash", 2), flags(&["\\Deleted"]));
+    assert_eq!(env.uids("Trash"), [1, 2]);
+}
