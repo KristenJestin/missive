@@ -840,6 +840,26 @@ async fn a_message_being_sent_when_its_account_is_removed_and_added_again_is_del
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_worker_of_a_removed_account_takes_no_other_message() {
+    let (server, env, _daemon) = removed_while_sending().await;
+    // A message of the account written meanwhile, as the old worker would find it.
+    Connection::open(env.copy_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO outbox (account, sender, recipients, message_id, raw, sent_copy,
+                                 queued_at)
+             SELECT account, sender, recipients, 'second@example.org',
+                    CAST(replace(CAST(raw AS TEXT), 'first', 'second') AS BLOB), sent_copy,
+                    queued_at FROM outbox",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(bodies_taken(&server, 1).await, ["first"]);
+    assert_eq!(env.outbox().last().unwrap().1, "queued");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_sent_copy_is_not_appended_when_the_server_saves_sent_mail() {
     let server = mailbox().start().await;
     let mut setup = Setup::of(&server);

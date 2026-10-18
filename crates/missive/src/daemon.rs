@@ -53,6 +53,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
@@ -1544,7 +1545,15 @@ impl SmtpWorker {
         let mut password: Option<Password> = None;
         let mut backoff = Backoff::default();
         loop {
-            while self.wake.try_recv().is_ok() {}
+            // A worker whose account was removed takes no other message: its successor, if the
+            // account is added again, may already be sending them.
+            loop {
+                match self.wake.try_recv() {
+                    Ok(()) => {}
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                }
+            }
             match self.store.has_queued(self.key) {
                 Ok(true) => {}
                 Ok(false) => {
