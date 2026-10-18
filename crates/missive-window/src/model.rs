@@ -181,7 +181,11 @@ impl Model {
                 self.told.insert(account.clone(), state.clone());
                 self.refresh_states();
             }
-            Event::SyncStarted { .. } => self.daemon = Daemon::Running,
+            // The outbox is not shown here: a sending only says that a daemon runs.
+            Event::SyncStarted { .. }
+            | Event::Sent(_)
+            | Event::SendFailed(_)
+            | Event::SendUncertain(_) => self.daemon = Daemon::Running,
             Event::NewMessage(_)
             | Event::Unread(_)
             | Event::SyncEnded { .. }

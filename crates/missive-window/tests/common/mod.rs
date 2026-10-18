@@ -87,6 +87,7 @@ impl Mail {
             user: USER.to_owned(),
             imap: server(self.server.imap_tls_addr().port()),
             smtp: server(self.server.smtp_tls_addr().port()),
+            server_saves_sent: false,
         }
     }
 
