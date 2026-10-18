@@ -190,6 +190,8 @@ impl Model {
             | Event::Unread(_)
             | Event::SyncEnded { .. }
             | Event::Action(_)
+            // A draft saved or removed changes the Drafts folder.
+            | Event::Draft(_)
             | Event::Lagged { .. } => {
                 self.daemon = Daemon::Running;
                 self.refresh();
