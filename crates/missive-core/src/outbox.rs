@@ -22,6 +22,10 @@
 //!   before its answer. The server may have taken it: it stays, reported, and is never sent again
 //!   by itself, since a message delivered twice is worse than a question.
 //!
+//! After the server's `250`, recording that it was sent is tried again for a while when the copy
+//! is busy: a row left `sending` would be reported `uncertain` by the next daemon, for a message
+//! that was sent.
+//!
 //! The copy in Sent is appended by the account's IMAP connection, through the verified write
 //! path (`APPEND` counts only with its tagged `OK`), flagged `\Seen`, with the message's Bcc
 //! recipients in it (see [`crate::compose`]). A try whose answer was lost, or that a killed daemon
@@ -40,6 +44,11 @@ use crate::connect::{ConnectError, ImapSession};
 use crate::store::Store;
 use crate::submit::{Outgoing, Submitted, submit};
 use crate::sync::{self, Done, SyncError};
+
+/// How many times recording what came of a submission is tried, [`RECORD_PAUSE`] apart, when the
+/// copy is busy: each try already waits for the copy as long as its busy timeout says.
+const RECORD_TRIES: u32 = 5;
+const RECORD_PAUSE: Duration = Duration::from_secs(1);
 
 /// Now, in milliseconds since the epoch: the outbox's clock.
 pub fn now() -> i64 {
@@ -119,7 +128,7 @@ pub async fn send_next(
             } else {
                 "append"
             };
-            let answered = store.sent(id, sent_copy == "append")?;
+            let answered = recorded(store, |store| store.sent(id, sent_copy == "append")).await?;
             Tried::Sent {
                 id,
                 message_id,
@@ -128,11 +137,12 @@ pub async fn send_next(
             }
         }
         Ok(Submitted::Again { reason }) => {
-            store.send_again(id, &reason, now())?;
+            recorded(store, |store| store.send_again(id, &reason, now())).await?;
             Tried::Again { id, reason }
         }
         Ok(Submitted::Refused { code, step }) => {
-            store.send_failed(id, &format!("the server answered {code} to {step}"))?;
+            let why = format!("the server answered {code} to {step}");
+            recorded(store, |store| store.send_failed(id, &why)).await?;
             Tried::Failed {
                 id,
                 message_id,
@@ -141,7 +151,7 @@ pub async fn send_next(
             }
         }
         Ok(Submitted::Uncertain { reason }) => {
-            store.send_uncertain(id, &reason)?;
+            recorded(store, |store| store.send_uncertain(id, &reason)).await?;
             Tried::Uncertain {
                 id,
                 message_id,
@@ -149,10 +159,32 @@ pub async fn send_next(
             }
         }
         Err(error) => {
-            store.send_again(id, &error.to_string(), now())?;
+            let why = error.to_string();
+            recorded(store, |store| store.send_again(id, &why, now())).await?;
             Tried::Login { id, error }
         }
     }))
+}
+
+/// Records what came of a submission, trying again while the copy is busy: the server's answer
+/// is known only here.
+///
+/// The copy is lent to `record` mutably: a shared borrow held across the pause would make the
+/// future not `Send`, the copy not being `Sync`.
+async fn recorded<T>(
+    store: &mut Store,
+    mut record: impl FnMut(&mut Store) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let mut tries = 1;
+    loop {
+        match record(store) {
+            Err(_) if tries < RECORD_TRIES => {
+                tries += 1;
+                tokio::time::sleep(RECORD_PAUSE).await;
+            }
+            done => return done,
+        }
+    }
 }
 
 /// What became of a copy for Sent.

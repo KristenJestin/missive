@@ -642,8 +642,8 @@ impl FakeServer {
             .push(Rule::new("APPEND", Action::StallAfterAppend));
     }
 
-    /// Waits `delay` before answering every SMTP command that starts with `command`, like a slow
-    /// server. Until [`FakeServer::heal`].
+    /// Waits `delay` before answering every SMTP command that starts with `command`, or with
+    /// `"."` every end of data, like a slow server. Until [`FakeServer::heal`].
     pub fn smtp_delay(&self, command: &str, delay: Duration) {
         self.shared
             .state()

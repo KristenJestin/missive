@@ -1,7 +1,7 @@
 //! The outbox (schema versions 6, 8 and 9): the messages to send, and where each one is between
 //! its writing and its server's answer. See [`crate::outbox`].
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::Store;
 use crate::actions::{Kind, Wanted};
@@ -199,7 +199,11 @@ impl Store {
     /// recorded for the latter: the original may be gone, or being moved, by now, and then
     /// there is nothing to mark.
     pub fn sent(&mut self, id: i64, copy: bool) -> rusqlite::Result<bool> {
-        let transaction = self.connection.transaction()?;
+        // Immediate, so that a busy copy is waited for: a deferred transaction that reads first
+        // fails at once when it comes to write while another writer holds the copy.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<(i64, Option<String>, Option<String>)> = transaction
             .query_row(
                 "SELECT account, draft, answers FROM outbox WHERE id = ?1",

@@ -120,6 +120,9 @@ pub(super) async fn serve(
                 let Some(data) = read_data(&mut io).await else {
                     return;
                 };
+                if let Some(delay) = shared.smtp_delay(".") {
+                    tokio::time::sleep(delay).await;
+                }
                 let message = SmtpMessage {
                     from: session.from.take().unwrap_or_default(),
                     to: std::mem::take(&mut session.to),
