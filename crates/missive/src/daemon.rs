@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use missive_core::account::{Account, AccountStore, Password};
+use missive_core::account::{Account, AccountStore, Listing, Password};
 use missive_core::actions::{self, Kind, Outcome, Wanted};
 use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap};
 use missive_core::copy::{Copy, MessageId};
@@ -282,6 +282,37 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// Drops the accounts of the copy that the configuration no longer holds, with their mail:
+    /// the copy only, nothing is sent to a server. An account whose settings cannot be read is
+    /// still configured, so it stays; so do all of them when none is configured. Told to the
+    /// watchers as a change of the unread counts.
+    fn forget_removed(&self, listing: &Listing) {
+        let keep: Vec<String> = listing
+            .accounts
+            .iter()
+            .map(|(id, _)| id.clone())
+            .chain(listing.skipped.iter().map(|(id, _)| id.clone()))
+            .collect();
+        // No account at all is more likely a wrong or unmounted configuration folder than the
+        // removal of the last account: its rows stay until another account is configured.
+        if keep.is_empty() {
+            return;
+        }
+        let removed = Store::open(&self.store).and_then(|mut store| store.drop_unlisted(&keep));
+        match removed {
+            Ok(0) => {}
+            Ok(removed) => {
+                log!(
+                    "removed {removed} accounts that are no longer configured from the local copy"
+                );
+                if let Some(copy) = open_copy(&self.store) {
+                    self.events.unread(&copy);
+                }
+            }
+            Err(e) => log!("cannot remove the accounts no longer configured from the copy ({e})"),
+        }
+    }
+
     /// Starts a worker for each account of the configuration that has none, and lets the workers
     /// of removed accounts end. Returns the number of accounts.
     fn reload(&self) -> usize {
@@ -296,6 +327,7 @@ impl Daemon {
         for (_, kind) in &listing.skipped {
             log!("skipped an account whose settings cannot be read ({kind})");
         }
+        self.forget_removed(&listing);
         let mut workers = locked(&self.workers);
         // An account whose settings cannot be read now keeps its worker: it was not removed.
         workers.retain(|id, _| {
