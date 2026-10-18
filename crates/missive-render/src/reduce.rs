@@ -124,9 +124,51 @@ const DROPPED: &[&str] = &[
 
 impl Reducer<'_> {
     fn children(&mut self, node: &Node) {
+        if self.has_breaks(node) {
+            return self.lines(node);
+        }
         for &child in &node.children {
             if let Some(child) = self.document.get_node(child) {
                 self.node(child);
+            }
+        }
+    }
+
+    /// Whether a line break is among the children of a node.
+    fn has_breaks(&self, node: &Node) -> bool {
+        node.children
+            .iter()
+            .any(|&child| self.document.get_node(child).is_some_and(is_break))
+    }
+
+    /// The children of a node cut at its line breaks, each line a block of its own and a blank
+    /// line an empty one: a text view that lays a paragraph out as one run of text (gpui-base's)
+    /// would otherwise join the lines of a plain-text message.
+    fn lines(&mut self, node: &Node) {
+        let mut line = String::new();
+        let mut lines = Vec::new();
+        for &child in &node.children {
+            let Some(child) = self.document.get_node(child) else {
+                continue;
+            };
+            if is_break(child) {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            let outer = std::mem::take(&mut self.out);
+            self.node(child);
+            line.push_str(&std::mem::replace(&mut self.out, outer));
+        }
+        // A last break ends the last line; it does not start another.
+        if !line.trim().is_empty() {
+            lines.push(line);
+        }
+        for line in lines {
+            if line.trim().is_empty() {
+                // A no-break space, not a `<br>`: gpui-base draws a lone break as nothing.
+                self.out.push_str("<div>\u{a0}</div>");
+            } else {
+                self.out.push_str(&format!("<div>{line}</div>"));
             }
         }
     }
@@ -176,6 +218,8 @@ impl Reducer<'_> {
                 self.out.push_str(&format!("</{tag}>"));
             }
             "td" | "th" => self.wrapped("div", node),
+            // A paragraph cut into lines holds blocks, which a paragraph cannot.
+            "p" if self.has_breaks(node) => self.wrapped("div", node),
             _ if KEPT.contains(&tag) => self.wrapped(tag, node),
             _ if BLOCKS.contains(&tag) => self.wrapped("div", node),
             _ => self.children(node),
@@ -280,6 +324,11 @@ struct Shape {
     nested_table: bool,
 }
 
+fn is_break(node: &Node) -> bool {
+    node.element_data()
+        .is_some_and(|element| &*element.name.local == "br")
+}
+
 fn is_followable(href: &str) -> bool {
     let lower = href.trim().to_ascii_lowercase();
     lower.starts_with("https:") || lower.starts_with("http:") || lower.starts_with("mailto:")
@@ -371,6 +420,16 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("javascript"), "{out}");
+    }
+
+    #[test]
+    fn each_line_broken_by_a_line_break_is_a_block_and_a_blank_line_stays() {
+        let out = body("<p>Hi all,<br><br>Notes:<br>1. <b>Agreed</b>.<br></p>");
+        assert_eq!(
+            out,
+            "<div><div>Hi all,</div><div>\u{a0}</div><div>Notes:</div>\
+             <div>1. <b>Agreed</b>.</div></div>"
+        );
     }
 
     #[test]
