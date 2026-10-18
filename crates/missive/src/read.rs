@@ -9,7 +9,8 @@ use clap::{Args, ValueEnum};
 use missive_core::account::{AccountStore, Listing};
 use missive_core::body::{self, Attachment};
 use missive_core::copy::{
-    Copy, FolderRef, Hit, List, NotFound, Outgoing, Person, Search, Stored, WaitingDraft, utc,
+    Copy, FolderRef, Hit, List, NotFound, Outgoing, Person, Search, Stored, WaitingDraft,
+    local_time,
 };
 use missive_core::protocol::pid_path;
 use missive_core::store::{SkippedFolder, Store};
@@ -264,7 +265,7 @@ pub fn status(json: bool) -> Result<()> {
             n => format!("{n} messages"),
         };
         let synced = match account.last_sync {
-            Some(seconds) => format!("last sync {}", utc(seconds)),
+            Some(seconds) => format!("last sync {}", local_time(seconds)),
             None => "never synced".to_owned(),
         };
         let skipped = if account.skipped.is_empty() {
@@ -520,7 +521,7 @@ fn columns(hit: &Hit) -> (String, String, String) {
                 .or(p.address.as_deref())
         })
         .unwrap_or("");
-    let date = hit.date.map(utc).unwrap_or_default();
+    let date = hit.date.map(local_time).unwrap_or_default();
     let subject = hit.subject.as_deref().unwrap_or("(no subject)");
     // A tab or a line break in a header would break the columns.
     let clean = |text: &str| text.replace(hides_text, " ");
@@ -657,7 +658,7 @@ pub fn show(args: ShowArgs) -> std::result::Result<(), ShowError> {
     people("Cc", &stored.cc);
     people("Reply-To", &body.reply_to);
     if let Some(date) = stored.hit.date {
-        println!("Date: {}", utc(date));
+        println!("Date: {}", local_time(date));
     }
     println!(
         "Subject: {}",

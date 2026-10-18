@@ -324,8 +324,10 @@ const HIT_COLUMNS: &str = "account.id, folder.id, folder.name, folder.role, home
     message.uid, coalesce(message.date, message.internal_date), message.subject,
     message.sender, message.recipients, message.flags, home.id";
 
-/// A hit from a row that starts with [`HIT_COLUMNS`].
-fn hit(r: &rusqlite::Row) -> rusqlite::Result<(Hit, String)> {
+/// A hit from a row that starts with [`HIT_COLUMNS`]. A copy written before raw 8-bit headers were
+/// decoded holds U+FFFD for their bytes: the hit is then read again from the raw message, which
+/// the copy keeps as it came (no migration; only the rows that need it cost a second read).
+fn hit(connection: &Connection, r: &rusqlite::Row) -> rusqlite::Result<(Hit, String)> {
     let account: String = r.get(0)?;
     let folder = FolderRef {
         id: r.get(1)?,
@@ -340,7 +342,7 @@ fn hit(r: &rusqlite::Row) -> rusqlite::Result<(Hit, String)> {
         Ok(serde_json::from_str(&json).unwrap_or_default())
     };
     let flags: String = r.get(10)?;
-    let hit = Hit {
+    let mut hit = Hit {
         id: message_id(&account, home, uidvalidity.unwrap_or(0), uid),
         account,
         folder,
@@ -352,7 +354,70 @@ fn hit(r: &rusqlite::Row) -> rusqlite::Result<(Hit, String)> {
         to: people(9)?,
         unread: !has_flag(&flags, "\\Seen"),
     };
+    if damaged(
+        hit.subject
+            .iter()
+            .map(String::as_str)
+            .chain(names(&[&hit.from, &hit.to])),
+    ) {
+        let raw = connection
+            .query_row(
+                "SELECT raw FROM message_raw JOIN message ON message.id = message_raw.message
+                  WHERE message.folder = ?1 AND message.uid = ?2",
+                params![home, uid],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .ok();
+        if let Some(envelope) = raw.as_deref().map(envelope) {
+            hit.subject = envelope.subject;
+            hit.from = envelope.from;
+            hit.to = envelope.to;
+        }
+    }
     Ok((hit, flags))
+}
+
+/// The headers of a message that are stored apart, as the message says them.
+struct Envelope {
+    subject: Option<String>,
+    from: Vec<Person>,
+    to: Vec<Person>,
+    cc: Vec<Person>,
+}
+
+fn envelope(raw: &[u8]) -> Envelope {
+    let raw = crate::header::decoded(raw);
+    let parsed = mail_parser::MessageParser::default().parse(raw.as_ref());
+    let people = |address: Option<&mail_parser::Address>| -> Vec<Person> {
+        address
+            .into_iter()
+            .flat_map(|address| address.iter())
+            .map(|mailbox| Person {
+                name: mailbox.name().map(str::to_owned),
+                address: mailbox.address().map(str::to_owned),
+            })
+            .collect()
+    };
+    Envelope {
+        subject: parsed.as_ref().and_then(|m| m.subject()).map(str::to_owned),
+        from: people(parsed.as_ref().and_then(|m| m.from())),
+        to: people(parsed.as_ref().and_then(|m| m.to())),
+        cc: people(parsed.as_ref().and_then(|m| m.cc())),
+    }
+}
+
+fn names<'a>(lists: &[&'a [Person]]) -> impl Iterator<Item = &'a str> {
+    lists
+        .iter()
+        .flat_map(|list| list.iter())
+        .filter_map(|person| person.name.as_deref())
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+/// Whether a text holds the character a parser puts in place of a byte it cannot read.
+fn damaged<'a>(mut texts: impl Iterator<Item = &'a str>) -> bool {
+    texts.any(|text| text.contains('\u{fffd}'))
 }
 
 impl Copy {
@@ -564,7 +629,7 @@ impl Copy {
         let role = search.role.clone().map_or(Value::Null, Value::Text);
         let rows = statement.query_map(
             params![expression, accounts, role, search.limit as i64],
-            |r| Ok(hit(r)?.0),
+            |r| Ok(hit(&self.connection, r)?.0),
         )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -606,7 +671,7 @@ impl Copy {
                 list.limit as i64
             ],
             |r| {
-                let (hit, flags) = hit(r)?;
+                let (hit, flags) = hit(&self.connection, r)?;
                 Ok(Listed {
                     hit,
                     flagged: has_flag(&flags, "\\Flagged"),
@@ -710,16 +775,21 @@ impl Copy {
                 self.from()
             ))?
             .query_row(params![id.account, id.folder, id.uid], |r| {
-                let (hit, flags) = hit(r)?;
+                let (hit, flags) = hit(&self.connection, r)?;
                 let cc: String = r.get(13)?;
+                let mut cc: Vec<Person> = serde_json::from_str(&cc).unwrap_or_default();
+                let raw: Vec<u8> = r.get(15)?;
+                if damaged(names(&[&cc])) {
+                    cc = envelope(&raw).cc;
+                }
                 Ok(Stored {
                     hit,
                     flagged: has_flag(&flags, "\\Flagged"),
                     answered: has_flag(&flags, "\\Answered"),
                     size: r.get::<_, i64>(12)? as u64,
-                    cc: serde_json::from_str(&cc).unwrap_or_default(),
+                    cc,
                     message_id: r.get(14)?,
-                    raw: r.get(15)?,
+                    raw,
                 })
             });
         match stored {
@@ -730,30 +800,23 @@ impl Copy {
     }
 }
 
-/// A time in seconds since the epoch as `2026-10-17 07:30 UTC`.
-pub fn utc(seconds: i64) -> String {
-    let days = seconds.div_euclid(86_400);
-    let rest = seconds.rem_euclid(86_400);
-    // The civil date of a day count (Howard Hinnant's algorithm), days from 1970-01-01.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
+/// A time in seconds since the epoch in the user's time zone (`TZ`, else the system's), as
+/// `2026-10-17 09:30 +02:00`; `2026-10-17 07:30 UTC` where the zone is UTC itself.
+pub fn local_time(seconds: i64) -> String {
+    match chrono::DateTime::from_timestamp(seconds, 0) {
+        Some(time) => written(time.with_timezone(&chrono::Local).fixed_offset()),
+        None => seconds.to_string(),
+    }
+}
+
+fn written(time: chrono::DateTime<chrono::FixedOffset>) -> String {
+    let offset = time.offset().local_minus_utc();
+    let zone = if offset == 0 {
+        "UTC".to_owned()
     } else {
-        shifted_month - 9
+        time.format("%:z").to_string()
     };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
-        rest / 3_600,
-        rest % 3_600 / 60
-    )
+    format!("{} {zone}", time.format("%Y-%m-%d %H:%M"))
 }
 
 fn role_rank(folder: &FolderRef) -> usize {
@@ -819,13 +882,24 @@ mod tests {
     }
 
     #[test]
-    fn a_time_is_written_in_utc() {
-        assert_eq!(utc(0), "1970-01-01 00:00 UTC");
-        assert_eq!(utc(1_792_220_640), "2026-10-17 07:04 UTC");
-        // The end of a leap day and the start of the next day.
-        assert_eq!(utc(1_709_251_199), "2024-02-29 23:59 UTC");
-        assert_eq!(utc(1_709_251_200), "2024-03-01 00:00 UTC");
-        assert_eq!(utc(-1), "1969-12-31 23:59 UTC");
+    fn a_time_is_written_in_its_zone_with_the_offset() {
+        use chrono::{DateTime, FixedOffset, Utc};
+        let at = |seconds: i64, offset: i32| {
+            written(
+                DateTime::<Utc>::from_timestamp(seconds, 0)
+                    .unwrap()
+                    .with_timezone(&FixedOffset::east_opt(offset).unwrap()),
+            )
+        };
+        assert_eq!(at(0, 0), "1970-01-01 00:00 UTC");
+        assert_eq!(at(1_792_220_640, 0), "2026-10-17 07:04 UTC");
+        assert_eq!(at(1_792_220_640, 7_200), "2026-10-17 09:04 +02:00");
+        assert_eq!(at(1_792_220_640, -12_600), "2026-10-17 03:34 -03:30");
+        // The end of a leap day and the start of the next day, and a day that changes with the zone.
+        assert_eq!(at(1_709_251_199, 0), "2024-02-29 23:59 UTC");
+        assert_eq!(at(1_709_251_200, 0), "2024-03-01 00:00 UTC");
+        assert_eq!(at(1_709_251_199, 3_600), "2024-03-01 00:59 +01:00");
+        assert_eq!(at(-1, 0), "1969-12-31 23:59 UTC");
     }
 
     #[test]
@@ -888,6 +962,119 @@ mod tests {
         assert!(found.flagged);
         assert!(!found.answered);
         assert_eq!(found.size, raw.len() as u64);
+    }
+
+    /// A message whose subject and names are raw Latin-1 bytes, not encoded words.
+    fn latin_1(uid: u32) -> NewMessage {
+        let raw =
+            b"From: Zo\xe9 M\xfcller <zoe@example.org>\r\nTo: Andr\xe9 <andre@example.net>\r\n\
+            Cc: Fran\xe7ois <francois@example.net>\r\nSubject: Caf\xe9 Cr\xe8me\r\n\
+            Date: Sat, 17 Oct 2026 09:30:00 +0000\r\n\r\nBonjour\r\n"
+                .to_vec();
+        NewMessage {
+            uid,
+            flags: String::new(),
+            internal_date: Some(1_790_000_000),
+            size: raw.len() as i64,
+            raw,
+        }
+    }
+
+    fn names(people: &[Person]) -> Vec<Option<&str>> {
+        people.iter().map(|p| p.name.as_deref()).collect()
+    }
+
+    #[test]
+    fn a_raw_latin_1_subject_and_names_are_stored_decoded_and_the_raw_message_is_kept() {
+        let (_dir, mut store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        let folder = store.folder(alice, "INBOX", Some("inbox")).unwrap().id;
+        store.rebuild(folder, 77).unwrap();
+        let sent = latin_1(5);
+        let raw = sent.raw.clone();
+        store.insert(folder, &[sent]).unwrap();
+
+        let found = copy
+            .message(&message_id("alice", folder, 77, 5))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.hit.subject.as_deref(), Some("Café Crème"));
+        assert_eq!(names(&found.hit.from), [Some("Zoé Müller")]);
+        assert_eq!(names(&found.hit.to), [Some("André")]);
+        assert_eq!(names(&found.cc), [Some("François")]);
+        // The server's bytes are kept as they came.
+        assert_eq!(found.raw, raw);
+        // The index holds the decoded words too.
+        assert_eq!(search(&copy, &["crème"]), [5]);
+    }
+
+    #[test]
+    fn a_copy_written_before_holds_replacement_characters_that_reading_repairs_from_the_raw_message()
+     {
+        let (dir, mut store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        let folder = store.folder(alice, "INBOX", Some("inbox")).unwrap().id;
+        store.rebuild(folder, 77).unwrap();
+        store.insert(folder, &[latin_1(5)]).unwrap();
+        // What an earlier Missive wrote for this message.
+        Connection::open(dir.path().join("copy.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE message SET subject = 'Caf\u{fffd} Cr\u{fffd}me',
+                    sender = '[{\"name\":\"Zo\u{fffd} M\u{fffd}ller\",\"address\":\"zoe@example.org\"}]',
+                    recipients = '[{\"name\":\"Andr\u{fffd}\",\"address\":\"andre@example.net\"}]',
+                    cc = '[{\"name\":\"Fran\u{fffd}ois\",\"address\":\"francois@example.net\"}]'",
+                [],
+            )
+            .unwrap();
+
+        let listed = copy
+            .list(&List {
+                accounts: vec!["alice".to_owned()],
+                role: None,
+                name: None,
+                unread: false,
+                limit: 10,
+            })
+            .unwrap();
+        let found = copy
+            .message(&message_id("alice", folder, 77, 5))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(listed[0].hit.subject.as_deref(), Some("Café Crème"));
+        assert_eq!(names(&listed[0].hit.from), [Some("Zoé Müller")]);
+        assert_eq!(found.hit.subject.as_deref(), Some("Café Crème"));
+        assert_eq!(names(&found.hit.to), [Some("André")]);
+        assert_eq!(names(&found.cc), [Some("François")]);
+    }
+
+    #[test]
+    fn a_replacement_character_the_sender_really_wrote_is_left_as_it_is() {
+        let (_dir, mut store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        let folder = store.folder(alice, "INBOX", Some("inbox")).unwrap().id;
+        store.rebuild(folder, 77).unwrap();
+        store
+            .insert(
+                folder,
+                &[message(
+                    5,
+                    "",
+                    "Sat, 17 Oct 2026 09:30:00 +0000",
+                    "Odd \u{fffd} sign",
+                    "b",
+                )],
+            )
+            .unwrap();
+
+        let found = copy
+            .message(&message_id("alice", folder, 77, 5))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.hit.subject.as_deref(), Some("Odd \u{fffd} sign"));
     }
 
     #[test]

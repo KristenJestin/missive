@@ -329,7 +329,9 @@ impl Store {
 }
 
 fn insert(transaction: &Transaction, folder: i64, message: &NewMessage) -> rusqlite::Result<()> {
-    let parsed = MessageParser::default().parse(&message.raw);
+    // The headers are read decoded; what is stored as the message is the server's bytes.
+    let readable = crate::header::decoded(&message.raw);
+    let parsed = MessageParser::default().parse(readable.as_ref());
     let parsed = parsed.as_ref();
     let mailboxes = |address: Option<&Address>| {
         let list: Vec<Mailbox> = address

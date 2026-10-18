@@ -4795,6 +4795,7 @@ dependencies = [
  "ammonia",
  "async-imap",
  "base64 0.22.1",
+ "chrono",
  "futures-util",
  "html5ever 0.40.1",
  "mail-builder",
