@@ -113,6 +113,66 @@ async fn imap_no_unavailable_at_login_gives_unreachable_not_auth_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn imap_no_unavailable_through_the_generic_option_still_gives_unreachable() {
+    let fake = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .imap_login_no("[UNAVAILABLE] try again in a moment")
+        .start()
+        .await;
+
+    let refused = check_imap(
+        &server(fake.imap_tls_addr(), Security::Tls),
+        USER,
+        &password(PASSWORD),
+        client_config(Some(fake.certificate_der())),
+    )
+    .await;
+
+    assert!(
+        matches!(refused, Err(ConnectError::Unreachable(_))),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn imap_no_expired_at_login_gives_auth_refused() {
+    let fake = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .imap_login_no("[EXPIRED] the password has expired")
+        .start()
+        .await;
+
+    let refused = check_imap(
+        &server(fake.imap_tls_addr(), Security::Tls),
+        USER,
+        &password(PASSWORD),
+        client_config(Some(fake.certificate_der())),
+    )
+    .await;
+
+    assert_eq!(refused, Err(ConnectError::AuthRefused));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn imap_no_without_a_code_at_login_gives_auth_refused() {
+    let fake = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .imap_login_no("login refused")
+        .start()
+        .await;
+
+    let refused = check_imap(
+        &server(fake.imap_tls_addr(), Security::Tls),
+        USER,
+        &password(PASSWORD),
+        client_config(Some(fake.certificate_der())),
+    )
+    .await;
+
+    assert_eq!(refused, Err(ConnectError::AuthRefused));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn imap_no_authenticationfailed_at_login_still_gives_auth_refused() {
     let fake = FakeServer::builder().user(USER, PASSWORD).start().await;
     let tls = client_config(Some(fake.certificate_der()));
