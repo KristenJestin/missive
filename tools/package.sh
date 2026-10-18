@@ -1,6 +1,6 @@
 #!/bin/sh
-# Packs the built `missive` with the install script and its desktop entry, and writes the SHA-256 checksum beside the
-# archive. Prints the archive's file name.
+# Packs the built `missive` and `missive-window` with the install script and the two desktop entries, and writes the
+# SHA-256 checksum beside the archive. Prints the archive's file name.
 #
 #   tools/package.sh <tag> <binaries-dir> <out-dir>      (tag: v0.1.0, v0.1.1-beta.21)
 set -eu
@@ -15,8 +15,10 @@ trap 'rm -rf "$stage"' EXIT
 
 mkdir "$stage/$name"
 install -m 755 "$binaries/missive" "$stage/$name/missive"
+install -m 755 "$binaries/missive-window" "$stage/$name/missive-window"
 install -m 755 "$root/dist/install.sh" "$stage/$name/install.sh"
 install -m 644 "$root/dist/missive-mailto.desktop" "$stage/$name/missive-mailto.desktop"
+install -m 644 "$root/dist/missive.desktop" "$stage/$name/missive.desktop"
 
 mkdir -p "$out"
 tar --owner=0 --group=0 -C "$stage" -czf "$out/$name.tar.gz" "$name"

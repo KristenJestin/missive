@@ -15,6 +15,9 @@ missive-core = { path = "crates/missive-core" }
 ammonia = "4"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 base64 = "0.22"
+# The local time zone of the dates Missive writes (`TZ`, else the system's). Already in the tree through
+# async-imap; `time`'s local offset refuses to work once a program has threads.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 futures-channel = "0.3"
 futures-util = "0.3"

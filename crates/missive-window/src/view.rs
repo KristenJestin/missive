@@ -15,7 +15,7 @@ use gpui_kit::{
     ScrollStrategy, SharedString, SharedUri, StyleRefinement, UniformListScrollHandle, Window,
     WindowAppearance, actions, div, px, rems, rgb, uniform_list,
 };
-use missive_core::copy::{Person, utc};
+use missive_core::copy::{Person, local_time};
 use missive_core::opener::followable;
 use missive_core::protocol::{Answer, Command};
 
@@ -448,7 +448,7 @@ impl MailWindow {
                     .subject
                     .clone()
                     .unwrap_or_else(|| "(no subject)".to_owned()),
-                date: listed.hit.date.map(utc).unwrap_or_default(),
+                date: listed.hit.date.map(local_time).unwrap_or_default(),
                 unread: listed.hit.unread,
                 attachment: listed.has_attachments,
                 cursor: self.model.cursor == Some(at),
@@ -817,7 +817,10 @@ fn headers(opened: &Opened, palette: Palette) -> gpui_kit::Div {
         .when(!opened.cc.is_empty(), |div| {
             div.child(line("Cc", people(&opened.cc, "")))
         })
-        .child(line("Date", opened.date.map(utc).unwrap_or_default()))
+        .child(line(
+            "Date",
+            opened.date.map(local_time).unwrap_or_default(),
+        ))
 }
 
 /// The body of a message in its reduced form, drawn by gpui-base's text view. Both of its hooks
