@@ -77,7 +77,12 @@ impl Setup {
             .spawn()
             .unwrap();
         let mut input = child.stdin.take().unwrap();
-        input.write_all(stdin.as_bytes()).await.unwrap();
+        // A process that exits before reading it all (a refusal, under load) closed the pipe:
+        // its output says what it did.
+        match input.write_all(stdin.as_bytes()).await {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            written => written.unwrap(),
+        }
         drop(input);
         child.wait_with_output().await.unwrap()
     }
@@ -761,4 +766,17 @@ async fn without_a_terminal_the_password_comes_only_from_password_stdin() {
         stderr(&output)
     );
     setup.nothing_saved();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_that_exits_before_reading_its_standard_input_does_not_fail_the_helper() {
+    let setup = Setup::new().await;
+    // More than a pipe holds: the write meets a process that is gone.
+    let input = "x".repeat(4 << 20);
+
+    let output = setup
+        .run_with_stdin(setup.command(&["account", "list", "--json"]), &input)
+        .await;
+
+    succeeded(&output);
 }
