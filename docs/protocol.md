@@ -53,7 +53,13 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `unsupported-protocol` | the daemon speaks another protocol version (`message` says which) |
 | `unknown-request` | the daemon knows no such request |
 | `no-such-account` | the account named is not in the configuration |
-| `failed` | the daemon could not do it: it is stopping, an account's sync could not write the local copy (`message` names the account), or the connection is already subscribed |
+| `no-such-message` | an identifier names no message in the local copy (`message` says which, and why) |
+| `no-such-folder` | the folder a `move` names is not one of the account's |
+| `no-trash` | a `delete` without `permanently`, in an account that has no trash |
+| `in-trash` | a `delete` without `permanently` of a message already in the trash |
+| `not-in-trash` | a `delete` with `permanently` of a message outside the trash, in an account that has one |
+| `busy` | a message whose move waits for the server: it takes no other action until then |
+| `failed` | the daemon could not do it: it is stopping, an account's sync could not write the local copy (`message` names the account), the local copy could not be written, or the connection is already subscribed |
 
 ## Requests
 
@@ -74,6 +80,36 @@ account's connection state at that point, in the order of their identifiers.
 
 The daemon reads the configuration again on each `sync`: an account added since it started is
 synced, a removed one is let go.
+
+### `mark`, `move`, `delete`
+
+Change messages on the server, named by the identifiers `missive search` and `list` print
+(`<account>/<folder id>/<uidvalidity>/<uid>`), of one account or several:
+
+```json
+{"protocol": 1, "request": "mark", "messages": ["alice/1/1745112/4"], "as": "read"}
+{"protocol": 1, "request": "move", "messages": ["alice/1/1745112/4"], "to": "archive"}
+{"protocol": 1, "request": "delete", "messages": ["alice/1/1745112/4"], "permanently": false}
+```
+
+| Field | | |
+|---|---|---|
+| `messages` | array of strings | at least one |
+| `as` (`mark`) | string | `read`, `unread`, `flagged` or `unflagged` |
+| `to` (`move`) | string | a role (`inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`), looked for first, or a folder's name as the server gives it |
+| `permanently` (`delete`) | boolean, `false` when absent | delete for good, rather than move to the trash: only for messages in the trash, or of an account that has none |
+
+The request is checked whole against the local copy, then recorded in its queue with its effect on
+the copy, in one transaction, and answered: nothing waits for the server, which may be
+unreachable. The answer gives the identifiers recorded, each once, in the order of the request:
+
+```json
+{"protocol": 1, "answer": "mark", "ok": true, "messages": ["alice/1/1745112/4"]}
+```
+
+A request that cannot apply to one of its messages records nothing, and is answered with one of
+the errors above. The daemon then applies the queue on the server, in order, when the account is
+connected; the `action` events (`docs/events.md`) tell what became of each action.
 
 ### `subscribe`
 

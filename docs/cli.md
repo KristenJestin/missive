@@ -117,8 +117,9 @@ version, say) or the socket cannot be reached for another reason than the daemon
 
 Missive keeps a copy of each account in `$XDG_DATA_HOME/missive/copy.sqlite` (or
 `~/.local/share/missive/…`): folders, messages, flags and each account's connection state. Only
-the daemon talks to the servers and writes the copy, and it never changes anything on a server:
-it only reads.
+the daemon talks to the servers and writes the copy. Its sync only reads; it changes something on
+a server only when the user asks for it (`mark`, `move`, `delete`: see
+[Changing messages](#changing-messages)).
 
 ### `missive sync [--account <id>]`
 
@@ -480,3 +481,68 @@ nothing on standard output. It says which of three it is:
   gives the current identifiers.
 
 With no local copy yet, `show` says so (as the other commands do) and exits with 3.
+
+## Changing messages
+
+`missive mark`, `missive move` and `missive delete` change messages on the server. They name
+messages by the identifiers `search` and `list` print, as many as wanted, of one account or
+several. They ask the daemon (starting one when none answers, as `sync` does), which:
+
+1. records the action in the local copy, in a queue, together with its effect: the message reads
+   as seen, shows in its new folder, or is gone, in `list`, `search`, `show` and `unread` at once;
+2. answers: the command returns as soon as the action is recorded, whether the server can be
+   reached or not;
+3. applies it on the server when the account is connected, in the order the actions were asked,
+   and reconciles the copy with what the server answered. Offline, the queue waits for the
+   connection; a daemon stopped or killed in between applies it when it starts again.
+
+`missive watch` tells what became of each action (an `action` event, `docs/events.md`): applied,
+tried again later, or refused. A refused action is taken back from the copy: the message shows as
+the server has it.
+
+While a move waits for the server, the message is shown in its new folder, but its identifier
+still names the folder the server has it in; once moved, it has a new identifier there (its UID in
+that folder), as it would if another client had moved it. A message whose move waits takes no
+other action until the server moved it (`busy`).
+
+### `missive mark <message id>… --read | --unread | --flagged | --unflagged [--json]`
+
+Adds or removes the `\Seen` or the `\Flagged` flag.
+
+### `missive move <message id>… --to <role or folder name> [--json]`
+
+Moves the messages to another folder of their account: a role (`inbox`, `sent`, `drafts`,
+`trash`, `junk`, `archive`) or a folder's name as the server gives it (`unread` shows them). A
+role is looked for first, then a name. A message already in that folder is left as it is.
+
+The server must have `MOVE`, or else `UIDPLUS` (the move is then a copy, followed by the removal
+of exactly those messages). A server with neither refuses the move: removing a message there
+would also remove every message another client marked deleted in the same folder.
+
+### `missive delete <message id>… [--permanently] [--json]`
+
+Without `--permanently`, moves the messages to their account's trash (the folder with the
+`trash` role). A message already in the trash is refused, and so is a message of an account that
+has no trash: the message says to use `--permanently`.
+
+With `--permanently`, deletes them for good: only messages in the trash, or in an account that
+has no trash. Anywhere else it is refused, before anything is recorded. The server must have
+`UIDPLUS`, for the same reason as for a move.
+
+### What they answer
+
+For people, one line: `2 messages marked read; the server is told as soon as the account is
+connected.`. With `--json`, one object:
+
+```json
+{"messages": ["alice/1/1745112/4", "alice/1/1745112/7"]}
+```
+
+`messages` holds the identifiers the action was recorded for, each once, in the order given.
+
+A request is checked whole before anything is recorded: when one identifier names no message, or
+the action cannot apply to one of them, nothing is recorded and the command fails, saying why on
+standard error. The exit status is 3 when an identifier names no message (as for `show`), 1 for
+every other refusal: a folder that does not exist, `--permanently` outside the trash, a message
+whose move waits, an account that is not configured.
+

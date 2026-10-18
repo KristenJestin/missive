@@ -136,6 +136,42 @@ The pass ended, and the copy is up to date with the server: `state` `ready` came
 A pass that fails (the connection is lost, the copy cannot be written) has a `sync-started` and no
 `sync-ended`: the `state` event that follows says what became of the account.
 
+### `action`
+
+What became of an action (`missive mark`, `move`, `delete`, or their requests on the socket) once
+the daemon tried it on the server.
+
+```json
+{"protocol": 1, "event": "action", "account": "alice", "action": "read",
+ "outcome": "applied", "messages": ["alice/1/1745112/4"]}
+```
+
+| Field | Type | |
+|---|---|---|
+| `account` | string | the account's identifier |
+| `action` | string | `read`, `unread`, `flagged`, `unflagged`, `move`, `delete` (a move to the trash) or `delete-permanently` |
+| `outcome` | string | `applied`, `retried` or `refused` |
+| `messages` | array of strings | the identifiers of the messages, as they were when the action was asked |
+| `reason` | string | with `retried` and `refused` only: why, for programs (below) |
+| `attempts` | number | with `retried` only: how many times the server refused it so far |
+| `message` | string | with `refused` only: why, for people |
+
+An action on messages of several folders is one action per folder, each with its event.
+
+- `applied`: the server did it, and the copy shows what the server answered. A message the server
+  no longer had is not an error: nothing was done for it, and the sync removes it from the copy.
+- `retried`: the action stays in the queue, and the actions asked after it on the same account
+  wait for it, so that they are applied in order. `reason` is `refused` (the server answered
+  `NO`; it is tried again at the next pass, and refused after 5 such answers) or `connection` (the
+  connection was lost before the server answered; it is tried again on the next connection, in a
+  way that neither loses nor duplicates a message).
+- `refused`: the action was dropped and its effect taken back from the copy. `reason` is
+  `renumbered` (the server renumbered the folder: its UIDs name other messages now),
+  `no-such-folder` (the target of a move does not exist on the server), `unsupported` (the server
+  can neither `MOVE` nor `UID EXPUNGE`, so moving or deleting for good would also remove the
+  messages another client marked deleted) or `refused` (the server refused it 5 times, or as
+  malformed).
+
 ### `lagged`
 
 The watcher read too slowly, and events were dropped for it alone.
