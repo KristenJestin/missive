@@ -75,6 +75,11 @@ fn unpacked(work: &Path, tag: &str) -> PathBuf {
     extracted.join(archive.trim_end_matches(".tar.gz"))
 }
 
+/// The temporary data folder an install puts the desktop entry in (`XDG_DATA_HOME`).
+fn data(work: &Path) -> PathBuf {
+    work.join("data")
+}
+
 fn install(folder: &Path, work: &Path, prefix: &Path) -> Output {
     let home = work.join("home");
     fs::create_dir_all(&home).unwrap();
@@ -83,6 +88,7 @@ fn install(folder: &Path, work: &Path, prefix: &Path) -> Output {
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap())
         .env("HOME", &home)
+        .env("XDG_DATA_HOME", data(work))
         .env("PREFIX", prefix))
 }
 
@@ -95,7 +101,7 @@ fn the_archive_holds_the_binary_and_the_install_script_with_its_checksum() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     names.sort();
-    assert_eq!(names, ["install.sh", "missive"]);
+    assert_eq!(names, ["install.sh", "missive", "missive-mailto.desktop"]);
 
     // Checked from the folder the two files are in, as a person who downloaded them does.
     run(Command::new("sha256sum")
@@ -116,7 +122,7 @@ fn a_beta_tag_names_the_archive() {
 }
 
 #[test]
-fn install_in_an_empty_prefix_puts_only_the_binary_there_and_leaves_the_user_alone() {
+fn install_in_an_empty_prefix_puts_the_binary_and_the_desktop_entry_and_leaves_the_user_alone() {
     let work = Work::new("install");
     let folder = unpacked(&work.0, "v0.1.0");
     let prefix = work.0.join("prefix");
@@ -143,6 +149,12 @@ fn install_in_an_empty_prefix_puts_only_the_binary_there_and_leaves_the_user_alo
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     assert_eq!(in_bin, ["missive"]);
+    // The desktop entry is in the user's data folder, not in the prefix.
+    assert!(
+        data(&work.0)
+            .join("applications/missive-mailto.desktop")
+            .is_file()
+    );
     // Not a file in the home folder: no configuration, no local copy, no keyring.
     assert!(fs::read_dir(work.0.join("home")).unwrap().next().is_none());
 }
@@ -227,4 +239,119 @@ fn the_beta_version_refuses_a_run_that_is_not_a_positive_number() {
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{bad:?}");
     }
+}
+
+/// The keys of the `[Desktop Entry]` group of a desktop entry.
+fn entry(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut in_group = false;
+    let mut keys = std::collections::BTreeMap::new();
+    for line in text
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        if line.starts_with('[') {
+            in_group = line == "[Desktop Entry]";
+        } else if in_group {
+            let (key, value) = line.split_once('=').expect("a key=value line");
+            assert!(
+                keys.insert(key.to_owned(), value.to_owned()).is_none(),
+                "{key} is given twice"
+            );
+        }
+    }
+    keys
+}
+
+#[test]
+fn the_desktop_entry_makes_missive_a_handler_of_mailto_links_and_is_valid() {
+    let path = root().join("dist/missive-mailto.desktop");
+    let text = fs::read_to_string(&path).unwrap();
+    let keys = entry(&text);
+    assert_eq!(keys["Type"], "Application");
+    assert!(!keys["Name"].is_empty());
+    assert_eq!(keys["Exec"], "missive mailto %u");
+    assert_eq!(keys["MimeType"], "x-scheme-handler/mailto;");
+    // Only a handler: it is not listed in menus, and opens no terminal.
+    assert_eq!(keys["NoDisplay"], "true");
+    assert_eq!(keys["Terminal"], "false");
+    assert!(keys["Categories"].ends_with(';'));
+
+    // The reference validator when the machine has it (the package desktop-file-utils).
+    if Command::new("desktop-file-validate")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        run(Command::new("desktop-file-validate").arg(&path));
+    }
+}
+
+#[test]
+fn install_writes_the_desktop_entry_with_the_installed_program_and_tells_how_to_make_it_the_default()
+ {
+    let work = Work::new("desktop");
+    let folder = unpacked(&work.0, "v0.1.0");
+    let prefix = work.0.join("prefix");
+    // A stand-in `xdg-mime` that records being called: install.sh must only say how.
+    let tools = work.0.join("tools");
+    fs::create_dir(&tools).unwrap();
+    let called = work.0.join("xdg-mime-called");
+    let stand_in = tools.join("xdg-mime");
+    fs::write(
+        &stand_in,
+        format!("#!/bin/sh\necho \"$@\" >> '{}'\n", called.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&stand_in, fs::Permissions::from_mode(0o755)).unwrap();
+    let home = work.0.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let output = run(Command::new("sh")
+        .arg(folder.join("install.sh"))
+        .env_clear()
+        .env(
+            "PATH",
+            format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", data(&work.0))
+        .env("PREFIX", &prefix));
+    let said = String::from_utf8(output.stdout).unwrap();
+
+    let installed = data(&work.0).join("applications/missive-mailto.desktop");
+    let keys = entry(&fs::read_to_string(&installed).unwrap());
+    // A launcher does not always have ~/.local/bin in its PATH.
+    assert_eq!(
+        keys["Exec"],
+        format!("\"{}\" mailto %u", prefix.join("bin/missive").display())
+    );
+    assert_eq!(keys["MimeType"], "x-scheme-handler/mailto;");
+    assert!(
+        said.contains("xdg-mime default missive-mailto.desktop x-scheme-handler/mailto"),
+        "{said}"
+    );
+    assert!(!called.exists(), "install.sh ran xdg-mime");
+    // Nothing else of the data folder was made.
+    let in_applications: Vec<_> = fs::read_dir(data(&work.0).join("applications"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(in_applications, ["missive-mailto.desktop"]);
+}
+
+#[test]
+fn without_xdg_data_home_the_desktop_entry_goes_under_the_home_folder() {
+    let work = Work::new("desktop-home");
+    let folder = unpacked(&work.0, "v0.1.0");
+    let home = work.0.join("home");
+    fs::create_dir_all(&home).unwrap();
+    run(Command::new("sh")
+        .arg(folder.join("install.sh"))
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("HOME", &home)
+        .env("PREFIX", work.0.join("prefix")));
+    assert!(
+        home.join(".local/share/applications/missive-mailto.desktop")
+            .is_file()
+    );
 }
