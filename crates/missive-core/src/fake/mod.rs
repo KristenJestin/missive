@@ -42,7 +42,8 @@
 //! of an answer, ends an answer short but with its `OK` ([`FakeServer::truncate`]), refuses
 //! one message ([`FakeServer::refuse_uid`]), answers nothing ([`Builder::stall`]), `BAD`
 //! ([`Builder::bad`]) or a bare `BAD` ([`Builder::bare_bad`]), or takes an appended message and
-//! drops the client before answering ([`FakeServer::cut_after_append`]).
+//! drops the client before answering ([`FakeServer::cut_after_append`]) or answers nothing
+//! ([`FakeServer::stall_after_append`]).
 //!
 //! The SMTP side serves `EHLO`/`HELO`, `STARTTLS`, `AUTH PLAIN` and `AUTH LOGIN` (offered only
 //! over TLS; [`Builder::smtp_login_only`] drops `PLAIN`), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP`
@@ -632,6 +633,15 @@ impl FakeServer {
             .push(Rule::new("APPEND", Action::CutAfterAppend));
     }
 
+    /// Takes the message of every `APPEND`, as a server does, then answers nothing, the
+    /// connection left open: the client cannot know it was appended. Until [`FakeServer::heal`].
+    pub fn stall_after_append(&self) {
+        self.shared
+            .state()
+            .rules
+            .push(Rule::new("APPEND", Action::StallAfterAppend));
+    }
+
     /// Waits `delay` before answering every SMTP command that starts with `command`, like a slow
     /// server. Until [`FakeServer::heal`].
     pub fn smtp_delay(&self, command: &str, delay: Duration) {
@@ -793,6 +803,8 @@ enum Action {
     Truncate(usize),
     /// Takes the message of an `APPEND`, then closes the connection without answering it.
     CutAfterAppend,
+    /// Takes the message of an `APPEND`, then answers nothing.
+    StallAfterAppend,
 }
 
 impl State {

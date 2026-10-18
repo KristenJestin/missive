@@ -1056,3 +1056,22 @@ async fn a_message_waiting_for_a_retry_does_not_hold_back_the_others() {
     .await;
     assert_eq!(bodies(&server), ["second", "first"]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_killed_during_the_sent_append_does_not_append_it_twice() {
+    let server = mailbox().start().await;
+    let (env, mut daemon) = started(&Setup::of(&server)).await;
+    server.stall_after_append();
+    succeeded(&env.compose(&["--body", BODY]).await);
+    eventually(20, "the copy taken by the server", || {
+        server.uids("Sent").len() == 1
+    })
+    .await;
+    daemon.kill().await;
+    server.heal();
+
+    let _restarted = env.daemon().await;
+
+    eventually(20, "the outbox empty", || env.outbox().is_empty()).await;
+    assert_eq!(server.uids("Sent").len(), 1);
+}

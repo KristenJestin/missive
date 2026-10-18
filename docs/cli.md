@@ -811,8 +811,9 @@ with the `sent` role) over IMAP, flagged `\Seen`, unless the account was added w
 recipients, in a `Bcc:` header: it is the user's own record, as in every mail client; what the
 recipients got never names them. A server that saves sent mail itself keeps what it was sent,
 without them. An account without a Sent folder gets no copy (the `sent` event says so): Missive
-never creates a folder. Appending is tried again when it fails, up to five times; an append whose
-answer was lost is looked for in Sent by its `Message-ID` before it is tried again.
+never creates a folder. Appending is tried again when it fails, up to five times; every try
+after the first (an append whose answer was lost, or one a killed daemon left) first looks for the
+message in Sent by its `Message-ID`.
 
 ### `missive mailto <uri> [--account <id>] [--json]`
 

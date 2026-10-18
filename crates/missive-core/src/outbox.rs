@@ -24,9 +24,10 @@
 //!
 //! The copy in Sent is appended by the account's IMAP connection, through the verified write
 //! path (`APPEND` counts only with its tagged `OK`), flagged `\Seen`, with the message's Bcc
-//! recipients in it (see [`crate::compose`]). A try whose answer was lost may have appended it:
-//! before trying again, the Sent folder is searched for its `Message-ID`. Missive never creates a
-//! Sent folder. After [`MAX_ATTEMPTS`] failures the copy is given up (the message was sent).
+//! recipients in it (see [`crate::compose`]). A try whose answer was lost, or that a killed daemon
+//! left, may have appended it: each try is counted before its `APPEND`, and every try after the
+//! first searches the Sent folder for its `Message-ID` first. Missive never creates a Sent folder.
+//! After [`MAX_ATTEMPTS`] tries the copy is given up (the message was sent).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -216,6 +217,7 @@ async fn copy_each(
             });
             continue;
         };
+        let attempts = store.copy_trying(id)?;
         let tried = tokio::time::timeout(timeout, async {
             if copy.attempts > 0 && already_there(session, &name, &copy.message_id).await? {
                 return Ok(Done::Ok(None));
@@ -226,11 +228,11 @@ async fn copy_each(
         let done = match tried {
             Ok(Ok(done)) => done,
             Ok(Err(error)) => {
-                failed(store, id, copies)?;
+                failed(store, id, attempts, copies)?;
                 return Err(error);
             }
             Err(_) => {
-                failed(store, id, copies)?;
+                failed(store, id, attempts, copies)?;
                 copies.timed_out = true;
                 return Err(SyncError::Connection(ConnectError::Unreachable(
                     "the IMAP server did not answer APPEND in time".to_owned(),
@@ -250,15 +252,19 @@ async fn copy_each(
                     why: "the server has no such Sent folder",
                 });
             }
-            Done::No { .. } | Done::Bad => failed(store, id, copies)?,
+            Done::No { .. } | Done::Bad => failed(store, id, attempts, copies)?,
         }
     }
     Ok(())
 }
 
-/// Counts a failed copy, and gives it up after [`MAX_ATTEMPTS`].
-fn failed(store: &mut Store, id: i64, copies: &mut Copies) -> rusqlite::Result<()> {
-    let attempts = store.copy_failed(id)?;
+/// A copy that failed at its `attempts`-th try: given up after [`MAX_ATTEMPTS`].
+fn failed(
+    store: &mut Store,
+    id: i64,
+    attempts: u32,
+    copies: &mut Copies,
+) -> rusqlite::Result<()> {
     if attempts >= MAX_ATTEMPTS {
         store.copy_done(id)?;
         copies.copied.push(Copied::GivenUp {

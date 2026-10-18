@@ -25,7 +25,8 @@ pub struct SentCopy {
     pub message_id: String,
     /// The message as it goes in Sent: its Bcc header, then the message sent.
     pub raw: Vec<u8>,
-    /// How many times appending it failed so far.
+    /// How many times appending it was started so far: a try a killed daemon left without its
+    /// answer counts.
     pub attempts: u32,
 }
 
@@ -279,8 +280,10 @@ impl Store {
             .collect()
     }
 
-    /// A copy that could not be appended this time; returns how many times it failed.
-    pub fn copy_failed(&self, id: i64) -> rusqlite::Result<u32> {
+    /// A copy about to be appended; returns how many times appending it was started, this one
+    /// included. Counted before the `APPEND`, so that a daemon killed during it leaves the next
+    /// one to look in Sent first.
+    pub fn copy_trying(&self, id: i64) -> rusqlite::Result<u32> {
         self.connection.query_row(
             "UPDATE outbox SET copy_attempts = copy_attempts + 1 WHERE id = ?1
              RETURNING copy_attempts",
@@ -472,7 +475,7 @@ mod tests {
             copies[0].raw,
             b"Bcc: <hidden@example.net>\r\nSubject: 1\r\n\r\nHello\r\n"
         );
-        assert_eq!(store.copy_failed(one).unwrap(), 1);
+        assert_eq!(store.copy_trying(one).unwrap(), 1);
         assert_eq!(store.sent_copies(account).unwrap()[0].attempts, 1);
         store.copy_done(one).unwrap();
         assert!(states(&store).is_empty());
