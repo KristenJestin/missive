@@ -6,7 +6,7 @@
 //! public, not a secret). Reading accounts touches neither the network nor the keyring.
 
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -86,6 +86,15 @@ pub fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._@+-".contains(c))
 }
 
+/// What [`AccountStore::list`] found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Listing {
+    pub accounts: Vec<(String, Account)>,
+    /// The folder and the kind of error of each account that could not be read. Never the content
+    /// of its file.
+    pub skipped: Vec<(String, io::ErrorKind)>,
+}
+
 /// The accounts in a config folder.
 pub struct AccountStore {
     root: PathBuf,
@@ -137,14 +146,16 @@ impl AccountStore {
             .map_err(|e| invalid(&path, e.message()))
     }
 
-    /// Every account, by identifier.
-    pub fn list(&self) -> io::Result<Vec<(String, Account)>> {
+    /// Every account, by identifier. An account whose `account.toml` cannot be read or is invalid
+    /// does not stop the others: it is left in [`Listing::skipped`].
+    pub fn list(&self) -> io::Result<Listing> {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Listing::default()),
             Err(e) => return Err(e),
         };
         let mut accounts = Vec::new();
+        let mut skipped = Vec::new();
         for entry in entries {
             let entry = entry?;
             let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
@@ -154,12 +165,15 @@ impl AccountStore {
             if !valid_id(&id) || !entry.file_type()?.is_dir() {
                 continue;
             }
-            if let Some(account) = self.get(&id)? {
-                accounts.push((id, account));
+            match self.get(&id) {
+                Ok(Some(account)) => accounts.push((id, account)),
+                Ok(None) => {}
+                Err(e) => skipped.push((id, e.kind())),
             }
         }
         accounts.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(accounts)
+        skipped.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Listing { accounts, skipped })
     }
 
     /// The certificate pinned for an account, if the user imported one.
@@ -190,14 +204,18 @@ impl AccountStore {
             ));
         }
         std::fs::create_dir_all(&self.root)?;
-        let staging = self.root.join(format!(".{id}.new"));
+        // Unique to the process: two `account add` of one id do not write into the same folder.
+        let staging = self.root.join(format!(".{id}.{}.new", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
         std::fs::create_dir(&staging)?;
         let written = (|| {
             let text = toml::to_string(account).map_err(|e| invalid(&staging, &e.to_string()))?;
-            std::fs::write(staging.join("account.toml"), text)?;
+            write_synced(&staging.join("account.toml"), text.as_bytes())?;
             if let Some(certificate) = certificate {
-                std::fs::write(staging.join("certificate.pem"), pem(certificate))?;
+                write_synced(
+                    &staging.join("certificate.pem"),
+                    pem(certificate).as_bytes(),
+                )?;
             }
             std::fs::rename(&staging, &folder)
         })();
@@ -224,6 +242,14 @@ pub fn read_certificate(pem: &[u8]) -> Result<CertificateDer<'static>, String> {
         .next()
         .ok_or_else(|| "it holds no PEM certificate".to_owned())?
         .map_err(|e| format!("it is not a valid PEM certificate ({e})"))
+}
+
+/// Writes a file and waits for the disk to have it, so that the rename which publishes the
+/// folder never shows an empty file after a crash.
+fn write_synced(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
 }
 
 fn pem(certificate: &CertificateDer<'_>) -> String {
@@ -264,6 +290,23 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_account_is_skipped_and_named_by_its_folder_and_the_kind_of_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AccountStore::new(dir.path());
+        let broken = dir.path().join("accounts/broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("account.toml"), "not toml [").unwrap();
+
+        let listing = store.list().unwrap();
+
+        assert!(listing.accounts.is_empty());
+        assert_eq!(
+            listing.skipped,
+            vec![("broken".to_owned(), io::ErrorKind::InvalidData)]
+        );
+    }
+
+    #[test]
     fn an_account_is_saved_listed_and_removed() {
         let dir = tempfile::tempdir().unwrap();
         let store = AccountStore::new(dir.path());
@@ -287,13 +330,13 @@ mod tests {
         store.save("alice", &account, Some(&certificate)).unwrap();
 
         assert_eq!(
-            store.list().unwrap(),
+            store.list().unwrap().accounts,
             vec![("alice".to_owned(), account.clone())]
         );
         assert_eq!(store.certificate("alice").unwrap(), Some(certificate));
         assert!(store.save("alice", &account, None).is_err());
         assert!(store.remove("alice").unwrap());
-        assert_eq!(store.list().unwrap(), Vec::new());
+        assert_eq!(store.list().unwrap().accounts, Vec::new());
         assert!(!store.remove("alice").unwrap());
     }
 }

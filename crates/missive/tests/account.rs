@@ -467,6 +467,57 @@ async fn account_list_json_follows_the_documented_format() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn one_broken_account_is_skipped_by_list_and_the_others_are_listed() {
+    let setup = Setup::new().await;
+    let certificate = setup.certificate_file();
+    succeeded(&setup.add_with_certificate().await);
+    succeeded(
+        &setup
+            .add(
+                &[
+                    "--certificate",
+                    certificate.to_str().unwrap(),
+                    "--id",
+                    "broken",
+                ],
+                PASSWORD,
+            )
+            .await,
+    );
+    std::fs::write(
+        setup.config().join("missive/accounts/broken/account.toml"),
+        "name = \"Content-That-Must-Not-Be-Echoed\n",
+    )
+    .unwrap();
+
+    let text = setup.run(&["account", "list"]).await;
+    let json = setup.run(&["account", "list", "--json"]).await;
+
+    for output in [&text, &json] {
+        succeeded(output);
+        let stderr = stderr(output);
+        assert!(stderr.contains("broken"), "{stderr}");
+        assert!(stderr.contains("invalid"), "{stderr}");
+        assert!(
+            !stderr.contains("Content-That-Must-Not-Be-Echoed"),
+            "{stderr}"
+        );
+        assert!(!stdout(output).contains("Content-That-Must-Not-Be-Echoed"));
+    }
+    let text = stdout(&text);
+    assert!(text.contains(USER), "{text}");
+    assert!(!text.contains("broken"), "{text}");
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    let ids: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|account| account["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [USER]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_chosen_id_names_the_account() {
     let setup = Setup::new().await;
     let certificate = setup.certificate_file();

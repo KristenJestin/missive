@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use missive_core::account::{
-    Account, AccountStore, Password, Security, Server, read_certificate, valid_id,
+    Account, AccountStore, Listing, Password, Security, Server, read_certificate, valid_id,
 };
 use missive_core::connect::{ConnectError, check_imap, check_smtp, client_config};
 use missive_core::keyring::Keyring;
@@ -222,7 +222,13 @@ struct Listed<'a> {
 
 fn list(json: bool) -> Result<()> {
     let store = AccountStore::from_env()?;
-    let accounts = store.list()?;
+    let Listing { accounts, skipped } = store.list()?;
+    // On stderr, so that the JSON on stdout stays valid.
+    for (id, kind) in &skipped {
+        eprintln!(
+            "missive: skipped the account folder {id}: its account.toml is unusable ({kind})"
+        );
+    }
     if json {
         let mut listed = Vec::new();
         for (id, account) in &accounts {
