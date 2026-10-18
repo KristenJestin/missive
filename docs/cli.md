@@ -796,12 +796,40 @@ A message stays in the outbox until its server took it, in one of these states:
 | `claimed` | the daemon is sending it, and has not yet written its end of data: the server cannot have taken it. A daemon killed then puts it back in `queued` when it starts again |
 | `sending` | its end of data is being written |
 | `sent` | the server took it (its `250` to the end of data); only its copy in Sent is left to append. Without one to append, the message leaves the outbox at once |
-| `failed` | the server refused it for good (`5xx` to `MAIL FROM`, a `RCPT TO`, `DATA` or the end of data). It stays, shown by `status`, and is never sent again |
-| `uncertain` | the connection was lost after its end of data and before the server's answer (or the daemon was killed then): the server may have taken it. It stays, shown by `status`, and is never sent again by itself: a message delivered twice is worse than a question |
+| `failed` | the server refused it for good (`5xx` to `MAIL FROM`, a `RCPT TO`, `DATA` or the end of data). It stays, shown by `status` and `missive outbox`, and is sent again only by `missive outbox resend` |
+| `uncertain` | the connection was lost after its end of data and before the server's answer (or the daemon was killed then): the server may have taken it. It stays, shown by `status` and `missive outbox`, and is never sent again by itself: a message delivered twice is worse than a question. Only `missive outbox resend <n> --yes` sends it again |
 
 Messages are sent one at a time, in the order they were written, each when its time has come: a
 message that waits for a new try holds back none of the others. `missive watch` tells when a
 message is `sent`, `send-failed` or `send-uncertain` (`docs/events.md`).
+
+#### `missive outbox [--json]`, `missive outbox resend <n> [--yes]`, `missive outbox discard <n>`
+
+`missive outbox` lists every message of the outbox, of every account, oldest first, one per line:
+its number, its account, its state, when it was written and its last error. It reads the local
+copy only. With `--json`, standard output is one JSON array, on one line:
+
+```json
+[{"account": "alice", "outbox": 3, "state": "failed", "message_id": "9c1f…@example.org",
+  "queued_at": 1790000000, "attempts": 0,
+  "last_error": "the server answered 550 to RCPT TO"}]
+```
+
+| Field | Type | |
+|---|---|---|
+| `account` | string | the account's identifier |
+| `outbox` | number | the message's number in the outbox, as `compose --json` printed it |
+| `state` | string | as in the table above |
+| `message_id` | string | its `Message-ID`, without angle brackets |
+| `queued_at` | number | when it was written, in seconds since the epoch |
+| `attempts` | number | the tries that failed before the end of its data |
+| `last_error` | string or `null` | for people |
+
+`missive outbox resend <n>` puts a `failed` message back in the queue, to send at once (it is sent
+once, as any other). An `uncertain` message may have arrived already: resending it needs `--yes`,
+and its recipients may then get it twice. `missive outbox discard <n>` removes a `failed` or
+`uncertain` message for good. Both go through the daemon (starting it when none runs), are
+refused for a message in another state, and exit with 3 when no message has that number.
 
 #### The copy in Sent
 

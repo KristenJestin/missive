@@ -343,6 +343,59 @@ pub fn status(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// A message of the outbox, as `missive outbox` lists it.
+#[derive(Serialize)]
+struct Queued {
+    account: String,
+    outbox: i64,
+    state: String,
+    message_id: String,
+    queued_at: i64,
+    attempts: u32,
+    last_error: Option<String>,
+}
+
+/// `missive outbox`: every message of the outbox, of every account, oldest first; those
+/// `failed` or `uncertain` are the ones to resend or discard.
+pub fn outbox(json: bool) -> Result<()> {
+    let configured = configured()?;
+    let mut listed = Vec::new();
+    if let Some(copy) = open()? {
+        for account in configured {
+            for message in copy.outbox(&account).map_err(|e| e.to_string())? {
+                listed.push(Queued {
+                    account: account.clone(),
+                    outbox: message.id,
+                    state: message.state,
+                    message_id: message.message_id,
+                    queued_at: message.queued_at,
+                    attempts: message.attempts,
+                    last_error: message.last_error,
+                });
+            }
+        }
+    }
+    listed.sort_by_key(|message| message.outbox);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&listed).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    for message in &listed {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            message.outbox,
+            message.account,
+            message.state,
+            utc(message.queued_at),
+            message.last_error.as_deref().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct Unread {
     total: u64,

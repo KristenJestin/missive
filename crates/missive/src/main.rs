@@ -3,6 +3,7 @@ mod compose;
 mod daemon;
 mod mailto;
 mod open;
+mod outbox;
 mod read;
 mod watch;
 
@@ -96,6 +97,9 @@ enum Command {
     /// with --send sent (through the outbox, at once, and as soon as the server can be reached).
     /// --draft picks a draft up again. Starts the daemon when none runs.
     Compose(compose::ComposeArgs),
+    /// List the messages of the outbox, or resend or discard one the server refused (failed) or
+    /// that may have been sent (uncertain). Listing reads the local copy only.
+    Outbox(outbox::OutboxArgs),
     /// Compose from a mailto: link, as the system's default handler for them: saved as a draft
     /// (see docs/cli.md). Starts the daemon when none runs.
     Mailto(mailto::MailtoArgs),
@@ -245,6 +249,7 @@ async fn main() -> ExitCode {
         Command::Delete(args) => acted(act::delete(args).await),
         Command::Compose(args) => acted(compose::run(args).await),
         Command::Mailto(args) => acted(mailto::run(args).await),
+        Command::Outbox(args) => acted(outbox::run(args).await),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

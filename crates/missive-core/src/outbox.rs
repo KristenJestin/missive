@@ -17,10 +17,14 @@
 //!   to the Sent folder. Without a copy to write (the account says its server keeps one, or it
 //!   has no Sent folder) the message leaves the outbox at once.
 //! - `failed`: the server refused it for good (`5xx` to `MAIL FROM`, a `RCPT TO`, `DATA` or the
-//!   end of data). It stays, reported by `status`, and is never sent again.
+//!   end of data). It stays, reported by `status`, and is never sent again by itself.
 //! - `uncertain`: the connection was lost (or the server stayed silent) after the end of data,
 //!   before its answer. The server may have taken it: it stays, reported, and is never sent again
 //!   by itself, since a message delivered twice is worse than a question.
+//!
+//! The user can put a `failed` or `uncertain` message back in the queue, or remove it
+//! ([`crate::store::Store::resend`], [`crate::store::Store::discard`]): `missive outbox`. A
+//! resent message is claimed as any other, so it goes once.
 //!
 //! After the server's `250`, recording that it was sent is tried again for a while when the copy
 //! is busy: a row left `sending` would be reported `uncertain` by the next daemon, for a message

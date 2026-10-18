@@ -101,7 +101,7 @@ mod outbox;
 mod queue;
 
 pub use drafts::{DraftRow, Stored};
-pub use outbox::{Left, SentCopy, ToSend};
+pub use outbox::{Left, Retaken, SentCopy, ToSend};
 pub use queue::{Action, ActionFolder};
 
 /// The local copy, opened for writing.

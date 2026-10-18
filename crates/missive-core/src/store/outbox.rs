@@ -30,6 +30,19 @@ pub struct SentCopy {
     pub attempts: u32,
 }
 
+/// What became of a [`Store::resend`] or a [`Store::discard`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Retaken {
+    /// Done; the message's account, by identifier.
+    Done(String),
+    /// The message may have reached its server: resending it is to be asked for explicitly.
+    Uncertain,
+    /// The message is in another state than `failed` or `uncertain`, named.
+    Not(String),
+    /// No message of the outbox has this number.
+    Unknown,
+}
+
 /// The longest wait before a message is tried again, in milliseconds.
 const RETRY_MAX: i64 = 5 * 60 * 1000;
 
@@ -181,6 +194,57 @@ impl Store {
             params![id, why, now, RETRY_MAX],
         )?;
         Ok(())
+    }
+
+    /// Puts a `failed` message, or with `uncertain_too` an `uncertain` one, back in the queue,
+    /// to send at once. Only the user asks for it: an `uncertain` message may have reached the
+    /// server already. In one statement, so that the message is queued once.
+    pub fn resend(&self, id: i64, uncertain_too: bool) -> rusqlite::Result<Retaken> {
+        let resent = self
+            .connection
+            .query_row(
+                "UPDATE outbox SET state = 'queued', attempts = 0, next_attempt_at = 0,
+                        last_error = NULL
+                  WHERE id = ?1 AND (state = 'failed' OR (state = 'uncertain' AND ?2))
+                  RETURNING (SELECT id FROM account WHERE key = outbox.account)",
+                params![id, uncertain_too],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match resent {
+            Some(account) => Ok(Retaken::Done(account)),
+            None => self.not_retaken(id),
+        }
+    }
+
+    /// Removes a `failed` or `uncertain` message from the outbox, for good.
+    pub fn discard(&self, id: i64) -> rusqlite::Result<Retaken> {
+        let discarded = self
+            .connection
+            .query_row(
+                "DELETE FROM outbox WHERE id = ?1 AND state IN ('failed', 'uncertain')
+                  RETURNING (SELECT id FROM account WHERE key = outbox.account)",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match discarded {
+            Some(account) => Ok(Retaken::Done(account)),
+            None => self.not_retaken(id),
+        }
+    }
+
+    /// Why a message was not resent or discarded.
+    fn not_retaken(&self, id: i64) -> rusqlite::Result<Retaken> {
+        let state: Option<String> = self
+            .connection
+            .query_row("SELECT state FROM outbox WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?;
+        Ok(match state {
+            None => Retaken::Unknown,
+            Some(state) if state == "uncertain" => Retaken::Uncertain,
+            Some(state) => Retaken::Not(state),
+        })
     }
 
     /// The server refused the message for good.
@@ -402,6 +466,51 @@ mod tests {
         }
         store.send_again(one, "451", now).unwrap();
         assert_eq!(store.next_due(account).unwrap(), Some(now + 300_000));
+    }
+
+    #[test]
+    fn only_a_failed_or_uncertain_message_is_resent_or_discarded() {
+        let (_dir, store, account) = open();
+        let failed = store.enqueue(account, &built(1), true, None).unwrap();
+        let uncertain = store.enqueue(account, &built(2), true, None).unwrap();
+        let queued = store.enqueue(account, &built(3), true, None).unwrap();
+        store.send_failed(failed, "554").unwrap();
+        store.send_uncertain(uncertain, "cut").unwrap();
+
+        assert_eq!(
+            store.resend(queued, true).unwrap(),
+            Retaken::Not("queued".to_owned())
+        );
+        assert_eq!(
+            store.discard(queued).unwrap(),
+            Retaken::Not("queued".to_owned())
+        );
+        assert_eq!(store.resend(99, true).unwrap(), Retaken::Unknown);
+        assert_eq!(store.discard(99).unwrap(), Retaken::Unknown);
+        assert_eq!(store.resend(uncertain, false).unwrap(), Retaken::Uncertain);
+        assert_eq!(
+            store.resend(failed, false).unwrap(),
+            Retaken::Done("alice".to_owned())
+        );
+        assert_eq!(
+            store.resend(uncertain, true).unwrap(),
+            Retaken::Done("alice".to_owned())
+        );
+        // Queued again, to send at once.
+        assert_eq!(store.claim_next(account, 0).unwrap().unwrap().id, failed);
+        assert_eq!(store.claim_next(account, 0).unwrap().unwrap().id, uncertain);
+        store.send_failed(uncertain, "554").unwrap();
+        assert_eq!(
+            store.discard(uncertain).unwrap(),
+            Retaken::Done("alice".to_owned())
+        );
+        assert_eq!(
+            states(&store),
+            [
+                (failed, "claimed".to_owned()),
+                (queued, "queued".to_owned())
+            ]
+        );
     }
 
     #[test]

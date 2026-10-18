@@ -52,7 +52,7 @@ use missive_core::outbox::{self, Copied, Tried};
 use missive_core::protocol::{
     self, AccountState, Answer, Command, PROTOCOL, pid_path, read_request, runtime_dir, socket_path,
 };
-use missive_core::store::{SkippedFolder, Store};
+use missive_core::store::{Retaken, SkippedFolder, Store};
 use missive_core::sync::{self, Capabilities, Changes, Folder, Skip, SyncError};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -596,6 +596,73 @@ impl Daemon {
             } => self.record(name, &messages, Wanted::Delete { permanently }),
             Command::Send(send) => self.enqueue(send),
             Command::Draft(draft) => self.draft(draft),
+            Command::Resend { outbox, yes } => self.retake(name, outbox, yes),
+            Command::Discard { outbox } => self.retake(name, outbox, false),
+        }
+    }
+
+    /// Puts a `failed` or `uncertain` message of the outbox back in the queue and wakes its
+    /// account's SMTP worker (`resend`), or removes it (`discard`). Only the user asks for either;
+    /// an `uncertain` message is resent only with `yes`, since it may have arrived already.
+    fn retake(&self, name: &str, outbox: i64, yes: bool) -> Answer {
+        let resend = name == "resend";
+        self.reload();
+        let retaken = Store::open(&self.store).and_then(|store| {
+            if resend {
+                store.resend(outbox, yes)
+            } else {
+                store.discard(outbox)
+            }
+        });
+        let done = if resend { "resent" } else { "discarded" };
+        let account = match retaken {
+            Ok(Retaken::Done(account)) => account,
+            Ok(Retaken::Unknown) => {
+                return Answer::error(
+                    Some(name),
+                    "no-such-message",
+                    format!("no message {outbox} in the outbox (missive outbox lists them)"),
+                );
+            }
+            Ok(Retaken::Uncertain) => {
+                return Answer::error(
+                    Some(name),
+                    "uncertain",
+                    format!(
+                        "message {outbox} is uncertain: the server may have taken it already, so \
+                         it is resent only when asked with yes"
+                    ),
+                );
+            }
+            Ok(Retaken::Not(state)) => {
+                return Answer::error(
+                    Some(name),
+                    "not-failed",
+                    format!(
+                        "message {outbox} is {state}: only a failed or uncertain message can be \
+                         {done}"
+                    ),
+                );
+            }
+            Err(e) => {
+                log!("cannot write the outbox ({e})");
+                return Answer::error(
+                    Some(name),
+                    "failed",
+                    format!("the local copy could not be written ({e})"),
+                );
+            }
+        };
+        log!("message {outbox} of the outbox {done}, as asked");
+        if resend && let Some(sender) = locked(&self.senders).get(&account) {
+            let _ = sender.send(());
+        }
+        Answer {
+            protocol: PROTOCOL,
+            answer: Some(name.to_owned()),
+            ok: true,
+            outbox: Some(outbox),
+            ..Answer::default()
         }
     }
 
