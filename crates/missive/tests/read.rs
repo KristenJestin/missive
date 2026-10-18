@@ -2077,3 +2077,46 @@ async fn an_account_whose_settings_cannot_be_read_keeps_its_rows() {
 
     assert_eq!(rows_in_copy(&env.copy_path()), before);
 }
+
+/// Both ways the configuration can hold no account at all: its folder is gone (a wrong
+/// `XDG_CONFIG_HOME`, a folder unmounted) or it is there and empty.
+async fn no_account_configured_leaves_the_copy_and_its_queue_alone(folder_missing: bool) {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    {
+        let copy = rusqlite::Connection::open(env.copy_path()).unwrap();
+        copy.execute(
+            "INSERT INTO action (account, folder, uidvalidity, uids, kind)
+             SELECT folder.account, folder.id, 1, '[1]', 'read' FROM folder
+              WHERE folder.name = 'INBOX'",
+            [],
+        )
+        .unwrap();
+    }
+    let before = rows_in_copy(&env.copy_path());
+    assert_eq!(before["alice"][4], 1);
+    let accounts = env.path("config").join("missive");
+    let store = AccountStore::new(accounts.clone());
+    store.remove("alice").unwrap();
+    if folder_missing {
+        std::fs::remove_dir_all(&accounts).unwrap();
+    } else {
+        std::fs::create_dir_all(accounts.join("accounts")).unwrap();
+    }
+
+    // At the start of the daemon, then at a reload.
+    let mut daemon = env.daemon(&[]).await;
+    env.sync().await;
+    daemon.stop().await;
+
+    assert_eq!(rows_in_copy(&env.copy_path()), before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_configuration_folder_drops_nothing_from_the_copy() {
+    no_account_configured_leaves_the_copy_and_its_queue_alone(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configuration_with_no_account_drops_nothing_from_the_copy() {
+    no_account_configured_leaves_the_copy_and_its_queue_alone(false).await;
+}

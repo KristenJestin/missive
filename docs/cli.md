@@ -95,6 +95,9 @@ Removes the account's keyring entry, then its settings and certificate. The keyr
 if it is unavailable, the account stays whole and the command can be run again. Its mail leaves
 the local copy the next time the daemon starts or reloads the configuration (a `sync` does): the
 copy only, nothing is sent to the server. Until then the reading commands skip the account.
+Removing the last account leaves its rows in the copy until another account is configured: a
+configuration folder that is missing or empty is more likely a wrong or unmounted folder than a
+choice, and must not wipe the copy.
 
 ## The event stream
 

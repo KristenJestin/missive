@@ -270,7 +270,8 @@ struct Daemon {
 impl Daemon {
     /// Drops the accounts of the copy that the configuration no longer holds, with their mail:
     /// the copy only, nothing is sent to a server. An account whose settings cannot be read is
-    /// still configured, so it stays. Told to the watchers as a change of the unread counts.
+    /// still configured, so it stays; so do all of them when none is configured. Told to the
+    /// watchers as a change of the unread counts.
     fn forget_removed(&self, listing: &Listing) {
         let keep: Vec<String> = listing
             .accounts
@@ -278,6 +279,11 @@ impl Daemon {
             .map(|(id, _)| id.clone())
             .chain(listing.skipped.iter().map(|(id, _)| id.clone()))
             .collect();
+        // No account at all is more likely a wrong or unmounted configuration folder than the
+        // removal of the last account: its rows stay until another account is configured.
+        if keep.is_empty() {
+            return;
+        }
         let removed = Store::open(&self.store).and_then(|mut store| store.drop_unlisted(&keep));
         match removed {
             Ok(0) => {}
