@@ -23,7 +23,7 @@ fails.
 |---|---|---|
 | `--id` | the identifier | the address |
 | `--name` | the display name, as in `Alice Example <alice@example.org>` | asked |
-| `--address` | the address | asked |
+| `--address` | the address, plain (`name@example.org`, ASCII, no name or angle brackets): what the SMTP server gets in `MAIL FROM`, so it is checked as a recipient's is, before any login | asked |
 | `--imap-host`, `--smtp-host` | the server | asked |
 | `--imap-security`, `--smtp-security` | `tls` or `starttls` | `tls` |
 | `--imap-port` | the port | 993 with `tls`, 143 with `starttls` |

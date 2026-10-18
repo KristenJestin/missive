@@ -103,13 +103,25 @@ impl Setup {
         extra: &[&str],
         password: &str,
     ) -> Output {
+        self.add_as(USER, imap_port, smtp_port, extra, password)
+            .await
+    }
+
+    async fn add_as(
+        &self,
+        address: &str,
+        imap_port: &str,
+        smtp_port: &str,
+        extra: &[&str],
+        password: &str,
+    ) -> Output {
         let mut args = vec![
             "account",
             "add",
             "--name",
             "Alice Example",
             "--address",
-            USER,
+            address,
             "--imap-host",
             "127.0.0.1",
             "--imap-port",
@@ -766,6 +778,40 @@ async fn without_a_terminal_the_password_comes_only_from_password_stdin() {
         stderr(&output)
     );
     setup.nothing_saved();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_address_missive_cannot_send_from_is_refused_before_any_login() {
+    let setup = Setup::new().await;
+    let imap_port = setup.server.imap_starttls_addr().port().to_string();
+    let smtp_port = setup.server.smtp_tls_addr().port().to_string();
+
+    for address in [
+        "alice@example.org> SIZE=1",
+        "Alice <alice@example.org>",
+        "alice example.org",
+        "alice@exämple.org",
+        "alice@example.org\r\nRCPT TO:<eve@example.com>",
+    ] {
+        let output = setup
+            .add_as(
+                address,
+                &imap_port,
+                &smtp_port,
+                &["--id", "alice", "--user", USER],
+                PASSWORD,
+            )
+            .await;
+
+        failed(&output);
+        assert!(stderr(&output).contains("address"), "{}", stderr(&output));
+        setup.nothing_saved();
+    }
+    assert!(
+        setup.server.imap_log().is_empty(),
+        "{:?}",
+        setup.server.imap_log()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

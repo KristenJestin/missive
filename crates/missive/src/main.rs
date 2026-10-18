@@ -15,6 +15,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use missive_core::account::{
     Account, AccountStore, Listing, Password, Security, Server, read_certificate, valid_id,
 };
+use missive_core::compose::Mailbox;
 use missive_core::connect::{ConnectError, check_imap, check_smtp, client_config};
 use missive_core::keyring::Keyring;
 use missive_core::protocol::{Answer, Command as Request, PROTOCOL};
@@ -286,6 +287,15 @@ async fn add(args: AddArgs) -> Result<()> {
     )?;
     let user = ask.value("User name", "--user", args.user, Some(address.clone()))?;
     ask.done()?;
+    // It goes into `MAIL FROM:<…>` as it is: checked as a recipient's address is.
+    if !Mailbox::parse(&address)
+        .is_ok_and(|mailbox| mailbox.name.is_none() && mailbox.address == address)
+    {
+        return Err(Failure(format!(
+            "{address:?} is not an address Missive can send from (name@example.org, ASCII \
+             only, without a name or angle brackets) (--address)"
+        )));
+    }
     let id = args.id.unwrap_or_else(|| address.clone());
     if !valid_id(&id) {
         return Err(Failure(format!(
