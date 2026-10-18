@@ -169,7 +169,8 @@ async fn login_imap(
 }
 
 /// A `NO` to `LOGIN` is a refusal of the credentials when it has no response code, or the code
-/// says so (RFC 5530: `AUTHENTICATIONFAILED`, `AUTHORIZATIONFAILED`). Any other code
+/// says so (RFC 5530: `AUTHENTICATIONFAILED`, `AUTHORIZATIONFAILED`, `EXPIRED`: all three are for
+/// the user to mend, by logging in again). Any other code
 /// (`UNAVAILABLE`, which a bridge answers while it starts, for one) says the server cannot log
 /// anyone in right now, which asking for the password again would not mend.
 fn login_refusal(text: &str) -> ConnectError {
@@ -184,7 +185,9 @@ fn login_refusal(text: &str) -> ConnectError {
         None => Some("a code"),
     };
     match code.map(str::to_ascii_uppercase).as_deref() {
-        None | Some("AUTHENTICATIONFAILED" | "AUTHORIZATIONFAILED") => ConnectError::AuthRefused,
+        None | Some("AUTHENTICATIONFAILED" | "AUTHORIZATIONFAILED" | "EXPIRED") => {
+            ConnectError::AuthRefused
+        }
         Some(_) => ConnectError::Unreachable(
             "the IMAP server cannot log in now (it refused with a code other than a wrong \
              user name or password)"

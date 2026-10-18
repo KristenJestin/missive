@@ -191,7 +191,7 @@ pub struct Builder {
     users: Vec<(String, String)>,
     folders: Vec<Folder>,
     without_condstore: bool,
-    imap_login_unavailable: bool,
+    imap_login_no: Option<String>,
     smtp_login_only: bool,
     fetch_delay: Duration,
     idle_keepalive: Duration,
@@ -219,11 +219,18 @@ impl Builder {
         self
     }
 
+    /// Answers every IMAP `LOGIN` `NO <text>`, whatever the credentials. `text` is what follows
+    /// `NO`: with a response code (`[EXPIRED] the password has expired`, RFC 5530) or without
+    /// (`login refused`).
+    pub fn imap_login_no(mut self, text: &str) -> Self {
+        self.imap_login_no = Some(text.to_owned());
+        self
+    }
+
     /// Answers every IMAP `LOGIN` `NO [UNAVAILABLE]` (RFC 5530), as a bridge does while it is
     /// starting, whatever the credentials.
-    pub fn imap_login_unavailable(mut self) -> Self {
-        self.imap_login_unavailable = true;
-        self
+    pub fn imap_login_unavailable(self) -> Self {
+        self.imap_login_no("[UNAVAILABLE] try again in a moment")
     }
 
     /// Offers only `AUTH LOGIN` on SMTP, not `PLAIN`. As some servers do, it then refuses an
@@ -319,7 +326,7 @@ impl Builder {
             }),
             changes: watch::channel(()).0,
             condstore: !self.without_condstore,
-            imap_login_unavailable: self.imap_login_unavailable,
+            imap_login_no: self.imap_login_no,
             smtp_login_only: self.smtp_login_only,
             fetch_delay: self.fetch_delay,
             idle_keepalive: self.idle_keepalive,
@@ -531,7 +538,7 @@ struct Shared {
     /// Signalled after each change made by a test or a client, so that idling sessions look.
     changes: watch::Sender<()>,
     condstore: bool,
-    imap_login_unavailable: bool,
+    imap_login_no: Option<String>,
     smtp_login_only: bool,
     fetch_delay: Duration,
     idle_keepalive: Duration,

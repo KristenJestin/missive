@@ -283,19 +283,27 @@ fn list(json: bool) -> Result<()> {
             "missive: skipped the account folder {id}: its account.toml is unusable ({kind})"
         );
     }
-    if json {
-        let mut listed = Vec::new();
-        for (id, account) in &accounts {
-            listed.push(Listed {
+    // Only this command reads the certificate, so a damaged one is skipped here: the daemon and
+    // `status`, `unread` and `search` need the account whether or not its certificate reads.
+    let mut listed = Vec::new();
+    for (id, account) in &accounts {
+        match store.certificate(id) {
+            Ok(certificate) => listed.push(Listed {
                 id,
                 account,
-                certificate: store.certificate(id)?.is_some(),
-            });
+                certificate: certificate.is_some(),
+            }),
+            Err(e) => eprintln!(
+                "missive: skipped the account folder {id}: its certificate.pem is unusable ({})",
+                e.kind()
+            ),
         }
+    }
+    if json {
         println!("{}", serde_json::to_string(&listed)?);
         return Ok(());
     }
-    for (id, account) in &accounts {
+    for Listed { id, account, .. } in &listed {
         println!(
             "{id}\t{} <{}>\timap {}\tsmtp {}",
             account.name,
