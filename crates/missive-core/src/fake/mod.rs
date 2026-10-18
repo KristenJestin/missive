@@ -50,6 +50,7 @@
 //!
 //! [`FakeKeyring`] is the keyring's counterpart: a fake Secret Service on a private session bus.
 
+mod bus;
 mod imap;
 mod keyring;
 mod smtp;

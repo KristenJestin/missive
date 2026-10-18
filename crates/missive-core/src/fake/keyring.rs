@@ -1,9 +1,6 @@
 //! A fake Secret Service on a private session bus: see [`FakeKeyring`].
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -11,6 +8,7 @@ use zbus::object_server::{ObjectServer, SignalEmitter};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, fdo, interface};
 
+use super::bus::Daemon;
 use crate::keyring::{ATTRIBUTES, LABEL, Secret};
 
 const COLLECTION: &str = "/org/freedesktop/secrets/collection/login";
@@ -45,23 +43,6 @@ pub enum PromptAnswer {
     Accept,
     /// The prompt completes with `dismissed = true` and the collection stays locked.
     Dismiss,
-}
-
-/// The private `dbus-daemon` and the folder of its socket, cleaned up on drop, wherever a panic
-/// happens after they exist.
-struct Daemon {
-    child: Option<Child>,
-    folder: PathBuf,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let _ = std::fs::remove_dir_all(&self.folder);
-    }
 }
 
 /// Whether the collection is locked, and what the user answers to the prompt that unlocks it.
@@ -118,32 +99,7 @@ impl FakeKeyring {
     }
 
     async fn start_with(lock: Lock) -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let folder = std::env::temp_dir().join(format!(
-            "missive-fake-keyring-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&folder).expect("a temporary folder");
-        let mut daemon = Daemon {
-            child: None,
-            folder: folder.clone(),
-        };
-        let config = folder.join("bus.conf");
-        std::fs::write(&config, bus_config(&folder)).expect("the bus configuration");
-        let child = Command::new("dbus-daemon")
-            .arg(format!("--config-file={}", config.display()))
-            .args(["--print-address", "--nofork"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("dbus-daemon (the dbus package) to run a private bus");
-        let child = daemon.child.insert(child);
-        let mut address = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut address)
-            .expect("the address of the private bus");
-        let address = address.trim().to_owned();
+        let (daemon, address) = Daemon::start();
 
         let items = Arc::new(Mutex::new(Vec::new()));
         let lock = Arc::new(lock);
@@ -194,29 +150,6 @@ impl FakeKeyring {
     pub fn items(&self) -> Vec<FakeItem> {
         lock(&self.items).iter().map(|s| s.item.clone()).collect()
     }
-}
-
-/// A session bus that anyone on it may use, without the system's service files.
-fn bus_config(folder: &std::path::Path) -> String {
-    format!(
-        r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
- "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig>
-  <type>session</type>
-  <listen>unix:dir={}</listen>
-  <auth>EXTERNAL</auth>
-  <policy context="default">
-    <allow send_destination="*"/>
-    <allow receive_type="method_call"/>
-    <allow receive_type="method_return"/>
-    <allow receive_type="error"/>
-    <allow receive_type="signal"/>
-    <allow own="*"/>
-  </policy>
-</busconfig>
-"#,
-        folder.display()
-    )
 }
 
 fn lock(items: &Mutex<Vec<StoredItem>>) -> MutexGuard<'_, Vec<StoredItem>> {
