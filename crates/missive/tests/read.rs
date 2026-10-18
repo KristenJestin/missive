@@ -2259,3 +2259,45 @@ async fn json_keeps_epoch_seconds_whatever_the_time_zone() {
     // 17 October 2026, 09:02 at +0200.
     assert_eq!(hits[0]["date"], 1_792_220_520);
 }
+
+/// A mailbox with one message whose subject and names are raw Latin-1 bytes, not encoded words.
+fn latin_1_mailbox() -> missive_core::fake::Builder {
+    let raw = b"From: Zo\xe9 M\xfcller <zoe.muller@example.org>\r\n\
+        To: Andr\xe9 <andre@example.net>\r\nSubject: Caf\xe9 Cr\xe8me \x80 5\r\n\
+        Message-ID: <latin@example.com>\r\nDate: Sat, 17 Oct 2026 09:30:00 +0200\r\n\
+        Content-Type: text/plain; charset=iso-8859-1\r\n\r\nBonjour\r\n"
+        .to_vec();
+    FakeServer::builder()
+        .user(USER, PASSWORD)
+        .folder(Folder::new("INBOX").message(Message::new(raw)))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_and_show_print_a_raw_latin_1_subject_and_names_right() {
+    let env = Env::filled_with(vec![("alice", latin_1_mailbox())]).await;
+
+    let listed = env.read(&["list"]).await;
+    let shown = env.read(&["show", &inbox_id(&env, 1).await]).await;
+
+    succeeded(&listed);
+    let line = stdout(&listed);
+    assert!(line.contains("\tZoé Müller\tCafé Crème € 5\n"), "{line}");
+    let text = stdout(&shown);
+    assert!(
+        text.starts_with("From: Zoé Müller <zoe.muller@example.org>\n"),
+        "{text}"
+    );
+    assert!(text.contains("\nTo: André <andre@example.net>\n"), "{text}");
+    assert!(text.contains("\nSubject: Café Crème € 5\n"), "{text}");
+    assert!(!text.contains('\u{fffd}') && !line.contains('\u{fffd}'));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_finds_a_raw_latin_1_subject_by_its_accented_word() {
+    let env = Env::filled_with(vec![("alice", latin_1_mailbox())]).await;
+
+    let hits = json(&env.read(&["search", "--json", "crème"]).await);
+
+    assert_eq!(hits[0]["subject"], "Café Crème € 5");
+    assert_eq!(hits[0]["from"][0]["name"], "Zoé Müller");
+}
