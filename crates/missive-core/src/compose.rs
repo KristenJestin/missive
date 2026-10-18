@@ -62,6 +62,15 @@ impl Mailbox {
         })
     }
 
+    /// `alice@example.org` or `"Alice Example" <alice@example.org>`: what [`Mailbox::parse`]
+    /// reads back.
+    pub fn to_text(&self) -> String {
+        match &self.name {
+            Some(name) => format!("\"{}\" <{}>", name.replace('"', ""), self.address),
+            None => self.address.clone(),
+        }
+    }
+
     fn header(&self) -> Address<'_> {
         Address::new_address(self.name.as_deref(), self.address.as_str())
     }
@@ -379,6 +388,23 @@ mod tests {
         ] {
             assert!(Mailbox::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_address_written_as_text_reads_back_the_same() {
+        for text in [
+            "zoe@example.com",
+            "Zoé Ça <zoe@example.com>",
+            "\"Doe, John\" <john@example.com>",
+        ] {
+            let parsed = mailbox(text);
+            assert_eq!(mailbox(&parsed.to_text()), parsed, "{text}");
+        }
+        let quoted = Mailbox {
+            name: Some("Say \"hi\"".to_owned()),
+            address: "a@example.com".to_owned(),
+        };
+        assert_eq!(mailbox(&quoted.to_text()).name.as_deref(), Some("Say hi"));
     }
 
     #[test]

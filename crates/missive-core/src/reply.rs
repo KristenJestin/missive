@@ -75,9 +75,15 @@ impl Original {
                 .flat_map(|address| address.iter())
                 .filter_map(|mailbox| {
                     let address = mailbox.address()?;
-                    Some(Mailbox::parse(address).map(|parsed| Mailbox {
-                        name: mailbox.name().map(str::to_owned).filter(|n| !n.is_empty()),
-                        address: parsed.address,
+                    Some(Mailbox::parse(address).map(|parsed| {
+                        Mailbox {
+                            // A name Missive would refuse to write is cleaned, not the reply lost.
+                            name: mailbox
+                                .name()
+                                .map(|name| name.replace(char::is_control, " ").trim().to_owned())
+                                .filter(|n| !n.is_empty()),
+                            address: parsed.address,
+                        }
                     }))
                 })
                 .collect()

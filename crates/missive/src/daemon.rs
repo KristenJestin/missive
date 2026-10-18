@@ -721,6 +721,10 @@ impl Daemon {
                     })
                     .collect();
             }
+            if request.draft.is_none() {
+                draft.in_reply_to = request.in_reply_to.clone();
+                draft.references = request.references.clone();
+            }
             if request.send {
                 draft.check()?;
             }
@@ -831,7 +835,8 @@ impl Daemon {
                         data: a.data,
                     })
                     .collect(),
-                ..Draft::default()
+                in_reply_to: send.in_reply_to,
+                references: send.references,
             })
         })();
         let built = match draft.and_then(|draft| compose::build(&account, &draft, now())) {
@@ -840,9 +845,13 @@ impl Daemon {
         };
         let queued = Store::open(&self.store).and_then(|store| {
             let key = store.account(&send.account)?;
+            let sent_copy = !account.server_saves_sent;
             Ok((
                 key,
-                store.enqueue(key, &built, !account.server_saves_sent, None)?,
+                match &send.answers {
+                    Some(answers) => store.enqueue_reply(key, &built, sent_copy, answers)?,
+                    None => store.enqueue(key, &built, sent_copy, None)?,
+                },
             ))
         });
         let (key, outbox) = match queued {

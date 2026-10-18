@@ -3,24 +3,43 @@
 //! the account's server can be reached (see docs/cli.md). `--draft` picks a draft up again: the
 //! fields given replace its own. The files to attach are read here, when the command runs: they
 //! may be gone by the time the message is sent.
+//!
+//! `--reply`, `--reply-all` and `--forward` start from a message of the local copy: what to put in
+//! the message (recipients, subject, quote, thread, the original attached) is worked out here
+//! from the copy, by `missive_core::reply`, and what the user gives replaces it. The daemon then
+//! gets an ordinary message to save or send.
 
 use std::io::Read;
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{ArgGroup, Args};
 use missive_core::account::AccountStore;
 use missive_core::compose::{Attachment, Draft, Mailbox};
 use missive_core::copy::MessageId;
 use missive_core::protocol::{Answer, Attached, Command, SaveDraft, Send};
+use missive_core::reply::{self, Mode, Original};
 use serde::Serialize;
 
 use crate::act::{self, ActError};
+use crate::read::{self, ShowError};
 
 #[derive(Args)]
+#[command(group(ArgGroup::new("answering").args(["reply", "reply_all", "forward"])))]
 pub struct ComposeArgs {
-    /// The account to send from, by identifier [default: the only account, or the draft's].
+    /// The account to send from, by identifier [default: the account of the message answered or
+    /// forwarded, or of the draft, else the only account].
     #[arg(long)]
     account: Option<String>,
+    /// Reply to this message's sender: its identifier, as missive search and list print it. The
+    /// recipients, subject, quote and thread are the message's; the fields given replace them.
+    #[arg(long, value_name = "MESSAGE ID", conflicts_with = "draft")]
+    reply: Option<String>,
+    /// Reply to this message's sender and to everyone it went to, but the account itself.
+    #[arg(long, value_name = "MESSAGE ID", conflicts_with = "draft")]
+    reply_all: Option<String>,
+    /// Forward this message: it goes along as an attachment, untouched.
+    #[arg(long, value_name = "MESSAGE ID", conflicts_with = "draft")]
+    forward: Option<String>,
     /// The draft to pick up again: its identifier as compose printed it, or a message
     /// identifier of the Drafts folder, as missive list prints it. The fields given replace its
     /// own; the others are kept.
@@ -67,15 +86,34 @@ struct Saved {
 }
 
 pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
+    let (mode, id) = match (&args.reply, &args.reply_all, &args.forward) {
+        (Some(id), _, _) => (Some(Some(Mode::Reply)), Some(id)),
+        (_, Some(id), _) => (Some(Some(Mode::ReplyAll)), Some(id)),
+        (_, _, Some(id)) => (Some(None), Some(id)),
+        _ => (None, None),
+    };
+    let stored = match id {
+        Some(id) => Some(read::message(id).map_err(|e| match e {
+            ShowError::NotFound(why) => ActError::NotFound(why),
+            ShowError::Failed(why) => ActError::Failed(why),
+        })?),
+        None => None,
+    };
     // A message identifier names its account.
     let named = match (
         &args.account,
         args.draft.as_deref().and_then(MessageId::parse),
+        &stored,
     ) {
-        (None, Some(id)) => Some(id.account),
-        (named, _) => named.clone(),
+        (None, Some(id), _) => Some(id.account),
+        (None, None, Some(stored)) => Some(stored.hit.account.clone()),
+        (named, _, _) => named.clone(),
     };
     let account = account(named)?;
+    let answering = match (stored, mode) {
+        (Some(stored), Some(mode)) => Some(answering(&account, stored, mode)?),
+        _ => None,
+    };
     let body = match (args.body_file, args.body) {
         (Some(path), _) => Some(
             std::fs::read(&path)
@@ -107,14 +145,25 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
             .ok_or_else(|| format!("{} names no file", path.display()))?;
         attachments.push(Attachment { name, data });
     }
+    // What the user gives replaces what the message answered suggests.
+    let a = answering.unwrap_or_default();
+    attachments.splice(0..0, a.attachment);
+    let to = if args.to.is_empty() { a.to } else { args.to };
+    let cc = if args.cc.is_empty() { a.cc } else { args.cc };
+    let subject = args.subject.or(a.subject);
+    let text = match &a.quote {
+        Some(quote) => reply::with_quote(body.as_deref().unwrap_or_default(), quote),
+        None => body.clone().unwrap_or_default(),
+    };
     let draft = Draft {
-        to: mailboxes(&args.to)?,
-        cc: mailboxes(&args.cc)?,
+        to: mailboxes(&to)?,
+        cc: mailboxes(&cc)?,
         bcc: mailboxes(&args.bcc)?,
-        subject: args.subject,
-        body: body.clone().unwrap_or_default(),
+        subject,
+        body: text,
         attachments,
-        ..Draft::default()
+        in_reply_to: a.in_reply_to,
+        references: a.references,
     };
     // What can be told here is told before the daemon is asked; a draft picked up again is
     // checked by the daemon, once its own fields are known.
@@ -135,12 +184,15 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         return send(
             Send {
                 account,
-                to: args.to,
-                cc: args.cc,
+                to,
+                cc,
                 bcc: args.bcc,
                 subject: draft.subject,
                 body: draft.body,
                 attachments: attached(draft.attachments),
+                in_reply_to: draft.in_reply_to,
+                references: draft.references,
+                answers: a.answers,
             },
             args.json,
         )
@@ -152,8 +204,8 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
     let answer = act::ask(Command::Draft(SaveDraft {
         account,
         draft: args.draft.clone(),
-        to: given(args.to),
-        cc: given(args.cc),
+        to: given(to),
+        cc: given(cc),
         bcc: given(args.bcc),
         subject: draft.subject,
         body: if args.draft.is_none() {
@@ -163,6 +215,8 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         },
         attachments: (args.draft.is_none() || !args.attach.is_empty())
             .then(|| attached(draft.attachments)),
+        in_reply_to: draft.in_reply_to,
+        references: draft.references,
         send: args.send,
     }))
     .await?;
@@ -192,6 +246,59 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         );
     }
     Ok(())
+}
+
+/// What the message answered or forwarded gives a new message.
+#[derive(Default)]
+struct Answering {
+    to: Vec<String>,
+    cc: Vec<String>,
+    subject: Option<String>,
+    /// The attribution and the quoted text, to put below the user's text.
+    quote: Option<String>,
+    in_reply_to: Vec<String>,
+    references: Vec<String>,
+    /// A forward: the message, to go along as it is.
+    attachment: Option<Attachment>,
+    /// A reply: the message to mark answered once the reply is sent.
+    answers: Option<String>,
+}
+
+/// Works out a reply (`Some(mode)`) or a forward (`None`) to `stored`, written from `account`.
+fn answering(
+    account: &str,
+    stored: missive_core::copy::Stored,
+    mode: Option<Mode>,
+) -> Result<Answering, ActError> {
+    let Some(mode) = mode else {
+        return Ok(Answering {
+            subject: Some(reply::forward_subject(stored.hit.subject.as_deref())),
+            attachment: Some(Attachment {
+                name: reply::forward_name(stored.hit.subject.as_deref()),
+                data: stored.raw,
+            }),
+            ..Answering::default()
+        });
+    };
+    let address = AccountStore::from_env()
+        .and_then(|store| store.get(account))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no account {account} (missive account list shows them)"))?
+        .address;
+    let original =
+        Original::read(&stored.raw).map_err(|e| format!("cannot answer {}: {e}", stored.hit.id))?;
+    let reply = reply::reply(&original, mode, &address);
+    let texts = |list: Vec<Mailbox>| list.iter().map(Mailbox::to_text).collect();
+    Ok(Answering {
+        to: texts(reply.to),
+        cc: texts(reply.cc),
+        subject: Some(reply.subject),
+        quote: Some(reply.quote),
+        in_reply_to: reply.in_reply_to,
+        references: reply.references,
+        answers: Some(stored.hit.id),
+        ..Answering::default()
+    })
 }
 
 fn mailboxes(list: &[String]) -> Result<Vec<Mailbox>, String> {
