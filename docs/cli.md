@@ -451,7 +451,10 @@ it, but the subject, which reads `(no subject)` when there is none), an empty li
 text: the text part, else the HTML reduced to its text (markup, styles and scripts left out; the
 paragraphs and line breaks stay, the addresses links go to do not: they are in `html`). The HTML
 is never interpreted. Control characters (the escape sequences that could move a terminal's
-cursor or change its title) are left out of the headers and the text.
+cursor or change its title) are left out of the headers and the text, and so are the Unicode
+format characters that reorder or hide text (a right-to-left override, the zero-width space, the
+byte order mark…); the zero-width joiner and non-joiner stay, as emoji and some scripts need
+them.
 
 ```
 From: Carol Sender <carol.sender@example.com>

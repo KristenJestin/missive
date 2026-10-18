@@ -1174,7 +1174,10 @@ async fn show_a_message_with_only_html_gives_it_as_written_and_prints_it_as_text
     assert!(!text.contains('<'), "{text}");
     assert!(!text.contains("color: red"), "{text}");
     assert!(!text.contains("never run"), "{text}");
-    assert!(text.contains("read it"), "{text}");
+    assert!(
+        text.contains("read it [https://example.net/read]"),
+        "{text}"
+    );
     assert!(
         text.lines()
             .any(|l| l.contains("Quokka waits") && !l.contains("Second paragraph")),
@@ -1333,6 +1336,48 @@ async fn show_does_not_print_the_control_characters_of_a_message_on_a_terminal()
     assert!(text.contains("Line one"), "{text:?}");
     // A tab and the line breaks are text.
     assert!(text.contains("Line\ttwo"), "{text:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_does_not_print_the_characters_that_make_text_look_like_something_else() {
+    // A right-to-left override, zero-width characters, an isolate and a byte order mark are no
+    // control characters, yet they hide or reorder what a person reads.
+    let tricky = Message::new(format!(
+        "From: Carol Sender <{SENDER}>\r\nSubject: Invoice\u{202e}fdp.exe\u{200b} 12\r\n\
+         Date: Sat, 17 Oct 2026 09:12:00 +0200\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Transfer-Encoding: 8bit\r\n\r\n\
+         Pay\u{202e}gnissim\u{202c} to\u{2066}x\u{2069} the\u{feff}\u{2060}\u{200e} account\r\n\
+         Caf\u{e9} cr\u{e8}me, \u{65e5}\u{672c}\u{8a9e}\r\n"
+    ));
+    let env = Env::filled_with(vec![(
+        "alice",
+        FakeServer::builder()
+            .user(USER, PASSWORD)
+            .folder(Folder::new("INBOX").message(tricky)),
+    )])
+    .await;
+    let id = inbox_id(&env, 1).await;
+
+    let output = env.read(&["show", &id]).await;
+
+    succeeded(&output);
+    let text = stdout(&output);
+    for hidden in [
+        '\u{202e}', '\u{202c}', '\u{200b}', '\u{2066}', '\u{2069}', '\u{feff}', '\u{2060}',
+        '\u{200e}',
+    ] {
+        assert!(!text.contains(hidden), "{hidden:?} in {text:?}");
+    }
+    assert!(text.contains("Invoice"), "{text:?}");
+    assert!(text.contains("account"), "{text:?}");
+    // Letters of every script and accents are text.
+    assert!(
+        text.contains("Caf\u{e9} cr\u{e8}me, \u{65e5}\u{672c}\u{8a9e}"),
+        "{text:?}"
+    );
+    // `list` prints the subject too.
+    let list = env.read(&["list"]).await;
+    assert!(!stdout(&list).contains('\u{202e}'), "{:?}", stdout(&list));
 }
 
 #[tokio::test(flavor = "multi_thread")]
