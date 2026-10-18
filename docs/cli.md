@@ -214,7 +214,7 @@ number of messages in the copy and what its outbox holds; and whether the daemon
 | `accounts[].skipped[].kind` | string | why: `refused` (the server answered `NO` to a command of the sync, for example `EXAMINE`) or `unusable` (it answered `OK` with something no sync can use: no `UIDVALIDITY` or `EXISTS`, a listing shorter than the folder) |
 | `accounts[].outbox` | array | the messages of the outbox, oldest first (see [Sending](#sending)) |
 | `accounts[].outbox[].id` | number | its number in the outbox, as `compose --json` printed it |
-| `accounts[].outbox[].state` | string | `queued`, `sending`, `sent` (its copy in Sent is still to be appended), `failed` or `uncertain` |
+| `accounts[].outbox[].state` | string | `queued`, `claimed`, `sending`, `sent` (its copy in Sent is still to be appended), `failed` or `uncertain` |
 | `accounts[].outbox[].message_id` | string | its `Message-ID`, without angle brackets |
 | `accounts[].outbox[].queued_at` | number | when it was written, in seconds since the epoch |
 | `accounts[].outbox[].attempts` | number | the tries that failed before the end of its data (tried again later) |
@@ -692,6 +692,7 @@ A message stays in the outbox until its server took it, in one of these states:
 | State | |
 |---|---|
 | `queued` | to send. A try that fails before the end of its data (a `4xx` answer, the server unreachable, the login or the certificate refused) leaves it here: the server took nothing, and it is tried again later, waiting longer each time (1 second, then twice as long, up to 5 minutes) |
+| `claimed` | the daemon is sending it, and has not yet written its end of data: the server cannot have taken it. A daemon killed then puts it back in `queued` when it starts again |
 | `sending` | its end of data is being written |
 | `sent` | the server took it (its `250` to the end of data); only its copy in Sent is left to append. Without one to append, the message leaves the outbox at once |
 | `failed` | the server refused it for good (`5xx` to `MAIL FROM`, a `RCPT TO`, `DATA` or the end of data). It stays, shown by `status`, and is never sent again |

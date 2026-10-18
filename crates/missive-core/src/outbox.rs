@@ -6,6 +6,9 @@
 //! - `queued`: to send. A try that fails before the end of data (a `4xx`, a connection lost, a
 //!   login refused, a certificate refused) leaves it `queued`: the server took nothing, so sending
 //!   it again is safe. The daemon tries again later, from a backoff.
+//! - `claimed`: a worker took it, before its first command: no other worker takes it. Nothing
+//!   was sent for it yet, so a daemon killed then leaves it to the next one, which puts it back
+//!   in the queue ([`crate::store::Store::release_claimed`]).
 //! - `sending`: written just before the end of data is, and only when the message was written
 //!   whole: what follows may reach the server. A daemon killed then leaves the row so; the next
 //!   one makes it `uncertain` ([`crate::store::Store::sending_left`]).
@@ -71,7 +74,7 @@ pub async fn send_next(
     password: &Password,
     tls: Arc<ClientConfig>,
 ) -> rusqlite::Result<Option<Tried>> {
-    let Some(message) = store.next_to_send(key)? else {
+    let Some(message) = store.claim_next(key)? else {
         return Ok(None);
     };
     let id = message.id;

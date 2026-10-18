@@ -5,7 +5,8 @@
 CREATE TABLE outbox (
     id INTEGER PRIMARY KEY,
     account INTEGER NOT NULL REFERENCES account (key) ON DELETE CASCADE,
-    -- queued: to send (again). sending: its end of data is being written, so the server may take
+    -- queued: to send (again). claimed: a worker took it, and sent nothing of it yet; a row
+    -- found so when the daemon starts is queued again. sending: its end of data is being written, so the server may take
     -- it; a row found so after a daemon was killed becomes uncertain. sent: the server took it,
     -- and its copy is still to be appended to Sent. failed: the server refused it for good (5xx).
     -- uncertain: the connection was lost after its end of data and before the server's answer;

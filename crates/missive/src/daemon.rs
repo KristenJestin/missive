@@ -133,7 +133,15 @@ pub async fn run(options: Options) -> Result<(), String> {
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     // Opened once here so that a copy this build cannot use stops the daemon at once.
-    Store::open(&store).map_err(|e| format!("cannot open the local copy: {e}"))?;
+    let copy = Store::open(&store).map_err(|e| format!("cannot open the local copy: {e}"))?;
+    match copy.release_claimed() {
+        Ok(0) => {}
+        Ok(released) => {
+            log!("{released} messages of the outbox were claimed by the last daemon: queued again")
+        }
+        Err(e) => log!("cannot read the outbox ({e})"),
+    }
+    drop(copy);
 
     let (stop, stopping) = watch::channel(false);
     let daemon = Arc::new(Daemon {
@@ -1537,9 +1545,9 @@ impl SmtpWorker {
         let mut backoff = Backoff::default();
         loop {
             while self.wake.try_recv().is_ok() {}
-            match self.store.next_to_send(self.key) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
+            match self.store.has_queued(self.key) {
+                Ok(true) => {}
+                Ok(false) => {
                     if !self.wait(None).await {
                         return;
                     }

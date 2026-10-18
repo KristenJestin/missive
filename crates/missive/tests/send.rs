@@ -761,6 +761,85 @@ async fn a_message_a_killed_daemon_left_sending_is_uncertain_and_not_resent() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_message_a_killed_daemon_left_claimed_is_queued_again_and_sent() {
+    let (server, relay, env) = smtp_down().await;
+    let mut daemon = env.daemon().await;
+    env.ready().await;
+    succeeded(&env.compose(&["--body", BODY]).await);
+    daemon.kill().await;
+    // As a daemon killed before the message's end of data leaves it.
+    Connection::open(env.copy_path())
+        .unwrap()
+        .execute("UPDATE outbox SET state = 'claimed'", [])
+        .unwrap();
+
+    relay.up.store(true, Ordering::SeqCst);
+    let _restarted = env.daemon().await;
+
+    took(&server, 1).await;
+}
+
+/// How long the server takes to answer `MAIL FROM` in the tests where a worker is held there.
+const SLOW_MAIL: Duration = Duration::from_secs(3);
+
+/// A daemon whose worker is held at the `MAIL FROM` of the first message, then the account
+/// removed from the configuration, and the daemon made to read it again: that worker's account
+/// is gone.
+async fn removed_while_sending() -> (FakeServer, Env, Daemon) {
+    let server = mailbox().start().await;
+    let (env, daemon) = started(&Setup::of(&server)).await;
+    server.smtp_delay("MAIL", SLOW_MAIL);
+    succeeded(&env.compose(&["--body", "first"]).await);
+    eventually(10, "the first message at MAIL FROM", || {
+        server.smtp_delayed() == 1
+    })
+    .await;
+    assert!(
+        AccountStore::new(env.path("config").join("missive"))
+            .remove("alice")
+            .unwrap()
+    );
+    // Any request reads the configuration again.
+    env.run(&["sync"]).await;
+    (server, env, daemon)
+}
+
+/// Waits until the server took `count` messages, then as long as a worker held at `MAIL FROM`
+/// may take to send another, and returns the bodies it took.
+async fn bodies_taken(server: &FakeServer, count: usize) -> Vec<String> {
+    eventually(30, "the messages sent", || {
+        server.smtp_messages().len() >= count
+    })
+    .await;
+    tokio::time::sleep(SLOW_MAIL + Duration::from_secs(2)).await;
+    let mut bodies: Vec<String> = server
+        .smtp_messages()
+        .iter()
+        .map(|m| {
+            let data = String::from_utf8_lossy(&m.data).into_owned();
+            data.split("\r\n\r\n")
+                .nth(1)
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        })
+        .collect();
+    bodies.sort();
+    bodies
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_being_sent_when_its_account_is_removed_and_added_again_is_delivered_once() {
+    let (server, env, _daemon) = removed_while_sending().await;
+
+    // Added again: a new worker, on the same account number, while the old one still sends.
+    env.add_account(&Setup::of(&server)).await;
+    succeeded(&env.compose(&["--body", "second"]).await);
+
+    assert_eq!(bodies_taken(&server, 2).await, ["first", "second"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_sent_copy_is_not_appended_when_the_server_saves_sent_mail() {
     let server = mailbox().start().await;
     let mut setup = Setup::of(&server);

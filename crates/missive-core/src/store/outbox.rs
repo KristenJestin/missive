@@ -75,12 +75,35 @@ impl Store {
             .collect()
     }
 
-    /// The account's first message to send.
-    pub fn next_to_send(&self, account: i64) -> rusqlite::Result<Option<ToSend>> {
+    /// The messages a daemon left `claimed` when it stopped: nothing of them was sent yet, so
+    /// they go back to the queue. Only at the daemon's start, when no worker can hold a claim.
+    pub fn release_claimed(&self) -> rusqlite::Result<usize> {
+        self.connection.execute(
+            "UPDATE outbox SET state = 'queued' WHERE state = 'claimed'",
+            [],
+        )
+    }
+
+    /// Whether the account has a message to send.
+    pub fn has_queued(&self, account: i64) -> rusqlite::Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM outbox WHERE account = ?1 AND state = 'queued')",
+            [account],
+            |r| r.get(0),
+        )
+    }
+
+    /// Claims the account's first message to send, before any command is sent for it: in one
+    /// statement, so that two workers of the same account (an old one whose account was removed
+    /// and added again, and its successor) never both take it.
+    pub fn claim_next(&self, account: i64) -> rusqlite::Result<Option<ToSend>> {
         self.connection
             .query_row(
-                "SELECT id, sender, recipients, message_id, raw, sent_copy FROM outbox
-                  WHERE account = ?1 AND state = 'queued' ORDER BY id LIMIT 1",
+                "UPDATE outbox SET state = 'claimed'
+                  WHERE id = (SELECT id FROM outbox WHERE account = ?1 AND state = 'queued'
+                               ORDER BY id LIMIT 1)
+                    AND state = 'queued'
+                  RETURNING id, sender, recipients, message_id, raw, sent_copy",
                 [account],
                 |r| {
                     let recipients: String = r.get(2)?;
@@ -97,9 +120,15 @@ impl Store {
             .optional()
     }
 
-    /// Records that a message's end of data is about to be written.
+    /// Records that a message's end of data is about to be written; an error, and the end not
+    /// written, when the message is no longer claimed (its account was removed meanwhile).
     pub fn sending(&self, id: i64) -> rusqlite::Result<()> {
-        self.set(id, "sending", None)
+        self.connection.query_row(
+            "UPDATE outbox SET state = 'sending' WHERE id = ?1 AND state = 'claimed'
+             RETURNING id",
+            [id],
+            |_| Ok(()),
+        )
     }
 
     /// A try that failed before the end of data: the message stays to send.
@@ -243,21 +272,57 @@ mod tests {
         let one = store.enqueue(account, &built(1), true).unwrap();
         let two = store.enqueue(account, &built(2), false).unwrap();
 
-        let next = store.next_to_send(account).unwrap().unwrap();
+        let next = store.claim_next(account).unwrap().unwrap();
         assert_eq!(next.id, one);
         assert_eq!(next.recipients, built(1).recipients);
         assert_eq!(next.raw, built(1).raw);
         assert!(next.sent_copy);
 
         store.send_again(one, "451").unwrap();
-        assert_eq!(store.next_to_send(account).unwrap().unwrap().id, one);
+        assert_eq!(store.claim_next(account).unwrap().unwrap().id, one);
         store.send_failed(one, "554").unwrap();
-        assert_eq!(store.next_to_send(account).unwrap().unwrap().id, two);
+        assert_eq!(store.claim_next(account).unwrap().unwrap().id, two);
         store.send_uncertain(two, "cut").unwrap();
-        assert_eq!(store.next_to_send(account).unwrap(), None);
+        assert_eq!(store.claim_next(account).unwrap(), None);
         assert_eq!(
             states(&store),
             [(one, "failed".to_owned()), (two, "uncertain".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_message_is_claimed_by_one_worker_only() {
+        let (dir, store, account) = open();
+        let other = Store::open(&dir.path().join("copy.sqlite")).unwrap();
+        let one = store.enqueue(account, &built(1), true).unwrap();
+
+        assert_eq!(store.claim_next(account).unwrap().unwrap().id, one);
+        assert_eq!(other.claim_next(account).unwrap(), None);
+        assert_eq!(states(&store), [(one, "claimed".to_owned())]);
+        // Only the row's claim lets its end of data go.
+        let two = store.enqueue(account, &built(2), true).unwrap();
+        assert!(store.sending(two).is_err());
+        store.sending(one).unwrap();
+        assert_eq!(
+            states(&store),
+            [(one, "sending".to_owned()), (two, "queued".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_claimed_message_found_at_start_goes_back_to_the_queue() {
+        let (_dir, store, account) = open();
+        let one = store.enqueue(account, &built(1), true).unwrap();
+        let two = store.enqueue(account, &built(2), true).unwrap();
+        store.claim_next(account).unwrap();
+        store.claim_next(account).unwrap();
+        store.sending(two).unwrap();
+
+        assert_eq!(store.release_claimed().unwrap(), 1);
+
+        assert_eq!(
+            states(&store),
+            [(one, "queued".to_owned()), (two, "sending".to_owned())]
         );
     }
 
@@ -266,6 +331,7 @@ mod tests {
         let (_dir, store, account) = open();
         let one = store.enqueue(account, &built(1), true).unwrap();
         let two = store.enqueue(account, &built(2), true).unwrap();
+        store.claim_next(account).unwrap();
         store.sending(one).unwrap();
 
         let left = store.sending_left(account).unwrap();
@@ -281,7 +347,7 @@ mod tests {
             states(&store),
             [(one, "uncertain".to_owned()), (two, "queued".to_owned())]
         );
-        assert_eq!(store.next_to_send(account).unwrap().unwrap().id, two);
+        assert_eq!(store.claim_next(account).unwrap().unwrap().id, two);
     }
 
     #[test]
