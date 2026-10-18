@@ -20,7 +20,11 @@
 //!    X-Missive-Draft "1"`: the versions it already holds, one from an `APPEND` whose answer was
 //!    lost included.
 //! 2. `APPEND <drafts> (\Draft \Seen)` of the new version. Its UID comes from `APPENDUID`
-//!    (UIDPLUS), else from the same search, made again.
+//!    (UIDPLUS), else from the same search, made again. A version tried before is first looked
+//!    for among those found (`UID FETCH <uids> (UID BODY.PEEK[])`): one identical byte for byte
+//!    landed from an `APPEND` whose answer was lost, and is taken as the new version instead of
+//!    a second copy. So cut answers, however many in a row, never add more than one copy of a
+//!    version, with or without UIDPLUS.
 //! 3. Only then, the older versions are removed: `UID STORE <uids> +FLAGS.SILENT (\Deleted)` and
 //!    `UID EXPUNGE <uids>`, which removes those UIDs and no other message marked deleted; an
 //!    expunge refused takes the flag back. Without UIDPLUS there is no `UID EXPUNGE`: the older
@@ -35,6 +39,8 @@
 
 use std::collections::BTreeSet;
 use std::time::Duration;
+
+use async_imap::imap_proto::{AttributeValue, Response};
 
 use crate::actions::{self, Server};
 use crate::compose::OWN_DRAFT;
@@ -187,6 +193,35 @@ async fn each(
     Ok(())
 }
 
+/// The last of `uids` whose message is `raw`, byte for byte. A refused fetch finds none: the
+/// version is then appended again, as before.
+async fn same(
+    server: &mut Server<'_>,
+    uids: &BTreeSet<u32>,
+    raw: &[u8],
+) -> std::result::Result<Option<u32>, SyncError> {
+    let set = sync::uid_set(&uids.iter().copied().collect::<Vec<_>>());
+    let mut found = None;
+    let done = server
+        .run_done(&format!("UID FETCH {set} (UID BODY.PEEK[])"), |response| {
+            if let Response::Fetch(_, attributes) = response
+                && let Some(uid) = sync::uid(attributes)
+                && uids.contains(&uid)
+                && attributes.iter().any(|attribute| {
+                    matches!(attribute, AttributeValue::BodySection {
+                        section: None,
+                        data: Some(data),
+                        ..
+                    } if data.as_ref() == raw)
+                })
+            {
+                found = found.max(Some(uid));
+            }
+        })
+        .await?;
+    Ok(found.filter(|_| matches!(done, Done::Ok(_))))
+}
+
 /// What one try of a draft came to.
 enum Step {
     /// Written (or removed): the UID of the new version when known.
@@ -226,8 +261,13 @@ async fn one(
         }
     }
 
-    let mut new = None;
-    if let Some(raw) = &draft.raw {
+    // A version tried before may be there already, from an `APPEND` whose answer was lost: it is
+    // taken as the new one rather than appended again, which a flaky link would repeat.
+    let mut new = match &draft.raw {
+        Some(raw) if draft.attempts > 0 && !old.is_empty() => same(server, &old, raw).await?,
+        _ => None,
+    };
+    if let Some(raw) = draft.raw.as_ref().filter(|_| new.is_none()) {
         let done = server.append(&quoted, FLAGS, raw).await?;
         match done {
             Done::Ok(_) => {}
