@@ -119,19 +119,28 @@ follow new mail while the daemon idles: those are told by `new-message` and `unr
 
 ### `sync-ended`
 
-The pass ended, and the copy is up to date with the server: `state` `ready` came just before it.
+The pass ended: `state` `ready` came just before it, and the copy is up to date with the server
+except for the folders in `skipped`.
 
 ```json
 {"protocol": 1, "event": "sync-ended", "account": "alice",
- "folders": 3, "new": 6, "removed": 0, "flags": 1}
+ "folders": 3, "new": 6, "removed": 0, "flags": 1, "skipped": []}
 ```
 
 | Field | Type | |
 |---|---|---|
-| `folders` | number | the folders synced |
+| `folders` | number | the folders synced (not those in `skipped`) |
 | `new` | number | messages added to the copy (including the ones `new-message` does not tell) |
 | `removed` | number | messages that left the copy because the server expunged them |
 | `flags` | number | messages whose flags changed |
+| `skipped` | array | the folders the pass left as they were, `[]` when none |
+| `skipped[].folder` | string | the folder's role (`inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`), else its name |
+| `skipped[].kind` | string | `refused` (the server answered `NO`) or `unusable` (it answered something no sync can use) |
+
+A folder the server refuses does not stop the others, and the account is `ready` all the same:
+`skipped` is how a program tells `ready` from `ready, and complete`. The same list is in
+`missive status --json`. The next pass that syncs the folder leaves it out. It never holds what the
+server said, only the kind of error.
 
 A pass that fails (the connection is lost, the copy cannot be written) has a `sync-started` and no
 `sync-ended`: the `state` event that follows says what became of the account.

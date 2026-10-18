@@ -37,8 +37,8 @@ use missive_core::keyring::{Keyring, KeyringError};
 use missive_core::protocol::{
     AccountState, Answer, Command, PROTOCOL, pid_path, read_request, runtime_dir, socket_path,
 };
-use missive_core::store::Store;
-use missive_core::sync::{self, Capabilities, Changes, Folder, SyncError};
+use missive_core::store::{SkippedFolder, Store};
+use missive_core::sync::{self, Capabilities, Changes, Folder, Skip, SyncError};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
@@ -980,11 +980,27 @@ impl Worker {
             let started = Instant::now();
             let mut folders = check!(sync::folders(&mut session, &mut self.store, self.key).await);
             let mut changes = Changes::default();
+            let mut skipped = Vec::new();
             for folder in &mut folders {
                 if *self.stop.borrow() {
                     return (Ended::Stopped, Some(session));
                 }
-                changes += check!(self.folder(&mut session, folder).await);
+                match check!(self.folder(&mut session, folder).await) {
+                    Ok(synced) => changes += synced,
+                    // The account is `ready` all the same: the pass says what it left out.
+                    Err(skip) => skipped.push(SkippedFolder {
+                        folder: folder
+                            .role
+                            .map_or_else(|| folder.name.clone(), str::to_owned),
+                        kind: skip.name().to_owned(),
+                    }),
+                }
+            }
+            if let Err(e) = self.store.set_skipped(self.key, &skipped) {
+                log!(
+                    "account {}: cannot record the skipped folders ({e})",
+                    self.key
+                );
             }
             if let Err(e) = self.store.set_state(self.key, "ready", true) {
                 log!("account {}: cannot record its state ({e})", self.key);
@@ -993,21 +1009,23 @@ impl Worker {
             self.tell("ready");
             self.events.send(Event::SyncEnded {
                 account: self.id.clone(),
-                folders: folders.len(),
+                folders: folders.len() - skipped.len(),
                 new: changes.new,
                 removed: changes.removed,
                 flags: changes.flags,
+                skipped: skipped.clone(),
             });
             log!(
                 "account {}: ready, {} folders synced in {:.2} s ({} new, {} removed, {} flag \
-                 changes, {} rebuilt)",
+                 changes, {} rebuilt, {} skipped)",
                 self.key,
-                folders.len(),
+                folders.len() - skipped.len(),
                 started.elapsed().as_secs_f64(),
                 changes.new,
                 changes.removed,
                 changes.flags,
-                changes.rebuilt
+                changes.rebuilt,
+                skipped.len()
             );
             self.answer("ready");
             *backoff = Backoff::default();
@@ -1029,7 +1047,8 @@ impl Worker {
                 let left = next_check.saturating_duration_since(Instant::now());
                 let wake = match (capabilities.idle && !self.idle_refused, inbox) {
                     (true, Some(inbox)) => {
-                        let changes = check!(self.folder(&mut session, &mut folders[inbox]).await);
+                        let changes = check!(self.folder(&mut session, &mut folders[inbox]).await)
+                            .unwrap_or_default();
                         if changes != Changes::default() {
                             log!(
                                 "account {} folder {} (inbox): {} new, {} removed, {} flag changes",
@@ -1112,7 +1131,8 @@ impl Worker {
             if let Some(folder) = folders.iter_mut().find(|f| f.row.id == id) {
                 // The queue may have changed what the copy knows of it (its HIGHESTMODSEQ).
                 folder.row = self.store.folder(self.key, &folder.name, folder.role)?;
-                self.folder(session, folder).await?;
+                // A folder skipped here is told by the next pass.
+                let _ = self.folder(session, folder).await?;
             }
         }
         Ok(())
@@ -1157,7 +1177,7 @@ impl Worker {
         &mut self,
         session: &mut ImapSession,
         folder: &mut Folder,
-    ) -> Result<Changes, SyncError> {
+    ) -> Result<Result<Changes, Skip>, SyncError> {
         // What arrives is announced one message at a time only in a folder that was synced before:
         // the first sync of an account, of a folder that is new, or of one the server renumbered,
         // brings mail the user already has.
@@ -1180,7 +1200,7 @@ impl Worker {
             };
         let role = folder.role.unwrap_or("no role");
         match changes {
-            Some(changes) => {
+            Ok(changes) => {
                 self.publish(folder, &changes, last_uid).await;
                 if changes.rebuilt > 0 {
                     log!(
@@ -1198,16 +1218,16 @@ impl Worker {
                         changes.refused
                     );
                 }
-                Ok(changes)
+                Ok(Ok(changes))
             }
-            None => {
+            Err(skip) => {
                 log!(
                     "account {} folder {} ({role}): left as it is: the server refused to examine or \
                      list it, or answered something no sync can use",
                     self.key,
                     folder.row.id
                 );
-                Ok(Changes::default())
+                Ok(Err(skip))
             }
         }
     }

@@ -636,7 +636,7 @@ async fn a_first_sync_gives_the_unread_counts_but_no_new_message_per_message() {
         ended,
         json!({
             "protocol": 1, "event": "sync-ended", "account": "alice",
-            "folders": 3, "new": 6, "removed": 0, "flags": 0,
+            "folders": 3, "new": 6, "removed": 0, "flags": 0, "skipped": [],
         })
     );
     // The unread counts do come, as they change: the last one is the whole copy's.
@@ -649,6 +649,38 @@ async fn a_first_sync_gives_the_unread_counts_but_no_new_message_per_message() {
     let uid = server.deliver("INBOX", message(7));
     let event = watcher.expect("new-message").await;
     assert_eq!(event["message"], env.inbox_message_id("alice", uid));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folder_the_server_refuses_is_named_in_sync_ended_and_the_next_pass_clears_it() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    let _daemon = idling(&server, &env).await;
+    let mut watcher = env.watch();
+    watcher.snapshot(1).await;
+
+    server.refuse("EXAMINE \"Sent\"");
+    assert!(env.sync().await.status.success());
+    let (before, ended) = watcher.until("sync-ended").await;
+
+    // `ready` all the same, and the pass says what it left out; the folders count is the synced.
+    assert!(
+        before.contains(
+            &json!({ "protocol": 1, "event": "state", "account": "alice", "state": "ready" })
+        ),
+        "{before:?}"
+    );
+    assert_eq!(ended["folders"], 2);
+    assert_eq!(
+        ended["skipped"],
+        json!([{ "folder": "sent", "kind": "refused" }])
+    );
+
+    server.heal();
+    assert!(env.sync().await.status.success());
+    let (_, ended) = watcher.until("sync-ended").await;
+    assert_eq!(ended["folders"], 3);
+    assert_eq!(ended["skipped"], json!([]));
 }
 
 #[tokio::test(flavor = "multi_thread")]

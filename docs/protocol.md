@@ -71,7 +71,7 @@ account's connection state at that point, in the order of their identifiers.
 
 | `state` | |
 |---|---|
-| `ready` | the copy is up to date with the server |
+| `ready` | the copy is up to date with the server, but for the folders the pass skipped (`skipped` in `status` and `sync-ended`) |
 | `syncing` | a sync is running |
 | `no-login` | the keyring holds no password for the account (or the keyring could not be read) |
 | `auth-refused` | the server refused the user name or password; asking for a sync again is what tries again |

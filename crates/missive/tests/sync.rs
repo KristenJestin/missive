@@ -15,6 +15,7 @@ use missive_core::fake::{FakeKeyring, FakeServer, Folder, Message, SpecialUse};
 use missive_core::keyring::Keyring;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
@@ -1704,6 +1705,69 @@ async fn the_socket_speaks_the_documented_protocol() {
     assert_eq!(ask(&env, "not json").await["error"], "bad-request");
 }
 
+/// `missive status --json`, the account `alice`'s `skipped` and `state`.
+async fn skipped_of_alice(env: &Env) -> (serde_json::Value, serde_json::Value) {
+    let output = env.run(&["status", "--json"]).await;
+    succeeded(&output);
+    let status: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let alice = status["accounts"][0].clone();
+    (alice["state"].clone(), alice["skipped"].clone())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folder_the_server_refuses_is_ready_with_the_folder_named_in_status_until_a_pass_succeeds()
+ {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(
+        skipped_of_alice(&env).await,
+        (json!("ready"), json!([])),
+        "{}",
+        env.logs()
+    );
+
+    server.refuse("EXAMINE \"Sent\"");
+    succeeded(&sync_soon(&env).await);
+    let (state, skipped) = skipped_of_alice(&env).await;
+    assert_eq!(state, "ready");
+    // By role, with the kind of error and nothing the server said.
+    assert_eq!(skipped, json!([{ "folder": "sent", "kind": "refused" }]));
+
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(skipped_of_alice(&env).await, (json!("ready"), json!([])));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folder_of_the_users_own_is_named_by_its_name_and_an_answer_no_sync_can_use_is_unusable()
+{
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    succeeded(&sync_soon(&env).await);
+
+    // `OK` without EXISTS in one folder, `NO` in another: two different kinds.
+    server.truncate(&format!("EXAMINE \"{PRIVATE_FOLDER}\""), 3);
+    server.refuse("EXAMINE \"Sent\"");
+    succeeded(&sync_soon(&env).await);
+
+    let (state, skipped) = skipped_of_alice(&env).await;
+    assert_eq!(state, "ready");
+    assert_eq!(
+        skipped,
+        json!([
+            { "folder": "sent", "kind": "refused" },
+            { "folder": PRIVATE_FOLDER, "kind": "unusable" },
+        ])
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_copy_is_in_wal_mode_with_a_schema_version() {
     let server = mailbox().start().await;
@@ -1722,7 +1786,7 @@ async fn the_copy_is_in_wal_mode_with_a_schema_version() {
         .unwrap();
 
     assert_eq!(mode, "wal");
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     // The search index is a virtual table with its shadow tables.
     assert_eq!(
         env.table_names(),

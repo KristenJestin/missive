@@ -186,8 +186,10 @@ number of messages in the copy; and whether the daemon runs.
 {
   "daemon": "running",
   "accounts": [
-    { "id": "alice", "state": "ready", "syncing": false, "last_sync": 1792220640, "messages": 8 },
-    { "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0 }
+    { "id": "alice", "state": "ready", "syncing": false, "last_sync": 1792220640, "messages": 8,
+      "skipped": [{ "folder": "sent", "kind": "refused" }] },
+    { "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0,
+      "skipped": [] }
   ]
 }
 ```
@@ -200,6 +202,16 @@ number of messages in the copy; and whether the daemon runs.
 | `accounts[].syncing` | boolean | a sync is running now: the state is `syncing` **and** the daemon runs |
 | `accounts[].last_sync` | number or `null` | when the last complete sync ended, in seconds since the epoch; `null` if none has |
 | `accounts[].messages` | number | the messages in the copy, in every folder |
+| `accounts[].skipped` | array | the folders the last complete pass left as they were, `[]` when none (below) |
+| `accounts[].skipped[].folder` | string | the folder's role (`inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`), else its name |
+| `accounts[].skipped[].kind` | string | why: `refused` (the server answered `NO` to a command of the sync, for example `EXAMINE`) or `unusable` (it answered `OK` with something no sync can use: no `UIDVALIDITY` or `EXISTS`, a listing shorter than the folder) |
+
+`ready` does not mean the copy is complete: a folder the server refuses is skipped, the others are
+synced, and the account is `ready` all the same. `skipped` is what keeps that from being silent. It
+is replaced at the end of every complete pass: a folder that syncs again leaves it, and the folder
+that was skipped keeps its mail in the copy as it was (nothing is removed from it). It names the
+kind of error only, never what the server said. Like the rest of `status`, it is read from the
+local copy: a copy written before this field existed says `[]`.
 
 `state` is `null` in two cases: the account is not in the copy yet, and the copy says `syncing`
 although no daemon runs. The second one is what a daemon killed in the middle of a sync leaves
@@ -212,7 +224,7 @@ For people, the same on lines:
 
 ```
 daemon: running
-alice	ready	last sync 2026-10-17 07:04 UTC	8 messages
+alice	ready	last sync 2026-10-17 07:04 UTC	8 messages	skipped: sent (refused)
 bob	never synced	0 messages
 ```
 
