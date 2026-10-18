@@ -1002,6 +1002,53 @@ async fn a_listed_message_carries_what_search_prints_and_more() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_newsletter_with_inline_images_has_no_attachment_but_a_file_makes_one() {
+    let newsletter = |extra: &str| {
+        Message::new(format!(
+            "From: Carol Sender <{SENDER}>\r\nSubject: News\r\n\
+             Date: Sat, 17 Oct 2026 09:20:00 +0200\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"m\"\r\n\r\n\
+             --m\r\nContent-Type: multipart/related; boundary=\"r\"\r\n\r\n\
+             --r\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+             <p>News</p><img src=\"cid:logo@example.com\">\r\n\
+             --r\r\nContent-Type: image/png\r\nContent-ID: <logo@example.com>\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\nAAEC\r\n--r--\r\n{extra}--m--\r\n"
+        ))
+    };
+    let with_file = "--m\r\nContent-Type: application/pdf; name=\"a.pdf\"\r\n\
+        Content-Disposition: attachment; filename=\"a.pdf\"\r\n\r\nPDF\r\n";
+    let env = Env::filled_with(vec![(
+        "alice",
+        FakeServer::builder().user(USER, PASSWORD).folder(
+            Folder::new("INBOX")
+                .message(newsletter(""))
+                .message(newsletter(with_file)),
+        ),
+    )])
+    .await;
+
+    let list = json(&env.read(&["list", "--json"]).await);
+    let marks: Vec<(u64, bool)> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["uid"].as_u64().unwrap(),
+                m["has_attachments"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(marks, [(2, true), (1, false)]);
+    let text = stdout(&env.read(&["list"]).await);
+    let flags: Vec<&str> = text
+        .lines()
+        .map(|l| l.split('\t').nth(1).unwrap())
+        .collect();
+    assert_eq!(flags, ["u..@", "u..."]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn list_can_keep_the_unread_messages_only() {
     let env = Env::filled_with(vec![("alice", alice())]).await;
 
@@ -1165,7 +1212,7 @@ async fn show_a_message_with_only_html_gives_it_as_written_and_prints_it_as_text
     // No text part: the JSON does not make one up.
     assert_eq!(message["text"], Value::Null);
     // For people, the HTML as text: no tag, no style, no script, and the paragraphs stay apart.
-    // The address a link goes to stays in the HTML of the JSON; the text has the link's words.
+    // A link keeps its words and gets its target after them; the JSON holds the HTML as written.
     succeeded(&words);
     // After the headers.
     let text = stdout(&words).split_once("\n\n").unwrap().1.to_owned();
@@ -1174,7 +1221,10 @@ async fn show_a_message_with_only_html_gives_it_as_written_and_prints_it_as_text
     assert!(!text.contains('<'), "{text}");
     assert!(!text.contains("color: red"), "{text}");
     assert!(!text.contains("never run"), "{text}");
-    assert!(text.contains("read it"), "{text}");
+    assert!(
+        text.contains("read it [https://example.net/read]"),
+        "{text}"
+    );
     assert!(
         text.lines()
             .any(|l| l.contains("Quokka waits") && !l.contains("Second paragraph")),
@@ -1333,6 +1383,48 @@ async fn show_does_not_print_the_control_characters_of_a_message_on_a_terminal()
     assert!(text.contains("Line one"), "{text:?}");
     // A tab and the line breaks are text.
     assert!(text.contains("Line\ttwo"), "{text:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_does_not_print_the_characters_that_make_text_look_like_something_else() {
+    // A right-to-left override, zero-width characters, an isolate and a byte order mark are no
+    // control characters, yet they hide or reorder what a person reads.
+    let tricky = Message::new(format!(
+        "From: Carol Sender <{SENDER}>\r\nSubject: Invoice\u{202e}fdp.exe\u{200b} 12\r\n\
+         Date: Sat, 17 Oct 2026 09:12:00 +0200\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Transfer-Encoding: 8bit\r\n\r\n\
+         Pay\u{202e}gnissim\u{202c} to\u{2066}x\u{2069} the\u{feff}\u{2060}\u{200e} account\r\n\
+         Caf\u{e9} cr\u{e8}me, \u{65e5}\u{672c}\u{8a9e}\r\n"
+    ));
+    let env = Env::filled_with(vec![(
+        "alice",
+        FakeServer::builder()
+            .user(USER, PASSWORD)
+            .folder(Folder::new("INBOX").message(tricky)),
+    )])
+    .await;
+    let id = inbox_id(&env, 1).await;
+
+    let output = env.read(&["show", &id]).await;
+
+    succeeded(&output);
+    let text = stdout(&output);
+    for hidden in [
+        '\u{202e}', '\u{202c}', '\u{200b}', '\u{2066}', '\u{2069}', '\u{feff}', '\u{2060}',
+        '\u{200e}',
+    ] {
+        assert!(!text.contains(hidden), "{hidden:?} in {text:?}");
+    }
+    assert!(text.contains("Invoice"), "{text:?}");
+    assert!(text.contains("account"), "{text:?}");
+    // Letters of every script and accents are text.
+    assert!(
+        text.contains("Caf\u{e9} cr\u{e8}me, \u{65e5}\u{672c}\u{8a9e}"),
+        "{text:?}"
+    );
+    // `list` prints the subject too.
+    let list = env.read(&["list"]).await;
+    assert!(!stdout(&list).contains('\u{202e}'), "{:?}", stdout(&list));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1734,6 +1826,126 @@ async fn open_without_a_runtime_folder_refuses() {
         "{}",
         stderr(&output)
     );
+    assert!(!env.path("bin").join("args").exists());
+}
+
+/// Runs `missive open` on a runtime folder prepared by `prepare`, and checks that it refused with
+/// `needle` in its message, that nothing was handed to `xdg-open`, and that no page was written
+/// under `watched`. A folder owned by another user cannot be made without root: the tests stand
+/// in with the folder's permissions and with symlinks, the two other ways it is not Missive's own.
+async fn open_refused_on(prepare: impl FnOnce(&Env), watched: impl FnOnce(&Env) -> PathBuf) {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let id = inbox_id(&env, 4).await;
+    prepare(&env);
+
+    let output = open(&env, &[&id], &nowhere(&env)).await;
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not private to you"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty());
+    let watched = watched(&env);
+    assert!(
+        std::fs::read_dir(&watched).unwrap().next().is_none(),
+        "{watched:?} holds a file"
+    );
+    assert!(!env.path("bin").join("args").exists());
+}
+
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_refuses_a_missive_folder_others_can_write() {
+    for mode in [0o770, 0o707] {
+        open_refused_on(
+            |env| {
+                std::fs::create_dir_all(originals(env)).unwrap();
+                chmod(originals(env).parent().unwrap(), mode);
+            },
+            originals,
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_refuses_an_original_folder_others_can_write() {
+    for mode in [0o770, 0o707] {
+        open_refused_on(
+            |env| {
+                std::fs::create_dir_all(originals(env)).unwrap();
+                chmod(&originals(env), mode);
+            },
+            originals,
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_refuses_an_original_folder_that_is_a_symlink() {
+    open_refused_on(
+        |env| {
+            let elsewhere = env.path("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::fs::create_dir_all(originals(env).parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, originals(env)).unwrap();
+        },
+        |env| env.path("elsewhere"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_refuses_a_missive_folder_that_is_a_symlink() {
+    open_refused_on(
+        |env| {
+            let elsewhere = env.path("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("original")).unwrap();
+            let missive = env.path("runtime").join("missive");
+            let _ = std::fs::remove_dir_all(&missive);
+            std::os::unix::fs::symlink(&elsewhere, missive).unwrap();
+        },
+        |env| env.path("elsewhere").join("original"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_portal_slow_to_take_the_call_does_not_get_xdg_open_as_well() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    // Slower than the time `open` gives the call: the portal may well be showing a chooser.
+    let portal = FakePortal::start(PortalAnswer::Slow(Duration::from_secs(7))).await;
+    let id = inbox_id(&env, 4).await;
+
+    let output = open(&env, &[&id], portal.address()).await;
+
+    succeeded(&output);
+    assert_eq!(portal.calls().len(), 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!env.path("bin").join("args").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_portal_answering_after_the_wait_does_not_get_xdg_open_as_well() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let portal = FakePortal::start(PortalAnswer::Late(Duration::from_secs(3))).await;
+    let id = inbox_id(&env, 4).await;
+
+    let output = open(&env, &[&id], portal.address()).await;
+
+    succeeded(&output);
+    assert_eq!(portal.calls().len(), 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!env.path("bin").join("args").exists());
 }
 

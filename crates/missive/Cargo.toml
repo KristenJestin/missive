@@ -12,6 +12,8 @@ futures-util.workspace = true
 missive-core.workspace = true
 rpassword.workspace = true
 rustls.workspace = true
+# `missive open` checks that its folder is the user's own.
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The page of `missive open`: a file created anew, under a random name, readable by the user only.

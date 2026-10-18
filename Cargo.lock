@@ -970,6 +970,7 @@ dependencies = [
  "missive-core",
  "rpassword",
  "rusqlite",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

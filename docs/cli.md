@@ -10,8 +10,9 @@ error, 3 for `missive show` of a message that does not exist).
 ## Accounts
 
 An account is named by its **identifier**: a short name made of letters, digits and
-`. _ @ + -`, chosen with `--id` when it is added and the address otherwise. Commands take it to
-say which account they mean.
+`. _ @ + -`, chosen with `--id` when it is added and the address otherwise (an address never
+holds a `/`, and `account add` refuses an identifier that does: a message identifier is read
+back by cutting it at its `/`). Commands take it to say which account they mean.
 
 ### `missive account add`
 
@@ -385,11 +386,21 @@ Each message has the fields of a `search` hit, with the same meaning (`id`, `acc
 | `flagged` | boolean | the `\Flagged` flag |
 | `answered` | boolean | the `\Answered` flag |
 | `size` | number | the size the server gives, in bytes |
-| `has_attachments` | boolean | the message has a part the reader counts as an attachment (a file, a nested message, an image shown inside the text). A message in text and HTML versions has none |
+| `has_attachments` | boolean | the message has something a person would call an attachment (rule below) |
+
+The rule of `has_attachments`: a part counts when it is a file, or a message attached as a file
+(`Content-Disposition: attachment`, or a file name). It does not count when it is
+
+- an image the HTML shows inside the text: a part with a `Content-ID` that the HTML names as
+  `cid:<that id>`, or an image marked `inline` inside a `multipart/related`;
+- a message nested without being attached (the copy of the original in a bounce, say);
+- one of the text and HTML versions of the message.
 
 `has_attachments` is decided when the daemon writes the message to the copy (and, for the
 messages a copy already holds, when it first opens the copy under this version), and kept in
-the copy: a list of a big folder does not parse a single message.
+the copy: a list of a big folder does not parse a single message. A message written under an
+earlier rule keeps its mark until its folder is rebuilt. The `attachments` of `show` lists every
+part that is not a body, inline images included, with the numbers that name them.
 
 For people, one line per message, separated by tabs: the identifier, four flags (`u` unread, `f`
 flagged, `a` answered, `@` has attachments; a dot for each that is not set), the date in UTC, the
@@ -429,7 +440,7 @@ One message, by the identifier `search` and `list` print (`<account>/<folder id>
 }
 ```
 
-It has the fields of a `list` message (but `has_attachments`: the list of `attachments` says it),
+It has the fields of a `list` message (but `has_attachments`: the list of `attachments` says it, with no distinction of inline images),
 and:
 
 | Field | Type | |
@@ -449,9 +460,13 @@ Without `--json`, the message is written for a terminal: its headers (`From`, `T
 `Reply-To`, `Date` in UTC, `Subject`, `Message-ID` and `Attachments`, each when the message has
 it, but the subject, which reads `(no subject)` when there is none), an empty line, then its
 text: the text part, else the HTML reduced to its text (markup, styles and scripts left out; the
-paragraphs and line breaks stay, the addresses links go to do not: they are in `html`). The HTML
-is never interpreted. Control characters (the escape sequences that could move a terminal's
-cursor or change its title) are left out of the headers and the text.
+paragraphs and line breaks stay). A link keeps its target after its words, `the site
+[https://example.org/]`, for `http`, `https` and `mailto` targets only (none is fetched, and a
+link that is its own text is written once); other targets are only in `html`. The HTML is never
+interpreted. Control characters (the escape sequences that could move a terminal's cursor or
+change its title) are left out of the headers and the text, and so are the Unicode format
+characters that reorder or hide text (a right-to-left override, the zero-width space, the byte
+order mark…); the zero-width joiner and non-joiner stay, as emoji and some scripts need them.
 
 ```
 From: Carol Sender <carol.sender@example.com>

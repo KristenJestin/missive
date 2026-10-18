@@ -90,6 +90,21 @@ pub struct ShowArgs {
     raw: bool,
 }
 
+/// Whether a character must not reach a terminal: a control character, or one of the Unicode
+/// format characters that reorder or hide text (bidirectional overrides and isolates, zero-width
+/// spaces, the byte order mark, tags). The zero-width joiner and non-joiner stay: they are part
+/// of how emoji sequences and some scripts are written.
+fn hides_text(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{ad}' | '\u{61c}' | '\u{180e}'
+            | '\u{200b}' | '\u{200e}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}'
+            | '\u{feff}' | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}')
+}
+
 /// The exit status of `show` and `open` when the identifier names no message.
 pub const NOT_FOUND: u8 = 3;
 
@@ -363,7 +378,7 @@ fn columns(hit: &Hit) -> (String, String, String) {
     let date = hit.date.map(utc).unwrap_or_default();
     let subject = hit.subject.as_deref().unwrap_or("(no subject)");
     // A tab or a line break in a header would break the columns.
-    let clean = |text: &str| text.replace(|c: char| c.is_control(), " ");
+    let clean = |text: &str| text.replace(hides_text, " ");
     (date, clean(from), clean(subject))
 }
 
@@ -476,7 +491,7 @@ pub fn show(args: ShowArgs) -> std::result::Result<(), ShowError> {
     }
     // A header or a body can hold anything: no escape sequence reaches the terminal, only the
     // line breaks and tabs of the text.
-    let clean = |text: &str| text.replace(|c: char| c.is_control(), " ");
+    let clean = |text: &str| text.replace(hides_text, " ");
     let people = |label: &str, people: &[Person]| {
         if !people.is_empty() {
             let people: Vec<String> = people
@@ -527,7 +542,7 @@ pub fn show(args: ShowArgs) -> std::result::Result<(), ShowError> {
     let readable = body.readable.replace("\r\n", "\n");
     let readable: String = readable
         .chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .filter(|c| !hides_text(*c) || matches!(c, '\n' | '\t'))
         .collect();
     println!("\n{readable}");
     Ok(())

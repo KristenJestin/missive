@@ -1089,8 +1089,13 @@ async fn idle_stalled_once_is_tried_again_after_the_reconnection() {
         env.uids("INBOX").contains(&uid)
     })
     .await;
+    // The count moves as the worker goes back to IDLE after reading the message: wait for the
+    // third IDLE rather than read the count at the instant the message shows.
+    eventually(10, "IDLE again, on the same connection", || {
+        idles(&server) == 3
+    })
+    .await;
     assert_eq!(logins(&server, USER), 2);
-    assert_eq!(idles(&server), 2);
     only_read_only_commands(&server);
 }
 
