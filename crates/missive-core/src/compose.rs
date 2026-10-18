@@ -118,6 +118,13 @@ impl Draft {
         {
             return Err("the subject holds a line break".to_owned());
         }
+        for id in self.in_reply_to.iter().chain(&self.references) {
+            if id.is_empty()
+                || id.contains(|c: char| c.is_control() || c.is_whitespace() || "<>".contains(c))
+            {
+                return Err(format!("{id:?} is not a message identifier"));
+            }
+        }
         for attachment in &self.attachments {
             if attachment.name.is_empty() || attachment.name.contains(['/', '\r', '\n']) {
                 return Err(format!("{:?} is not a file name", attachment.name));
@@ -551,5 +558,26 @@ mod tests {
             ..Draft::default()
         };
         assert!(write(&account(), &broken, 0, None).is_err());
+    }
+
+    #[test]
+    fn a_thread_identifier_that_would_start_a_header_is_refused() {
+        for id in [
+            "a@example.org\r\nBcc: evil@example.net",
+            "a b@example.org",
+            "<a@example.org>",
+            "",
+        ] {
+            let draft = Draft {
+                in_reply_to: vec![id.to_owned()],
+                ..Draft::default()
+            };
+            assert!(write(&account(), &draft, 0, None).is_err(), "{id:?}");
+            let draft = Draft {
+                references: vec![id.to_owned()],
+                ..Draft::default()
+            };
+            assert!(write(&account(), &draft, 0, None).is_err(), "{id:?}");
+        }
     }
 }

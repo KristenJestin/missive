@@ -163,6 +163,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         },
         attachments: (args.draft.is_none() || !args.attach.is_empty())
             .then(|| attached(draft.attachments)),
+        in_reply_to: None,
         send: args.send,
     }))
     .await?;

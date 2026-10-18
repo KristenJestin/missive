@@ -94,6 +94,9 @@ pub struct SaveDraft {
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<Attached>>,
+    /// The Message-ID, without angle brackets, of the message the draft answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
     /// Sends the draft (through the outbox); it is removed from the Drafts folder once the
     /// server took the message.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -393,6 +396,22 @@ mod tests {
                 })
             })
         );
+    }
+
+    #[test]
+    fn a_draft_request_may_name_the_message_it_answers() {
+        let line =
+            r#"{"protocol":1,"request":"draft","account":"alice","in_reply_to":"1@example.org"}"#;
+        let request = Request {
+            protocol: 1,
+            command: Command::Draft(SaveDraft {
+                account: "alice".to_owned(),
+                in_reply_to: Some("1@example.org".to_owned()),
+                ..SaveDraft::default()
+            }),
+        };
+        assert_eq!(read_request(line), Ok(request.clone()));
+        assert_eq!(serde_json::to_string(&request).unwrap(), line);
     }
 
     #[test]

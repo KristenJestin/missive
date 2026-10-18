@@ -692,7 +692,8 @@ impl Daemon {
             || request.bcc.is_some()
             || request.subject.is_some()
             || request.body.is_some()
-            || request.attachments.is_some();
+            || request.attachments.is_some()
+            || request.in_reply_to.is_some();
         let mailboxes = |list: &[String]| -> Result<Vec<Mailbox>, String> {
             list.iter().map(|text| Mailbox::parse(text)).collect()
         };
@@ -720,6 +721,9 @@ impl Daemon {
                         data: a.data,
                     })
                     .collect();
+            }
+            if let Some(id) = request.in_reply_to {
+                draft.in_reply_to = vec![id];
             }
             if request.send {
                 draft.check()?;
