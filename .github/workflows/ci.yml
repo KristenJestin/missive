@@ -42,6 +42,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add rustfmt clippy
+      # The keyring tests start their own private bus (see `missive_core::fake::FakeKeyring`).
+      - name: Have dbus-daemon
+        run: command -v dbus-daemon || { sudo apt-get update && sudo apt-get install -y dbus-daemon; }
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked

@@ -225,6 +225,9 @@ impl Session {
         ) else {
             return Err("BAD LOGIN takes a user and a password".to_owned());
         };
+        if self.shared.imap_login_unavailable {
+            return Err("NO [UNAVAILABLE] try again in a moment".to_owned());
+        }
         if !self.shared.authenticate(&user, &password) {
             return Err("NO [AUTHENTICATIONFAILED] invalid credentials".to_owned());
         }

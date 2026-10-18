@@ -34,7 +34,12 @@ pub(super) async fn serve(
             "EHLO" => {
                 let mut lines = vec![HOST.to_owned()];
                 if tls {
-                    lines.push("AUTH PLAIN LOGIN".to_owned());
+                    let mechanisms = if shared.smtp_login_only {
+                        "LOGIN"
+                    } else {
+                        "PLAIN LOGIN"
+                    };
+                    lines.push(format!("AUTH {mechanisms}"));
                 } else {
                     lines.push("STARTTLS".to_owned());
                 }
@@ -66,7 +71,7 @@ pub(super) async fn serve(
             }
             "AUTH" if !tls => "538 5.7.11 encryption required".to_owned(),
             "AUTH" if session.user.is_some() => "503 5.5.1 already authenticated".to_owned(),
-            "AUTH" => match authenticate(&mut io, argument).await {
+            "AUTH" => match authenticate(&mut io, argument, &shared).await {
                 None => return,
                 Some(Some((user, password))) if shared.authenticate(&user, &password) => {
                     session.user = Some(user);
@@ -158,6 +163,7 @@ async fn read_line(io: &mut BufReader<Box<dyn Io>>) -> Option<String> {
 async fn authenticate(
     io: &mut BufReader<Box<dyn Io>>,
     argument: &str,
+    shared: &Shared,
 ) -> Option<Option<(String, String)>> {
     let (mechanism, initial) = argument.split_once(' ').unwrap_or((argument, ""));
     match mechanism.to_ascii_uppercase().as_str() {
@@ -185,6 +191,10 @@ async fn authenticate(
             } else {
                 initial.to_owned()
             };
+            if shared.smtp_login_only && !decode(&user).is_some_and(|user| shared.knows(&user)) {
+                // Refused at the user name step, before any password is asked for.
+                return Some(Some((String::new(), String::new())));
+            }
             reply(io, &format!("334 {}", STANDARD.encode("Password:")))
                 .await
                 .ok()?;
