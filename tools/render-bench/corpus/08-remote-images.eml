@@ -1,0 +1,20 @@
+From: Example Shop <news@shop.example.org>
+To: Reader <reader@example.com>
+Subject: New in the shop
+Date: Mon, 12 Oct 2026 09:00:00 +0200
+Message-ID: <4054579764654902518@shop.example.org>
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body style="font-family:Arial,sans-serif;">
+<h1>New in the shop</h1>
+<table role="presentation" width="600"><tr>
+<td><img src="https://images.example.org/boots.jpg" width="280" height="200" alt="Leather boots"></td>
+<td><img src="http://images.example.org/gloves.png" width="280" height="200" alt="Gloves"></td>
+</tr><tr>
+<td style="background-image:url('https://images.example.org/pattern.png');padding:20px;">Boots, 89.00</td>
+<td background="https://images.example.org/pattern2.png" style="padding:20px;">Gloves, 19.00</td>
+</tr></table>
+<picture><source srcset="https://images.example.org/banner.webp" type="image/webp"><img src="https://images.example.org/banner.jpg" alt="Winter sale banner" width="600"></picture>
+</body></html>

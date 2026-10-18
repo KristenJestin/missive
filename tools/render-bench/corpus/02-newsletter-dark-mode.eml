@@ -1,0 +1,48 @@
+From: Example Shop <news@shop.example.org>
+To: Reader <reader@example.com>
+Subject: The weekly letter
+Date: Mon, 12 Oct 2026 09:00:00 +0200
+Message-ID: <3036183645428386417@shop.example.org>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+The weekly letter.
+--alt
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<!DOCTYPE html>
+<html><head>
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<link rel="stylesheet" href="https://cdn.example.org/letter.css">
+<style>
+@import url("https://cdn.example.org/import.css");
+@font-face { font-family: "Letter Sans"; src: url("https://cdn.example.org/letter-sans.woff2") format("woff2"); }
+body { margin: 0; background: #f4f1ea; font-family: "Letter Sans", Helvetica, Arial, sans-serif; }
+.wrap { max-width: 640px; margin: 0 auto; background: #ffffff; }
+.hero { background: #264653 url("https://images.example.org/hero-bg.jpg") center / cover; color: #ffffff; padding: 40px 32px; }
+.hero h1 { margin: 0; font-size: 32px; }
+.col { display: inline-block; width: 48%; vertical-align: top; }
+.story { padding: 16px 32px; color: #222222; font-size: 16px; line-height: 1.6; }
+.preheader { display: none; max-height: 0; overflow: hidden; }
+@media (max-width: 600px) { .col { display: block; width: 100%; } .hero h1 { font-size: 24px; } }
+@media (prefers-color-scheme: dark) {
+  body { background: #111111; } .wrap { background: #1d1d1d; } .story { color: #eeeeee; }
+}
+</style></head>
+<body>
+<div class="preheader">Three stories, one recipe and the week's best photograph.</div>
+<div class="wrap">
+<div class="hero"><h1>The weekly letter</h1><p>Issue 42, from the editors at example.org</p></div>
+<div class="story">
+<img src="https://images.example.org/photo-of-the-week.jpg" width="576" height="320" alt="Photograph of the week" style="display:block;width:100%;height:auto;">
+<div class="col"><h2>Rivers in spring</h2><p>How the thaw reshapes a valley, told by the people who live there.</p></div>
+<div class="col"><h2>A simple soup</h2><p>Leeks, potatoes, an hour. The recipe our readers asked for.</p></div>
+<p><a href="https://letter.example.org/42" style="color:#2a9d8f;">Read the full issue online</a></p>
+</div></div></body></html>
+--alt--

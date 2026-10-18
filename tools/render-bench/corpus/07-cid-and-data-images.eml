@@ -1,0 +1,26 @@
+From: Example Shop <news@shop.example.org>
+To: Reader <reader@example.com>
+Subject: Your boarding pass
+Date: Mon, 12 Oct 2026 09:00:00 +0200
+Message-ID: <3860968064000946950@shop.example.org>
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="rel"; type="text/html"
+
+--rel
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body style="font-family:sans-serif;">
+<p><img src="cid:logo@shop.example.org" alt="Example Air" width="160" height="48"></p>
+<h2>Boarding pass</h2>
+<p>Flight EX 123, gate 4, seat 12A. <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAIElEQVR4nGN4lshAFUQdU0YNGjVo1KBRg0YNGjWIIgQARQDf37hZ+TUAAAAASUVORK5CYII=" width="24" height="24" alt="dot"> Boarding at 08:40.</p>
+<p><img src="cid:missing@shop.example.org" alt="QR code (missing part)"></p>
+</body></html>
+--rel
+Content-Type: image/png; name="logo.png"
+Content-Transfer-Encoding: base64
+Content-ID: <logo@shop.example.org>
+Content-Disposition: inline; filename="logo.png"
+
+iVBORw0KGgoAAAANSUhEUgAAAKAAAAAwCAIAAAAZy+Y5AAAAjElEQVR4nO3RAQkAIBDAwA9iSdsaxxQijIMLMNisfQib7wU8ZXCcwXEGxxkcZ3CcwXEGxxkcZ3CcwXEGxxkcZ3CcwXEGxxkcZ3CcwXEGxxkcZ3CcwXEGxxkcZ3CcwXEGxxkcZ3CcwXEGxxkcZ3CcwXEGxxkcZ3CcwXEGxxkcZ3CcwXEGxxkcZ3CcwXEX8W7YaFSOkPcAAAAASUVORK5CYII=
+--rel--
