@@ -1160,6 +1160,8 @@ async fn unreachable_retries_with_a_backoff_and_never_asks_to_log_in_again() {
     );
     assert_eq!(env.uids("INBOX"), [1, 2, 3]);
     assert_eq!(env.keyring.items().len(), 1);
+    // The password was read once, not at each attempt.
+    assert_eq!(env.keyring.secret_reads(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
