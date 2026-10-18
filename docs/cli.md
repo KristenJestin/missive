@@ -10,8 +10,9 @@ error, 3 for `missive show` of a message that does not exist).
 ## Accounts
 
 An account is named by its **identifier**: a short name made of letters, digits and
-`. _ @ + -`, chosen with `--id` when it is added and the address otherwise. Commands take it to
-say which account they mean.
+`. _ @ + -`, chosen with `--id` when it is added and the address otherwise (an address never
+holds a `/`, and `account add` refuses an identifier that does: a message identifier is read
+back by cutting it at its `/`). Commands take it to say which account they mean.
 
 ### `missive account add`
 

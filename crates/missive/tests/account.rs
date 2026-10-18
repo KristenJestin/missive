@@ -646,6 +646,34 @@ async fn a_chosen_id_names_the_account() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_id_with_a_slash_is_refused_so_that_a_message_identifier_reads_back() {
+    // A message identifier is `<account>/<folder>/<uidvalidity>/<uid>`: a `/` in the account
+    // would make it ambiguous.
+    let setup = Setup::new().await;
+    let certificate = setup.certificate_file();
+
+    let output = setup
+        .add(
+            &[
+                "--certificate",
+                certificate.to_str().unwrap(),
+                "--id",
+                "work/mail",
+            ],
+            PASSWORD,
+        )
+        .await;
+
+    failed(&output);
+    assert!(
+        stderr(&output).contains("cannot name an account"),
+        "{}",
+        stderr(&output)
+    );
+    setup.nothing_saved();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_existing_id_is_refused() {
     let setup = Setup::new().await;
     succeeded(&setup.add_with_certificate().await);
