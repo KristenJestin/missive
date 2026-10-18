@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use mail_parser::{MessageParser, MimeHeaders};
 use missive_core::account::{Account, AccountStore, Password, Security, Server};
 use missive_core::fake::{FakeKeyring, FakeServer, Folder, Message, SpecialUse};
@@ -33,18 +35,27 @@ const BODY: &str = "Body-Text-That-Stays-Private";
 const NAME: &str = "Zoé Ça-Recipient";
 
 /// What no log and no output may ever show: the message's subject, addresses, words and names,
-/// the login and the password.
-const PRIVATE: &[&str] = &[
-    "Réunion-Subject",
-    RECIPIENT,
-    COPIED,
-    HIDDEN,
-    BODY,
-    NAME,
-    USER,
-    PASSWORD,
-    "Alice Example",
-];
+/// the login and the password, and the password as the SMTP login sends it: base64 alone (the
+/// `AUTH LOGIN` lines) and inside the `AUTH PLAIN` token.
+fn private() -> Vec<String> {
+    let mut private: Vec<String> = [
+        "Réunion-Subject",
+        RECIPIENT,
+        COPIED,
+        HIDDEN,
+        BODY,
+        NAME,
+        USER,
+        PASSWORD,
+        "Alice Example",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    private.push(STANDARD.encode(USER));
+    private.push(STANDARD.encode(PASSWORD));
+    private.push(STANDARD.encode(format!("\0{USER}\0{PASSWORD}")));
+    private
+}
 
 /// INBOX with one message, a Sent folder and a Drafts folder.
 fn mailbox() -> missive_core::fake::Builder {
@@ -940,7 +951,7 @@ async fn compose_without_send_checks_the_message_and_says_drafts_come_later() {
 #[tokio::test(flavor = "multi_thread")]
 async fn no_password_body_subject_or_address_appears_in_the_logs_of_sending() {
     let server = mailbox()
-        .smtp_answer("RCPT", "451 4.3.0 try again later")
+        .smtp_answer("AUTH", "535 5.7.8 authentication credentials invalid")
         .start()
         .await;
     let (env, _daemon) = started(&Setup::of(&server)).await;
@@ -966,10 +977,18 @@ async fn no_password_body_subject_or_address_appears_in_the_logs_of_sending() {
     ];
 
     let mut outputs = vec![env.run(&args).await];
-    eventually(20, "a refused try", || {
+    eventually(20, "a refused login", || {
         env.outbox()
             .first()
             .is_some_and(|(_, _, attempts)| *attempts >= 1)
+    })
+    .await;
+    server.heal();
+    server.smtp_answer("RCPT", "451 4.3.0 try again later");
+    eventually(20, "a refused try", || {
+        env.outbox()
+            .first()
+            .is_some_and(|(_, _, attempts)| *attempts >= 2)
     })
     .await;
     server.heal();
@@ -986,11 +1005,12 @@ async fn no_password_body_subject_or_address_appears_in_the_logs_of_sending() {
 
     let logs = env.logs();
     assert!(logs.contains("outbox"), "{logs}");
-    for private in PRIVATE {
-        assert!(!logs.contains(private), "the log shows {private}:\n{logs}");
+    assert!(logs.contains("SMTP login failed (auth-refused)"), "{logs}");
+    for private in private() {
+        assert!(!logs.contains(&private), "the log shows {private}:\n{logs}");
         for output in &outputs {
-            assert!(!stdout(output).contains(private), "{}", stdout(output));
-            assert!(!stderr(output).contains(private), "{}", stderr(output));
+            assert!(!stdout(output).contains(&private), "{}", stdout(output));
+            assert!(!stderr(output).contains(&private), "{}", stderr(output));
         }
     }
 }

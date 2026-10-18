@@ -23,6 +23,8 @@ tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "r
 zbus.workspace = true
 
 [dev-dependencies]
+# The login's encodings, which the logs must not show either.
+base64.workspace = true
 mail-parser.workspace = true
 missive-core = { workspace = true, features = ["fake"] }
 rusqlite.workspace = true
