@@ -34,7 +34,7 @@ pub(super) async fn serve(
         }
         let (verb, argument) = line.split_once(' ').unwrap_or((&line, ""));
         let verb = verb.to_ascii_uppercase();
-        if matches!(verb.as_str(), "MAIL" | "RCPT" | "DATA")
+        if matches!(verb.as_str(), "AUTH" | "MAIL" | "RCPT" | "DATA")
             && let Some(Some(answer)) = shared.smtp_rule(&line)
         {
             if reply(&mut io, &answer).await.is_err() {

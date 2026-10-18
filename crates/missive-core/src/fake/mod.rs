@@ -46,7 +46,7 @@
 //! The SMTP side serves `EHLO`/`HELO`, `STARTTLS`, `AUTH PLAIN` and `AUTH LOGIN` (offered only
 //! over TLS; [`Builder::smtp_login_only`] drops `PLAIN`), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP`
 //! and `QUIT`, and records each message it accepted ([`FakeServer::smtp_messages`]). It can
-//! answer a chosen reply to `MAIL`, `RCPT`, `DATA` or the end of data
+//! answer a chosen reply to `AUTH`, `MAIL`, `RCPT`, `DATA` or the end of data
 //! ([`FakeServer::smtp_answer`]), or take a message and drop the connection before answering its
 //! end of data ([`FakeServer::smtp_cut_after_data`]), or wait before answering a command
 //! ([`FakeServer::smtp_delay`]), until [`FakeServer::heal`].
@@ -601,7 +601,7 @@ impl FakeServer {
     }
 
     /// Answers `reply` (`451 4.3.0 try again later`, `550 5.1.1 no such user`…) to every SMTP
-    /// command that starts with `command` (`MAIL`, `RCPT`, `DATA`, in any case), without running
+    /// command that starts with `command` (`AUTH`, `MAIL`, `RCPT`, `DATA`, in any case), without running
     /// it, or with `"."` to every end of data: the message is then not taken. Until
     /// [`FakeServer::heal`].
     pub fn smtp_answer(&self, command: &str, reply: &str) {
