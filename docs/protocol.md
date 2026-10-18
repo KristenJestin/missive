@@ -171,6 +171,11 @@ it went.
 every version of the draft. With `send`, the answer also has `outbox`, as for `send`. A `draft`
 that names no draft of the account is answered `no-such-message`.
 
+A `draft` naming a draft another client wrote (one without Missive's `X-Missive-Draft` header)
+does not replace it: the daemon makes a new draft from it, under a new `message_id`, and the
+answer also has `kept`, the `draft` given, which stays on the server as it is (and is not removed
+once the message is sent).
+
 ### `subscribe`
 
 Starts the event stream on this connection:

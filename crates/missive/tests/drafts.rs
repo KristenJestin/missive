@@ -664,45 +664,149 @@ fn block<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_draft_written_by_another_client_is_picked_up_by_its_identifier() {
+/// An HTML reply another client saved as a draft: multipart/alternative, threaded, with a
+/// Reply-To, as the server holds it.
+fn foreign_html_reply() -> String {
+    format!(
+        "From: Alice Example <{USER}>\r\nTo: {NAME} <{RECIPIENT}>\r\nReply-To: {USER}\r\n\
+         Subject: Re: Other client\r\nMessage-ID: <other@example.com>\r\n\
+         In-Reply-To: <asked@example.com>\r\n\
+         References: <first@example.com> <asked@example.com>\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/alternative; boundary=\"b1\"\r\n\r\n\
+         --b1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{BODY}\r\n\
+         --b1\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p><b>{BODY}</b></p>\r\n\
+         --b1--\r\n"
+    )
+}
+
+/// The Drafts folder with [`foreign_html_reply`], a daemon synced, and the draft's identifier.
+async fn with_a_foreign_draft() -> (FakeServer, Env, Daemon, String) {
     let server = with_drafts(
         Folder::new("Drafts")
             .special_use(SpecialUse::Drafts)
-            .message(
-                Message::new(format!(
-                    "From: Alice Example <{USER}>\r\nTo: {NAME} <{RECIPIENT}>\r\n\
-                         Subject: Other client\r\nMessage-ID: <other@example.com>\r\n\
-                         Content-Type: text/plain; charset=utf-8\r\n\r\n{BODY}\r\n"
-                ))
-                .flag("\\Draft"),
-            ),
+            .message(Message::new(foreign_html_reply()).flag("\\Draft")),
     )
     .start()
     .await;
-    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let (env, daemon) = started(&Setup::of(&server)).await;
     let listed = env.drafts().await;
     let id = listed[0]["id"].as_str().unwrap().to_owned();
+    (server, env, daemon, id)
+}
+
+/// The thread a message answers: its In-Reply-To and References.
+fn thread(raw: &[u8]) -> (Vec<String>, Vec<String>) {
+    let parsed = MessageParser::default().parse(raw).unwrap();
+    let ids = |value: &mail_parser::HeaderValue| match value {
+        mail_parser::HeaderValue::Text(id) => vec![id.to_string()],
+        mail_parser::HeaderValue::TextList(ids) => ids.iter().map(|id| id.to_string()).collect(),
+        _ => Vec::new(),
+    };
+    (ids(parsed.in_reply_to()), ids(parsed.references()))
+}
+
+fn answered() -> (Vec<String>, Vec<String>) {
+    (
+        vec!["asked@example.com".to_owned()],
+        vec![
+            "first@example.com".to_owned(),
+            "asked@example.com".to_owned(),
+        ],
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_html_reply_draft_picked_up_with_a_change_stays_byte_identical_beside_a_new_draft()
+ {
+    let (server, env, _daemon, id) = with_a_foreign_draft().await;
 
     let output = env
         .run(&["compose", "--json", "--draft", &id, "--subject", "Changed"])
         .await;
     succeeded(&output);
     let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(saved["id"], "other@example.com");
+    let new = saved["id"].as_str().unwrap();
+    assert_ne!(new, "other@example.com");
+    assert!(stderr(&output).contains("is kept"), "{}", stderr(&output));
 
-    drafts_on_server(&server, &["Changed"]).await;
+    drafts_on_server(&server, &["Re: Other client", "Changed"]).await;
+    assert_eq!(
+        server.raw("Drafts", 1).unwrap(),
+        foreign_html_reply().into_bytes()
+    );
+    assert!(removals(&server).is_empty(), "{:?}", removals(&server));
     let raw = server.raw("Drafts", 2).unwrap();
     let parsed = MessageParser::default().parse(&raw).unwrap();
-    assert_eq!(parsed.message_id(), Some("other@example.com"));
+    assert_eq!(parsed.message_id(), Some(new));
     assert_eq!(
         parsed.to().unwrap().first().unwrap().address(),
         Some(RECIPIENT)
     );
     assert!(parsed.body_text(0).unwrap().contains(BODY));
+    assert_eq!(thread(&raw), answered());
+
+    // The new draft is Missive's own: picked up again, it is replaced.
+    env.save(&["--draft", new, "--subject", "Again"]).await;
+    drafts_on_server(&server, &["Re: Other client", "Again"]).await;
+    assert_eq!(
+        server.raw("Drafts", 1).unwrap(),
+        foreign_html_reply().into_bytes()
+    );
     assert_eq!(
         removals(&server),
-        ["UID STORE 1 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 1"]
+        ["UID STORE 2 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 2"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_html_reply_draft_picked_up_and_sent_stays_byte_identical_on_the_server() {
+    let (server, env, _daemon, id) = with_a_foreign_draft().await;
+
+    let output = env.run(&["compose", "--draft", &id, "--send"]).await;
+    succeeded(&output);
+    assert!(stderr(&output).contains("is kept"), "{}", stderr(&output));
+    took(&server, 1).await;
+
+    let sent = &server.smtp_messages()[0];
+    assert_eq!(thread(&sent.data), answered());
+    let parsed = MessageParser::default().parse(&sent.data).unwrap();
+    assert_ne!(parsed.message_id(), Some("other@example.com"));
+    assert!(parsed.header("X-Missive-Draft").is_none());
+    drafts_on_server(&server, &["Re: Other client"]).await;
+    assert_eq!(
+        server.raw("Drafts", 1).unwrap(),
+        foreign_html_reply().into_bytes()
+    );
+    assert!(removals(&server).is_empty(), "{:?}", removals(&server));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_near_miss_message_id_beside_the_draft_survives_a_replacement() {
+    let own = |id: &str, subject: &str| {
+        Message::new(format!(
+            "From: {USER}\r\nSubject: {subject}\r\nMessage-ID: <{id}>\r\nX-Missive-Draft: 1\r\n\r\nx\r\n"
+        ))
+        .flag("\\Draft")
+    };
+    let server = with_drafts(
+        Folder::new("Drafts")
+            .special_use(SpecialUse::Drafts)
+            .message(own("x1@example.org", "Near miss"))
+            .message(own("1@example.org", "First")),
+    )
+    .start()
+    .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+
+    let id = env
+        .save(&["--draft", "1@example.org", "--subject", "Second"])
+        .await;
+    assert_eq!(id, "1@example.org");
+    drafts_on_server(&server, &["Near miss", "Second"]).await;
+    assert_eq!(server_drafts(&server)[0].0, 1);
+    assert_eq!(
+        removals(&server),
+        ["UID STORE 2 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 2"]
     );
 }
 
@@ -823,7 +927,7 @@ async fn an_append_whose_answer_never_came_leaves_one_draft_on_the_server_not_tw
 
     drafts_on_server(&server, &["First"]).await;
     assert_eq!(server_drafts(&server)[0].2.as_deref(), Some(id.as_str()));
-    let search = format!("UID SEARCH HEADER Message-ID \"<{id}>\"");
+    let search = format!("UID SEARCH HEADER Message-ID \"<{id}>\" HEADER X-Missive-Draft \"1\"");
     assert!(
         server.imap_log().contains(&search),
         "{:?}",

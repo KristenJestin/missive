@@ -16,10 +16,6 @@ pub struct DraftRow {
     /// The version to append, its Bcc header included; `None` when the draft is only to be
     /// removed (it was sent).
     pub raw: Option<Vec<u8>>,
-    /// UIDs of versions on the server that have no Message-ID to be found by, under
-    /// `replaces_uidvalidity`.
-    pub replaces: Vec<u32>,
-    pub replaces_uidvalidity: Option<u32>,
     /// See the schema: the row leaves only if it is still this version.
     pub version: i64,
     pub attempts: u32,
@@ -31,9 +27,6 @@ pub struct Stored {
     /// `None` for a draft another client wrote without a Message-ID.
     pub message_id: Option<String>,
     pub raw: Vec<u8>,
-    /// The version on the server it was found as, when it was named by its identifier:
-    /// `(uidvalidity, uid)`.
-    pub on_server: Option<(u32, u32)>,
 }
 
 impl Store {
@@ -42,7 +35,7 @@ impl Store {
     /// folder. Its latest version is the one waiting in the copy, else the newest the Drafts
     /// folder holds. `None` when there is no such draft, or when it was sent.
     pub fn find_draft(&self, account: i64, id: &str) -> rusqlite::Result<Option<Stored>> {
-        let (message_id, on_server) = match MessageId::parse(id) {
+        let message_id = match MessageId::parse(id) {
             Some(parsed) => {
                 let found: Option<(Option<String>, Vec<u8>)> = self
                     .connection
@@ -67,22 +60,17 @@ impl Store {
                 let Some((message_id, raw)) = found else {
                     return Ok(None);
                 };
-                let on_server = Some((parsed.uidvalidity, parsed.uid));
                 match message_id {
-                    Some(message_id) => (message_id, on_server),
+                    Some(message_id) => message_id,
                     None => {
                         return Ok(Some(Stored {
                             message_id: None,
                             raw,
-                            on_server,
                         }));
                     }
                 }
             }
-            None => (
-                id.trim_start_matches('<').trim_end_matches('>').to_owned(),
-                None,
-            ),
+            None => id.trim_start_matches('<').trim_end_matches('>').to_owned(),
         };
         let waiting: Option<Option<Vec<u8>>> = self
             .connection
@@ -113,58 +101,28 @@ impl Store {
         Ok(raw.map(|raw| Stored {
             message_id: Some(message_id),
             raw,
-            on_server,
         }))
     }
 
     /// Records a new version of a draft, to be written to the server: it takes the place of the
-    /// version waiting, if any. `replaces`, a version on the server without a Message-ID, is
-    /// added to those the draft replaces.
+    /// version waiting, if any.
     pub fn save_draft(
         &mut self,
         account: i64,
         message_id: &str,
         raw: &[u8],
-        replaces: Option<(u32, u32)>,
     ) -> rusqlite::Result<()> {
-        let transaction = self.connection.transaction()?;
-        let before: Option<(String, Option<u32>)> = transaction
-            .query_row(
-                "SELECT replaces, replaces_uidvalidity FROM draft
-                  WHERE account = ?1 AND message_id = ?2",
-                params![account, message_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let (mut uids, mut uidvalidity): (Vec<u32>, Option<u32>) = match before {
-            Some((uids, uidvalidity)) => {
-                (serde_json::from_str(&uids).unwrap_or_default(), uidvalidity)
-            }
-            None => (Vec::new(), None),
-        };
-        if let Some((validity, uid)) = replaces {
-            // UIDs of another UIDVALIDITY name other messages now.
-            if uidvalidity != Some(validity) {
-                uids.clear();
-                uidvalidity = Some(validity);
-            }
-            if !uids.contains(&uid) {
-                uids.push(uid);
-            }
-        }
         let parsed = MessageParser::default().parse(raw);
         let parsed = parsed.as_ref();
-        transaction.execute(
+        self.connection.execute(
             "INSERT INTO draft (account, message_id, raw, date, subject, sender, recipients,
-                                has_attachments, replaces, replaces_uidvalidity, saved_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, unixepoch())
+                                has_attachments, saved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())
              ON CONFLICT (account, message_id) DO UPDATE SET
                  raw = excluded.raw, date = excluded.date, subject = excluded.subject,
                  sender = excluded.sender, recipients = excluded.recipients,
-                 has_attachments = excluded.has_attachments, replaces = excluded.replaces,
-                 replaces_uidvalidity = excluded.replaces_uidvalidity,
-                 saved_at = excluded.saved_at, version = draft.version + 1, attempts = 0,
-                 last_error = NULL",
+                 has_attachments = excluded.has_attachments, saved_at = excluded.saved_at,
+                 version = draft.version + 1, attempts = 0, last_error = NULL",
             params![
                 account,
                 message_id,
@@ -176,11 +134,9 @@ impl Store {
                 mailboxes(parsed.and_then(|m| m.from())),
                 mailboxes(parsed.and_then(|m| m.to())),
                 parsed.is_some_and(crate::body::has_attachments),
-                serde_json::to_string(&uids).expect("numbers serialize"),
-                uidvalidity,
             ],
         )?;
-        transaction.commit()
+        Ok(())
     }
 
     /// Whether a message of the outbox sent from this draft is still to be sent.
@@ -197,19 +153,16 @@ impl Store {
     pub fn drafts(&self, account: i64) -> rusqlite::Result<Vec<DraftRow>> {
         self.connection
             .prepare(
-                "SELECT id, message_id, raw, replaces, replaces_uidvalidity, version, attempts
+                "SELECT id, message_id, raw, version, attempts
                    FROM draft WHERE account = ?1 ORDER BY id",
             )?
             .query_map([account], |r| {
-                let replaces: String = r.get(3)?;
                 Ok(DraftRow {
                     id: r.get(0)?,
                     message_id: r.get(1)?,
                     raw: r.get(2)?,
-                    replaces: serde_json::from_str(&replaces).unwrap_or_default(),
-                    replaces_uidvalidity: r.get(4)?,
-                    version: r.get(5)?,
-                    attempts: r.get(6)?,
+                    version: r.get(3)?,
+                    attempts: r.get(4)?,
                 })
             })?
             .collect()
@@ -230,12 +183,23 @@ impl Store {
             .optional()
     }
 
-    /// The UIDs the copy holds of a draft in a folder, by its Message-ID.
+    /// The UIDs the copy holds of a draft in a folder, by its Message-ID: only the versions
+    /// Missive wrote ([`crate::compose::is_own_draft`]).
     pub fn draft_uids(&self, folder: i64, message_id: &str) -> rusqlite::Result<Vec<u32>> {
-        self.connection
-            .prepare_cached("SELECT uid FROM message WHERE folder = ?1 AND message_id = ?2")?
-            .query_map(params![folder, message_id], |r| r.get(0))?
-            .collect()
+        let found: Vec<(u32, Vec<u8>)> = self
+            .connection
+            .prepare_cached(
+                "SELECT message.uid, message_raw.raw FROM message
+                   JOIN message_raw ON message_raw.message = message.id
+                  WHERE message.folder = ?1 AND message.message_id = ?2",
+            )?
+            .query_map(params![folder, message_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(found
+            .into_iter()
+            .filter(|(_, raw)| crate::compose::is_own_draft(raw))
+            .map(|(uid, _)| uid)
+            .collect())
     }
 
     /// Writing a draft failed this time: it stays. Returns how many times it failed.
@@ -325,8 +289,8 @@ mod tests {
 
     fn raw(subject: &str) -> Vec<u8> {
         format!(
-            "From: alice@example.org\r\nTo: Bob <bob@example.com>\r\nSubject: {subject}\r\n\
-             Message-ID: <d1@example.org>\r\n\r\nHello\r\n"
+            "X-Missive-Draft: 1\r\nFrom: alice@example.org\r\nTo: Bob <bob@example.com>\r\n\
+             Subject: {subject}\r\nMessage-ID: <d1@example.org>\r\n\r\nHello\r\n"
         )
         .into_bytes()
     }
@@ -365,14 +329,12 @@ mod tests {
 
         let by_id = found(&store, "<d1@example.org>").unwrap();
         assert_eq!(by_id.raw, raw("On the server"));
-        assert_eq!(by_id.on_server, None);
         let identifier = message_id("alice", folder, 7, 1);
         let by_identifier = found(&store, &identifier).unwrap();
         assert_eq!(by_identifier.message_id.as_deref(), Some("d1@example.org"));
-        assert_eq!(by_identifier.on_server, Some((7, 1)));
 
         store
-            .save_draft(account, "d1@example.org", &raw("Waiting"), None)
+            .save_draft(account, "d1@example.org", &raw("Waiting"))
             .unwrap();
         assert_eq!(found(&store, "d1@example.org").unwrap().raw, raw("Waiting"));
         assert_eq!(found(&store, &identifier).unwrap().raw, raw("Waiting"));
@@ -384,15 +346,38 @@ mod tests {
     }
 
     #[test]
+    fn a_version_of_another_client_under_the_same_message_id_is_never_one_to_remove() {
+        let (_dir, mut store, account) = open();
+        let folder = on_server(&mut store, account, "Missive's");
+        let foreign = String::from_utf8(raw("Another client's"))
+            .unwrap()
+            .replace("X-Missive-Draft: 1\r\n", "");
+        store
+            .insert(
+                folder,
+                &[NewMessage {
+                    uid: 2,
+                    flags: "\\Draft".to_owned(),
+                    internal_date: None,
+                    size: 10,
+                    raw: foreign.into_bytes(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(store.draft_uids(folder, "d1@example.org").unwrap(), [1]);
+    }
+
+    #[test]
     fn a_version_saved_while_the_last_one_was_written_stays_to_write() {
         let (_dir, mut store, account) = open();
         let folder = on_server(&mut store, account, "First");
         store
-            .save_draft(account, "d1@example.org", &raw("Second"), None)
+            .save_draft(account, "d1@example.org", &raw("Second"))
             .unwrap();
         let writing = store.drafts(account).unwrap().remove(0);
         store
-            .save_draft(account, "d1@example.org", &raw("Third"), None)
+            .save_draft(account, "d1@example.org", &raw("Third"))
             .unwrap();
 
         let left = store
@@ -418,13 +403,9 @@ mod tests {
         let (_dir, mut store, account) = open();
         let folder = on_server(&mut store, account, "First");
         store
-            .save_draft(account, "d1@example.org", &raw("Second"), Some((7, 1)))
+            .save_draft(account, "d1@example.org", &raw("Second"))
             .unwrap();
         let writing = store.drafts(account).unwrap().remove(0);
-        assert_eq!(
-            (writing.replaces.clone(), writing.replaces_uidvalidity),
-            (vec![1], Some(7))
-        );
         let new = NewMessage {
             uid: 2,
             flags: "\\Draft \\Seen".to_owned(),
@@ -448,7 +429,7 @@ mod tests {
         let (_dir, mut store, account) = open();
         on_server(&mut store, account, "First");
         store
-            .save_draft(account, "d1@example.org", &raw("Second"), None)
+            .save_draft(account, "d1@example.org", &raw("Second"))
             .unwrap();
         let built = Built {
             sender: "alice@example.org".to_owned(),

@@ -17,11 +17,6 @@ CREATE TABLE draft (
     sender TEXT NOT NULL DEFAULT '[]',
     recipients TEXT NOT NULL DEFAULT '[]',
     has_attachments INTEGER NOT NULL DEFAULT 0,
-    -- Versions of the draft on the server that have no Message-ID to be found by (a draft
-    -- another client wrote without one): a JSON array of UIDs of the Drafts folder, under
-    -- `replaces_uidvalidity`.
-    replaces TEXT NOT NULL DEFAULT '[]',
-    replaces_uidvalidity INTEGER,
     -- Counts every change of the row: a version written to the server leaves the row only if
     -- no other version was saved meanwhile.
     version INTEGER NOT NULL DEFAULT 1,

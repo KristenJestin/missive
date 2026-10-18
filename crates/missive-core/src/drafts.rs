@@ -7,11 +7,18 @@
 //! found on the server, by this client or after a connection was cut. Each version gets a new
 //! `Date`.
 //!
+//! Missive only ever replaces or removes a version it wrote itself: one that carries
+//! [`OWN_DRAFT`]. A draft another client wrote, picked up again, becomes a new draft of
+//! Missive's own, under a new Message-ID, and the original stays on the server as it is: Missive
+//! reads a draft back without its HTML and most of its headers, and would otherwise replace the
+//! only rich copy with a poorer one.
+//!
 //! On the server, every command goes through the sync's verified path, and counts only with its
 //! tagged `OK`:
 //!
-//! 1. `SELECT` the Drafts folder, and `UID SEARCH HEADER Message-ID "<id>"`: the versions it
-//!    already holds, one from an `APPEND` whose answer was lost included.
+//! 1. `SELECT` the Drafts folder, and `UID SEARCH HEADER Message-ID "<id>" HEADER
+//!    X-Missive-Draft "1"`: the versions it already holds, one from an `APPEND` whose answer was
+//!    lost included.
 //! 2. `APPEND <drafts> (\Draft \Seen)` of the new version. Its UID comes from `APPENDUID`
 //!    (UIDPLUS), else from the same search, made again.
 //! 3. Only then, the older versions are removed: `UID STORE <uids> +FLAGS.SILENT (\Deleted)` and
@@ -30,6 +37,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::actions::{self, Server};
+use crate::compose::OWN_DRAFT;
 use crate::connect::ImapSession;
 use crate::copy::message_id;
 use crate::store::{DraftRow, NewMessage, Store};
@@ -205,8 +213,8 @@ async fn one(
         return Ok(Step::No("select"));
     };
     // With its angle brackets: `3@` does not match `13@`.
-    let search =
-        sync::quote(&format!("<{}>", draft.message_id)).map(|id| format!("HEADER Message-ID {id}"));
+    let search = sync::quote(&format!("<{}>", draft.message_id))
+        .map(|id| format!("HEADER Message-ID {id} HEADER {OWN_DRAFT} \"1\""));
     let mut old = BTreeSet::new();
     if let Some(search) = &search {
         let Some(found) = server.search(search).await? else {
@@ -216,9 +224,6 @@ async fn one(
         if in_copy == Some(uidvalidity) {
             old.extend(store.draft_uids(folder, &draft.message_id)?);
         }
-    }
-    if draft.replaces_uidvalidity == Some(uidvalidity) {
-        old.extend(&draft.replaces);
     }
 
     let mut new = None;

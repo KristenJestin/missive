@@ -174,6 +174,10 @@ pub struct Answer {
     /// brackets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    /// A `draft` that picked up another client's draft: the draft named, which stays on the
+    /// server as it is, beside the new draft `message_id` names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<String>,
     /// When not `ok`: `bad-request`, `unsupported-protocol`, `unknown-request`,
     /// `no-such-account`, `failed`, or why an action was refused (`docs/protocol.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -7,11 +7,14 @@
 //! Sent folder keeps them, in a `Bcc:` header put before the message ([`Built::bcc_header`]): the
 //! Sent folder is the user's own record, and it is how every mail client remembers who was sent
 //! a blind copy. A server that saves sent mail itself keeps what it was sent, without them.
+//!
+//! A draft Missive writes carries [`OWN_DRAFT`] (`X-Missive-Draft: 1`), and only such a draft is
+//! ever replaced or removed by Missive; the message sent from it does not carry it.
 
 use mail_builder::MessageBuilder;
 use mail_builder::headers::Header;
 use mail_builder::headers::address::Address;
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::{HeaderValue, MessageParser, MimeHeaders};
 
 use crate::account::Account;
 
@@ -80,6 +83,21 @@ pub struct Draft {
     pub subject: Option<String>,
     pub body: String,
     pub attachments: Vec<Attachment>,
+    /// The message it answers, and its thread: Message-IDs without angle brackets.
+    pub in_reply_to: Vec<String>,
+    pub references: Vec<String>,
+}
+
+/// The header that marks a draft as Missive's own. It is in the message itself, not in the
+/// local copy: it survives a copy rebuilt, and another client that writes its own version of
+/// the draft does not carry it over.
+pub const OWN_DRAFT: &str = "X-Missive-Draft";
+
+/// Whether this draft is one Missive wrote, and so may replace or remove.
+pub fn is_own_draft(raw: &[u8]) -> bool {
+    MessageParser::default()
+        .parse_headers(raw)
+        .is_some_and(|parsed| parsed.header(OWN_DRAFT).is_some())
 }
 
 impl Draft {
@@ -111,8 +129,9 @@ impl Draft {
 
 impl Draft {
     /// What a message saved as a draft holds: its recipients (Bcc included, which a draft keeps),
-    /// its subject, its text and its attachments. An address Missive cannot send to is refused:
-    /// the draft could not be written again as it is. A message with only HTML gives its text.
+    /// its subject, its text, its attachments and the thread it answers. An address Missive
+    /// cannot send to is refused: the draft could not be written again as it is. Its HTML is not
+    /// kept: a message with only HTML gives its text. Other headers (Reply-To…) are not kept.
     pub fn read(raw: &[u8]) -> Result<Draft, String> {
         let parsed = MessageParser::default()
             .parse(raw)
@@ -129,6 +148,13 @@ impl Draft {
                     }))
                 })
                 .collect()
+        };
+        let ids = |value: &HeaderValue| -> Vec<String> {
+            match value {
+                HeaderValue::Text(id) => vec![id.to_string()],
+                HeaderValue::TextList(ids) => ids.iter().map(|id| id.to_string()).collect(),
+                _ => Vec::new(),
+            }
         };
         let mut attachments = Vec::new();
         for (index, part) in parsed.attachments().enumerate() {
@@ -149,6 +175,8 @@ impl Draft {
                 .map(|text| text.into_owned())
                 .unwrap_or_default(),
             attachments,
+            in_reply_to: ids(parsed.in_reply_to()),
+            references: ids(parsed.references()),
         })
     }
 }
@@ -170,9 +198,11 @@ pub struct Built {
 }
 
 impl Built {
-    /// The message as it is kept in the Drafts folder: its Bcc header, then the message.
-    pub fn with_bcc(&self) -> Vec<u8> {
-        let mut raw = self.bcc_header.clone().unwrap_or_default();
+    /// The message as it is kept in the Drafts folder: [`OWN_DRAFT`], its Bcc header, then the
+    /// message.
+    pub fn as_draft(&self) -> Vec<u8> {
+        let mut raw = format!("{OWN_DRAFT}: 1\r\n").into_bytes();
+        raw.extend(self.bcc_header.iter().flatten());
         raw.extend_from_slice(&self.raw);
         raw
     }
@@ -220,6 +250,12 @@ pub fn write(
     }
     if let Some(subject) = &draft.subject {
         message = message.subject(subject.as_str());
+    }
+    if !draft.in_reply_to.is_empty() {
+        message = message.in_reply_to(draft.in_reply_to.as_slice());
+    }
+    if !draft.references.is_empty() {
+        message = message.references(draft.references.as_slice());
     }
     message = message.text_body(crlf(&draft.body));
     for attachment in &draft.attachments {
@@ -375,6 +411,7 @@ mod tests {
                     data: vec![0x89, b'P', b'N', b'G', 0, 1, 2, 255],
                 },
             ],
+            ..Draft::default()
         };
 
         let built = build(&account(), &draft, 1_792_222_200).unwrap();
@@ -484,13 +521,20 @@ mod tests {
                 name: "notes é.txt".to_owned(),
                 data: b"some notes".to_vec(),
             }],
+            in_reply_to: vec!["asked@example.com".to_owned()],
+            references: vec![
+                "first@example.com".to_owned(),
+                "asked@example.com".to_owned(),
+            ],
         };
         let built = write(&account(), &draft, 0, Some("same@example.org")).unwrap();
         assert_eq!(built.message_id, "same@example.org");
 
-        assert_eq!(Draft::read(&built.with_bcc()).unwrap(), draft);
-        // Without its Bcc header, the message sent reads back without them.
+        assert_eq!(Draft::read(&built.as_draft()).unwrap(), draft);
+        assert!(is_own_draft(&built.as_draft()));
+        // Without its Bcc header, the message sent reads back without them, and is no draft.
         assert!(Draft::read(&built.raw).unwrap().bcc.is_empty());
+        assert!(!is_own_draft(&built.raw));
     }
 
     #[test]

@@ -721,13 +721,22 @@ server took the message**: a message the server refuses (`failed`) or that may n
 (`uncertain`) keeps its draft. A draft whose message waits in the outbox cannot be changed or sent
 again until it is sent.
 
+Missive only ever replaces or removes a draft it wrote itself: its drafts carry an
+`X-Missive-Draft: 1` header (the message sent from one does not). A draft **another client
+wrote** is never changed or removed: picking it up makes a new draft, Missive's own, with a new
+identifier (which `--json` prints), and the original stays in the Drafts folder as it is, with
+`--send` or without; one line on standard error says so, and it is yours to delete there. What is
+picked up of a draft is its recipients, subject, text, attachments and the thread it answers
+(`In-Reply-To` and `References`): an HTML draft becomes text, and its other headers (`Reply-To`…)
+are not kept.
+
 The draft is saved in the local copy first, and the command returns at once, whether the server
 can be reached or not: `list --folder drafts` shows it at once. The daemon then writes it to the
 account's Drafts folder (the folder with the `drafts` role), as soon as the server can be
 reached:
 
-1. it looks for the versions the folder already holds, by `Message-ID` (`UID SEARCH`), one from a
-   connection cut before the server answered included;
+1. it looks for the versions the folder already holds, by `Message-ID` and Missive's own header
+   (`UID SEARCH`), one from a connection cut before the server answered included;
 2. it appends the new version, flagged `\Draft` and `\Seen`; the command counts as done only with
    the server's `OK`;
 3. only then it removes the older versions, by their UIDs only (`UID STORE … +FLAGS.SILENT

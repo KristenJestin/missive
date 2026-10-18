@@ -649,11 +649,16 @@ impl Daemon {
             Ok(key) => key,
             Err(e) => return failed(e.to_string()),
         };
-        let (mut draft, message_id, on_server) = match &request.draft {
+        // Only a draft Missive wrote is replaced: another client's stays on the server as it is,
+        // and a new draft, Missive's own, is made from it (`kept`).
+        let (mut draft, message_id, kept) = match &request.draft {
             None => (Draft::default(), None, None),
             Some(id) => match store.find_draft(key, id) {
                 Ok(Some(stored)) => match Draft::read(&stored.raw) {
-                    Ok(draft) => (draft, stored.message_id, stored.on_server),
+                    Ok(draft) if compose::is_own_draft(&stored.raw) => {
+                        (draft, stored.message_id, None)
+                    }
+                    Ok(draft) => (draft, None, Some(id.clone())),
                     Err(why) => return Answer::error(Some(name), "bad-request", why),
                 },
                 Ok(None) => {
@@ -725,11 +730,10 @@ impl Daemon {
             Ok(built) => built,
             Err(why) => return Answer::error(Some(name), "bad-request", why),
         };
-        // A draft sent as it is needs no new version; one without a Message-ID gets its row all
-        // the same, which names the version to remove once it is sent.
-        let save = !request.send || (request.draft.is_some() && (changed || message_id.is_none()));
+        // A draft sent as it is needs no new version.
+        let save = !request.send || (request.draft.is_some() && changed);
         if save {
-            let saved = store.save_draft(key, &built.message_id, &built.with_bcc(), on_server);
+            let saved = store.save_draft(key, &built.message_id, &built.as_draft());
             if let Err(e) = saved {
                 return failed(e.to_string());
             }
@@ -745,10 +749,13 @@ impl Daemon {
                 answer: Some(name.to_owned()),
                 ok: true,
                 message_id: Some(built.message_id),
+                kept,
                 ..Answer::default()
             };
         }
-        let draft = request.draft.is_some().then_some(built.message_id.as_str());
+        // The draft removed once the message is sent: Missive's own only.
+        let draft = (save || (request.draft.is_some() && kept.is_none()))
+            .then_some(built.message_id.as_str());
         let outbox = match store.enqueue(key, &built, !account.server_saves_sent, draft) {
             Ok(outbox) => outbox,
             Err(e) => return failed(e.to_string()),
@@ -765,6 +772,7 @@ impl Daemon {
             ok: true,
             outbox: Some(outbox),
             message_id: Some(built.message_id),
+            kept,
             ..Answer::default()
         }
     }
@@ -823,6 +831,7 @@ impl Daemon {
                         data: a.data,
                     })
                     .collect(),
+                ..Draft::default()
             })
         })();
         let built = match draft.and_then(|draft| compose::build(&account, &draft, now())) {

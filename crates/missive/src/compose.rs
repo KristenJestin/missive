@@ -114,6 +114,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         subject: args.subject,
         body: body.clone().unwrap_or_default(),
         attachments,
+        ..Draft::default()
     };
     // What can be told here is told before the daemon is asked; a draft picked up again is
     // checked by the daemon, once its own fields are known.
@@ -169,6 +170,12 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
     let Some(message_id) = answer.message_id else {
         return Err(unreadable());
     };
+    if let Some(kept) = answer.kept {
+        eprintln!(
+            "Draft {kept} was written by another client: it is kept as it is in the Drafts \
+             folder, beside the new one (delete it yourself if you no longer want it)."
+        );
+    }
     if args.send {
         let Some(outbox) = answer.outbox else {
             return Err(unreadable());
