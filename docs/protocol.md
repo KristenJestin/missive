@@ -53,7 +53,7 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `unsupported-protocol` | the daemon speaks another protocol version (`message` says which) |
 | `unknown-request` | the daemon knows no such request |
 | `no-such-account` | the account named is not in the configuration |
-| `failed` | the daemon could not do it (it is stopping, for one) |
+| `failed` | the daemon could not do it: it is stopping, or an account's sync could not write the local copy (`message` names the account) |
 
 ## Requests
 

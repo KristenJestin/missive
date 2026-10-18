@@ -56,8 +56,9 @@ macro_rules! log {
     };
 }
 
-/// Where a request waits for the end of the sync it asked for: it receives the account's state.
-type Waiter = oneshot::Sender<String>;
+/// Where a request waits for the end of the sync it asked for: it receives the account's state,
+/// or why the local copy could not be written.
+type Waiter = oneshot::Sender<Result<String, String>>;
 
 /// Runs the daemon until SIGTERM or SIGINT.
 pub async fn run(options: Options) -> Result<(), String> {
@@ -285,10 +286,15 @@ impl Daemon {
                 }
                 let mut accounts = Vec::new();
                 for (id, answer) in pending {
-                    let Ok(state) = answer.await else {
-                        return Answer::error(Some(name), "failed", "the daemon is stopping");
-                    };
-                    accounts.push(AccountState { id, state });
+                    match answer.await {
+                        Ok(Ok(state)) => accounts.push(AccountState { id, state }),
+                        Ok(Err(why)) => {
+                            return Answer::error(Some(name), "failed", format!("{id}: {why}"));
+                        }
+                        Err(_) => {
+                            return Answer::error(Some(name), "failed", "the daemon is stopping");
+                        }
+                    }
                 }
                 Answer {
                     protocol: PROTOCOL,
@@ -391,8 +397,20 @@ impl Worker {
             let retry = match opened {
                 Ok(session) => match self.connected(session, &mut backoff).await {
                     Ended::Stopped => return,
+                    // Answered and recorded now: a session lost at the same point at every
+                    // pass would otherwise leave the requests waiting, and the state `syncing`,
+                    // for ever.
                     Ended::Lost(error) => {
                         log!("account {}: the session ended ({})", self.key, kind(&error));
+                        match error {
+                            SyncError::Connection(_) => self.settle("unreachable"),
+                            SyncError::Store(error) => {
+                                let why = format!("the local copy could not be written ({error})");
+                                for waiter in self.waiting.drain(..) {
+                                    let _ = waiter.send(Err(why.clone()));
+                                }
+                            }
+                        }
                         Some(backoff.next())
                     }
                 },
@@ -467,7 +485,7 @@ impl Worker {
 
     fn answer(&mut self, state: &str) {
         for waiter in self.waiting.drain(..) {
-            let _ = waiter.send(state.to_owned());
+            let _ = waiter.send(Ok(state.to_owned()));
         }
     }
 

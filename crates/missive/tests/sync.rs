@@ -419,6 +419,13 @@ async fn eventually(seconds: u64, what: &str, mut condition: impl FnMut() -> boo
     }
 }
 
+/// `missive sync`, which must answer within 20 seconds.
+async fn sync_soon(env: &Env) -> Output {
+    tokio::time::timeout(Duration::from_secs(20), env.sync())
+        .await
+        .unwrap_or_else(|_| panic!("sync did not answer; the log:\n{}", env.logs()))
+}
+
 /// The fake's IMAP commands that log in as `user`.
 fn logins(server: &FakeServer, user: &str) -> usize {
     let login = format!("LOGIN \"{user}\"");
@@ -656,6 +663,26 @@ async fn a_uidvalidity_change_of_the_inbox_while_idling_in_it_rebuilds_it_after_
     assert_eq!(logins(&server, USER), 2);
     assert_eq!(env.flags("INBOX", 1).unwrap(), "\\Flagged");
     succeeded(&env.sync().await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_lost_at_every_pass_answers_the_sync_and_records_unreachable() {
+    let server = mailbox().cut("EXAMINE", 0).start().await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&[]).await;
+
+    let output = sync_soon(&env).await;
+
+    failed(&output);
+    assert_eq!(stdout(&output), "alice: unreachable\n");
+    eventually(10, "unreachable in the copy", || {
+        env.state("alice").as_deref() == Some("unreachable")
+    })
+    .await;
+    // And again: the next request is answered too.
+    assert_eq!(stdout(&sync_soon(&env).await), "alice: unreachable\n");
 }
 
 #[tokio::test(flavor = "multi_thread")]
