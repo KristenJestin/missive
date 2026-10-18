@@ -21,6 +21,8 @@ futures-util = "0.3"
 html5ever = "0.40"
 # Reads messages for the local copy: their envelope, from the raw message kept beside it.
 mail-parser = "0.11"
+# The `data:` URLs a message embeds.
+percent-encoding = "2"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rpassword = "7"

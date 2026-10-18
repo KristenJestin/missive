@@ -1,9 +1,7 @@
 //! render-bench: renders a folder of `.eml` files with each way Missive could draw mail, headless,
 //! and measures them, for issue #7. See README.md.
 
-mod message;
 mod net;
-mod reduce;
 mod render;
 mod run;
 mod summary;
@@ -13,6 +11,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use blitz_traits::shell::ColorScheme;
+use missive_render::{message, reduce};
 
 /// The ways, in the order of the contact sheet's columns.
 pub const WAYS: [&str; 3] = ["blitz", "reduced-light", "reduced-dark"];
