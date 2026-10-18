@@ -580,7 +580,7 @@ impl Daemon {
             }
             Command::Subscribe => unreachable!("`serve` answers a subscription itself"),
             Command::Mark { messages, mark_as } => match Kind::parse(&mark_as) {
-                Some(kind) if kind.flag().is_some() => {
+                Some(kind) if kind.flag().is_some() && kind != Kind::Answered => {
                     self.record(name, &messages, Wanted::Mark(kind))
                 }
                 _ => Answer::error(
@@ -1945,12 +1945,14 @@ impl SmtpWorker {
                 id,
                 message_id,
                 sent_copy,
+                answered,
             } => {
                 log!(
-                    "account {}: message {id} sent (copy in Sent: {sent_copy})",
+                    "account {}: message {id} sent (copy in Sent: {sent_copy}, answered: \
+                     {answered})",
                     self.key
                 );
-                if sent_copy == "append"
+                if (sent_copy == "append" || answered)
                     && let Some(imap) = self.imap.upgrade()
                 {
                     let _ = imap.send(Request::Actions);
