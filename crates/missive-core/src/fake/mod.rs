@@ -22,9 +22,13 @@
 //!
 //! What the IMAP side serves: `CAPABILITY`, `NOOP`, `LOGOUT`, `STARTTLS`, `LOGIN`, `ENABLE`,
 //! `LIST` (with special-use attributes), `STATUS`, `SELECT` and `EXAMINE`, `FETCH` and
-//! `UID FETCH`, `SEARCH` and `UID SEARCH`, `IDLE`, and CONDSTORE (`HIGHESTMODSEQ`, `MODSEQ`,
-//! `CHANGEDSINCE`) unless [`Builder::without_condstore`] is used. Anything else is answered
-//! `BAD` (and logged), so a client using more than this fails loudly rather than silently.
+//! `UID FETCH`, `SEARCH` and `UID SEARCH` (`HEADER` included), `IDLE`, CONDSTORE
+//! (`HIGHESTMODSEQ`, `MODSEQ`, `CHANGEDSINCE`) unless [`Builder::without_condstore`] is used, and
+//! what changes messages in a folder selected read-write: `STORE` and `UID STORE`, `UID COPY`,
+//! `UID MOVE` (RFC 6851) unless [`Builder::without_move`], and UIDPLUS (`COPYUID`,
+//! `UID EXPUNGE`, RFC 4315) unless [`Builder::without_uidplus`]. Anything else, a bare `EXPUNGE`
+//! among them, is answered `BAD` (and logged), so a client using more than this fails loudly
+//! rather than silently.
 //!
 //! Changes made through [`FakeServer`] reach a connected client the way a real server tells them:
 //! during `IDLE` at once, otherwise at its next `NOOP`. A client whose selected folder gets a new
@@ -192,6 +196,8 @@ pub struct Builder {
     users: Vec<(String, String)>,
     folders: Vec<Folder>,
     without_condstore: bool,
+    without_move: bool,
+    without_uidplus: bool,
     imap_login_no: Option<String>,
     smtp_login_only: bool,
     fetch_delay: Duration,
@@ -217,6 +223,18 @@ impl Builder {
     /// Serves without CONDSTORE, like a server that lacks it.
     pub fn without_condstore(mut self) -> Self {
         self.without_condstore = true;
+        self
+    }
+
+    /// Serves without `MOVE` (RFC 6851): `UID MOVE` is an unknown command.
+    pub fn without_move(mut self) -> Self {
+        self.without_move = true;
+        self
+    }
+
+    /// Serves without UIDPLUS (RFC 4315): no `COPYUID`, and `UID EXPUNGE` is an unknown command.
+    pub fn without_uidplus(mut self) -> Self {
+        self.without_uidplus = true;
         self
     }
 
@@ -342,6 +360,8 @@ impl Builder {
             }),
             changes: watch::channel(()).0,
             condstore: !self.without_condstore,
+            moves: !self.without_move,
+            uidplus: !self.without_uidplus,
             imap_login_no: self.imap_login_no,
             smtp_login_only: self.smtp_login_only,
             fetch_delay: self.fetch_delay,
@@ -478,6 +498,25 @@ impl FakeServer {
         Some(message.flags.clone())
     }
 
+    /// The UIDs of a folder now, in order.
+    pub fn uids(&self, folder: &str) -> Vec<u32> {
+        let mut state = self.shared.state();
+        state
+            .folder(folder)
+            .messages
+            .iter()
+            .map(|m| m.uid)
+            .collect()
+    }
+
+    /// The raw message of a UID now, or `None` when the folder holds no such UID.
+    pub fn raw(&self, folder: &str, uid: u32) -> Option<Vec<u8>> {
+        let mut state = self.shared.state();
+        let folder = state.folder(folder);
+        let message = folder.messages.iter().find(|m| m.uid == uid)?;
+        Some(message.raw.clone())
+    }
+
     /// Every IMAP command received so far, from every connection, in order, without its tag:
     /// `EXAMINE "INBOX"`, `UID FETCH 1:* (FLAGS)`, `IDLE`, `DONE`… The password of `LOGIN` is
     /// replaced by `***`.
@@ -554,6 +593,8 @@ struct Shared {
     /// Signalled after each change made by a test or a client, so that idling sessions look.
     changes: watch::Sender<()>,
     condstore: bool,
+    moves: bool,
+    uidplus: bool,
     imap_login_no: Option<String>,
     smtp_login_only: bool,
     fetch_delay: Duration,
@@ -669,6 +710,21 @@ impl FolderState {
             raw: message.raw,
             flags: message.flags,
             internal_date: message.internal_date,
+            modseq: self.highest_modseq,
+        });
+        uid
+    }
+
+    /// Adds a copy of a message of another folder, with its flags and date, under the next UID.
+    fn add_copy(&mut self, message: &StoredMessage) -> u32 {
+        let uid = self.uidnext;
+        self.uidnext += 1;
+        self.highest_modseq += 1;
+        self.messages.push(StoredMessage {
+            uid,
+            raw: message.raw.clone(),
+            flags: message.flags.clone(),
+            internal_date: message.internal_date.clone(),
             modseq: self.highest_modseq,
         });
         uid

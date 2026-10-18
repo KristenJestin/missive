@@ -181,6 +181,12 @@ impl Session {
         if self.shared.condstore {
             capabilities.push_str(" ENABLE CONDSTORE");
         }
+        if self.shared.moves {
+            capabilities.push_str(" MOVE");
+        }
+        if self.shared.uidplus {
+            capabilities.push_str(" UIDPLUS");
+        }
         capabilities
     }
 
@@ -208,7 +214,10 @@ impl Session {
             self.send(format!("{tag} BAD log in first"));
             return Flow::Continue;
         }
-        let needs_selected = matches!(name.as_str(), "FETCH" | "SEARCH");
+        let needs_selected = matches!(
+            name.as_str(),
+            "FETCH" | "SEARCH" | "STORE" | "COPY" | "MOVE" | "EXPUNGE"
+        );
         if needs_selected && self.selected.is_none() {
             self.send(format!("{tag} BAD select a folder first"));
             return Flow::Continue;
@@ -246,6 +255,10 @@ impl Session {
             (false, "EXAMINE") => return self.select(&tag, &args, true),
             (_, "FETCH") => self.fetch(&args, uid),
             (_, "SEARCH") => self.search(&args, uid),
+            (_, "STORE") => self.store(&args, uid),
+            (true, "COPY") => return self.copy(&tag, &args, false),
+            (true, "MOVE") if self.shared.moves => return self.copy(&tag, &args, true),
+            (true, "EXPUNGE") if self.shared.uidplus => self.expunge(&args),
             (false, "IDLE") => {
                 self.send("+ idling");
                 return Flow::Idle(tag);
@@ -558,6 +571,227 @@ impl Session {
         Ok(())
     }
 
+    /// `STORE` or `UID STORE`: `FLAGS`, `+FLAGS` or `-FLAGS`, each with or without `.SILENT`.
+    /// Each message whose flags it touched is answered with a `FETCH` of its flags, unless silent.
+    fn store(&mut self, args: &[Token], uid: bool) -> Result<(), String> {
+        let (Some(set), Some(item), Some(flags)) = (
+            args.first().and_then(Token::raw),
+            args.get(1).and_then(Token::raw),
+            args.get(2),
+        ) else {
+            return Err("BAD STORE takes a set, an item and flags".to_owned());
+        };
+        let item = item.to_ascii_uppercase();
+        let (item, silent) = match item.strip_suffix(".SILENT") {
+            Some(item) => (item.to_owned(), true),
+            None => (item, false),
+        };
+        let flags: Vec<String> = match flags {
+            Token::List(list) => list.iter().filter_map(Token::string).collect(),
+            other => other.string().into_iter().collect(),
+        };
+        let selected = self.selected.as_mut().expect("checked by the caller");
+        if selected.read_only {
+            return Err("NO [READ-ONLY] the folder was examined, not selected".to_owned());
+        }
+        let set = Set::parse(set).ok_or("BAD invalid set")?;
+        let max = if uid {
+            selected.view.last().map_or(0, |m| m.uid)
+        } else {
+            selected.view.len() as u32
+        };
+        let mut state = self.shared.state();
+        let folder = state.folder(&selected.folder);
+        let mut answer = Vec::new();
+        for (index, entry) in selected.view.iter_mut().enumerate() {
+            let sequence = index as u32 + 1;
+            if !set.contains(if uid { entry.uid } else { sequence }, max) {
+                continue;
+            }
+            let Some(message) = folder.messages.iter_mut().find(|m| m.uid == entry.uid) else {
+                continue;
+            };
+            let before = message.flags.clone();
+            let has =
+                |flags: &[String], flag: &str| flags.iter().any(|f| f.eq_ignore_ascii_case(flag));
+            match item.as_str() {
+                "FLAGS" => message.flags = flags.clone(),
+                "+FLAGS" => {
+                    for flag in &flags {
+                        if !has(&message.flags, flag) {
+                            message.flags.push(flag.clone());
+                        }
+                    }
+                }
+                "-FLAGS" => message
+                    .flags
+                    .retain(|f| !flags.iter().any(|g| g.eq_ignore_ascii_case(f))),
+                _ => return Err("BAD unknown STORE item".to_owned()),
+            }
+            if message.flags != before {
+                folder.highest_modseq += 1;
+                message.modseq = folder.highest_modseq;
+            }
+            entry.flags = message.flags.clone();
+            if !silent {
+                let modseq = if self.condstore {
+                    format!(" MODSEQ ({})", message.modseq)
+                } else {
+                    String::new()
+                };
+                answer.push(format!(
+                    "* {sequence} FETCH (UID {} FLAGS ({}){modseq})",
+                    message.uid,
+                    message.flags.join(" ")
+                ));
+            }
+        }
+        drop(state);
+        self.shared.changes.send_modify(|_| {});
+        // This session's view is already up to date.
+        self.changes.borrow_and_update();
+        for line in answer {
+            self.send(line);
+        }
+        Ok(())
+    }
+
+    /// `UID COPY`, or `UID MOVE` when `moves`: the messages of the set go to the end of the
+    /// target under new UIDs, told in `COPYUID` with UIDPLUS (in the tagged answer of a copy, in
+    /// an untagged `OK` before the expunges of a move, as RFC 6851 has it).
+    fn copy(&mut self, tag: &str, args: &[Token], moves: bool) -> Flow {
+        let command = if moves { "MOVE" } else { "COPY" };
+        let (Some(set), Some(target)) = (
+            args.first().and_then(Token::raw).and_then(Set::parse),
+            args.get(1).and_then(Token::string),
+        ) else {
+            self.send(format!("{tag} BAD {command} takes a set and a folder"));
+            return Flow::Continue;
+        };
+        let selected = self.selected.as_mut().expect("checked by the caller");
+        if moves && selected.read_only {
+            self.send(format!(
+                "{tag} NO [READ-ONLY] the folder was examined, not selected"
+            ));
+            return Flow::Continue;
+        }
+        let max = selected.view.last().map_or(0, |m| m.uid);
+        let mut state = self.shared.state();
+        let Some(target_index) = state.folders.iter().position(|f| f.name == target) else {
+            drop(state);
+            self.send(format!("{tag} NO [TRYCREATE] no such folder"));
+            return Flow::Continue;
+        };
+        let source_index = state
+            .folders
+            .iter()
+            .position(|f| f.name == selected.folder)
+            .expect("the selected folder exists");
+        let mut pairs = Vec::new();
+        let mut gone = Vec::new();
+        for (index, entry) in selected.view.iter().enumerate() {
+            if !set.contains(entry.uid, max) {
+                continue;
+            }
+            let Some(message) = state.folders[source_index]
+                .messages
+                .iter()
+                .find(|m| m.uid == entry.uid)
+            else {
+                continue;
+            };
+            let message = StoredMessage {
+                uid: message.uid,
+                raw: message.raw.clone(),
+                flags: message.flags.clone(),
+                internal_date: message.internal_date.clone(),
+                modseq: message.modseq,
+            };
+            let new = state.folders[target_index].add_copy(&message);
+            pairs.push((message.uid, new));
+            gone.push(index);
+        }
+        let uidvalidity = state.folders[target_index].uidvalidity;
+        if moves {
+            let moved: Vec<u32> = pairs.iter().map(|(old, _)| *old).collect();
+            state.folders[source_index]
+                .messages
+                .retain(|m| !moved.contains(&m.uid));
+        }
+        drop(state);
+        let copyuid = (self.shared.uidplus && !pairs.is_empty()).then(|| {
+            let old: Vec<String> = pairs.iter().map(|(old, _)| old.to_string()).collect();
+            let new: Vec<String> = pairs.iter().map(|(_, new)| new.to_string()).collect();
+            format!(
+                "[COPYUID {uidvalidity} {} {}] ",
+                old.join(","),
+                new.join(",")
+            )
+        });
+        if moves {
+            if let Some(copyuid) = &copyuid {
+                self.send(format!("* OK {copyuid}moved"));
+            }
+            let selected = self.selected.as_mut().expect("checked above");
+            let mut lines = Vec::new();
+            for index in gone.into_iter().rev() {
+                lines.push(format!("* {} EXPUNGE", index + 1));
+                selected.view.remove(index);
+            }
+            for line in lines {
+                self.send(line);
+            }
+        }
+        if !pairs.is_empty() {
+            self.shared.changes.send_modify(|_| {});
+            self.changes.borrow_and_update();
+        }
+        let code = if moves { None } else { copyuid };
+        self.send(format!(
+            "{tag} OK {}{command} completed",
+            code.unwrap_or_default()
+        ));
+        Flow::Continue
+    }
+
+    /// `UID EXPUNGE`: removes the messages of the set marked `\Deleted`, and only those.
+    fn expunge(&mut self, args: &[Token]) -> Result<(), String> {
+        let Some(set) = args.first().and_then(Token::raw).and_then(Set::parse) else {
+            return Err("BAD UID EXPUNGE takes a set".to_owned());
+        };
+        let selected = self.selected.as_mut().expect("checked by the caller");
+        if selected.read_only {
+            return Err("NO [READ-ONLY] the folder was examined, not selected".to_owned());
+        }
+        let max = selected.view.last().map_or(0, |m| m.uid);
+        let mut state = self.shared.state();
+        let folder = state.folder(&selected.folder);
+        let mut lines = Vec::new();
+        for index in (0..selected.view.len()).rev() {
+            let uid = selected.view[index].uid;
+            if !set.contains(uid, max) {
+                continue;
+            }
+            let deleted = folder.messages.iter().any(|m| {
+                m.uid == uid && m.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Deleted"))
+            });
+            if deleted {
+                folder.messages.retain(|m| m.uid != uid);
+                selected.view.remove(index);
+                lines.push(format!("* {} EXPUNGE", index + 1));
+            }
+        }
+        drop(state);
+        if !lines.is_empty() {
+            self.shared.changes.send_modify(|_| {});
+            self.changes.borrow_and_update();
+        }
+        for line in lines {
+            self.send(line);
+        }
+        Ok(())
+    }
+
     fn search(&mut self, args: &[Token], uid: bool) -> Result<(), String> {
         let selected = self.selected.as_ref().expect("checked by the caller");
         let mut state = self.shared.state();
@@ -585,6 +819,15 @@ impl Session {
                 "UNDELETED" => flag("\\Deleted", false),
                 "DRAFT" => flag("\\Draft", true),
                 "UNDRAFT" => flag("\\Draft", false),
+                "HEADER" => {
+                    let (Some(field), Some(value)) = (
+                        args.next().and_then(Token::string),
+                        args.next().and_then(Token::string),
+                    ) else {
+                        return Err("BAD HEADER takes a field and a string".to_owned());
+                    };
+                    Box::new(move |_, m| header_holds(&m.raw, &field, &value))
+                }
                 "UID" => {
                     let set = args
                         .next()
@@ -723,6 +966,17 @@ impl Session {
             return true;
         }
     }
+}
+
+/// Whether a header field of the message holds `value`, in any case, as `SEARCH HEADER` asks.
+fn header_holds(raw: &[u8], field: &str, value: &str) -> bool {
+    let header = String::from_utf8_lossy(&raw[..header_end(raw)]);
+    let value = value.to_ascii_lowercase();
+    let prefix = format!("{}:", field.to_ascii_lowercase());
+    header.split("\r\n").any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.starts_with(&prefix) && line[prefix.len()..].contains(&value)
+    })
 }
 
 /// A `SEARCH` criterion, given a message and its sequence number.
