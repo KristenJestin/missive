@@ -1026,7 +1026,7 @@ async fn a_server_that_advertises_idle_but_refuses_it_does_not_block_the_worker(
     let _daemon = env.daemon(&["--check-interval", "1"]).await;
     succeeded(&env.sync().await);
 
-    // Asked while the worker waits for the server to start IDLE, which it never does.
+    // Asked once the server refused IDLE: the worker goes on without it.
     succeeded(&sync_soon(&env).await);
 
     // The periodic check goes on, and IDLE is not asked again.
@@ -1041,6 +1041,95 @@ async fn a_server_that_advertises_idle_but_refuses_it_does_not_block_the_worker(
     assert_eq!(env.state("alice").as_deref(), Some("ready"));
     assert_eq!(idles(), 1);
     assert!(env.logs().contains("refuses IDLE"), "{}", env.logs());
+}
+
+fn idles(server: &FakeServer) -> usize {
+    server.imap_log().iter().filter(|c| *c == "IDLE").count()
+}
+
+/// Every command in the log is one that changes nothing on the server.
+fn only_read_only_commands(server: &FakeServer) {
+    for command in server.imap_log() {
+        let name = command.split(' ').next().unwrap().to_ascii_uppercase();
+        let allowed = match name.as_str() {
+            "CAPABILITY" | "LOGIN" | "LIST" | "EXAMINE" | "IDLE" | "DONE" | "NOOP" | "LOGOUT" => {
+                true
+            }
+            "ENABLE" => command == "ENABLE CONDSTORE",
+            "UID" => {
+                let upper = command.to_ascii_uppercase();
+                upper.starts_with("UID SEARCH ")
+                    || (upper.starts_with("UID FETCH ")
+                        && !upper.contains("BODY[")
+                        && !upper.replace("RFC822.SIZE", "").contains("RFC822"))
+            }
+            _ => false,
+        };
+        assert!(allowed, "{command:?} is not read only");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_stalled_once_is_tried_again_after_the_reconnection() {
+    let server = mailbox().stall("IDLE").start().await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    // The periodic check is an hour away: only IDLE can bring the message in.
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    succeeded(&env.sync().await);
+    eventually(10, "IDLE", || idles(&server) == 1).await;
+    // The server never answered that IDLE; from now on it behaves.
+    server.heal();
+
+    eventually(20, "IDLE on a new connection", || idles(&server) == 2).await;
+    let uid = server.deliver("INBOX", message(7));
+
+    eventually(10, "the new message, through IDLE", || {
+        env.uids("INBOX").contains(&uid)
+    })
+    .await;
+    assert_eq!(logins(&server, USER), 2);
+    assert_eq!(idles(&server), 2);
+    only_read_only_commands(&server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_bad_to_idle_neither_panics_nor_loses_the_account() {
+    let server = mailbox().bare_bad("IDLE").start().await;
+    let other = FakeServer::builder()
+        .user(OTHER_USER, OTHER_PASSWORD)
+        .folder(Folder::new("Notes"))
+        .start()
+        .await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    env.add_account("bob", &other, OTHER_USER, Some(OTHER_PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "1"]).await;
+    succeeded(&env.sync().await);
+    eventually(10, "IDLE", || idles(&server) == 1).await;
+
+    // New mail of both accounts comes with the periodic check.
+    let uid = server.deliver("INBOX", message(7));
+    let other_uid = other.deliver("Notes", message(8));
+    eventually(20, "the new message", || env.uids("INBOX").contains(&uid)).await;
+    eventually(20, "the other account's new message", || {
+        env.uids("Notes").contains(&other_uid)
+    })
+    .await;
+
+    let output = sync_soon(&env).await;
+    succeeded(&output);
+    assert_eq!(stdout(&output), "alice: ready\nbob: ready\n");
+    let logs = env.logs();
+    assert!(!logs.contains("panicked"), "{logs}");
+    assert!(logs.contains("refuses IDLE"), "{logs}");
+    // IDLE is asked once per connection, and the connection is kept.
+    assert_eq!(logins(&server, USER), 1);
+    assert_eq!(idles(&server), 1);
+    only_read_only_commands(&server);
 }
 
 #[tokio::test(flavor = "multi_thread")]

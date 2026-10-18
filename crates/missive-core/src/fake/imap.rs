@@ -44,10 +44,13 @@ pub(super) async fn serve(
         let text = String::from_utf8_lossy(&line);
         let text = text.trim_end_matches(['\r', '\n']);
         let rule = session.shared.rule(text);
-        let flow = if rule == Some(Action::Refuse) {
-            session.refuse(text)
-        } else {
-            session.command(text)
+        let flow = match rule {
+            Some(Action::Refuse) => {
+                session.refuse(text, Some("NO [UNAVAILABLE] the test refused this command"))
+            }
+            Some(Action::BareBad) => session.refuse(text, Some("BAD")),
+            Some(Action::Stall) => session.refuse(text, None),
+            _ => session.command(text),
         };
         if !session.shared.fetch_delay.is_zero() && is_fetch(text) {
             tokio::time::sleep(session.shared.fetch_delay).await;
@@ -256,8 +259,8 @@ impl Session {
         Flow::Continue
     }
 
-    /// Answers `NO` to a command a test asked to refuse, without running it.
-    fn refuse(&mut self, line: &str) -> Flow {
+    /// Answers `answer` (or nothing) to a command a test asked to refuse, without running it.
+    fn refuse(&mut self, line: &str, answer: Option<&str>) -> Flow {
         let (tag, rest) = line.split_once(' ').unwrap_or((line, ""));
         let name = rest
             .split(' ')
@@ -265,9 +268,9 @@ impl Session {
             .unwrap_or_default()
             .to_ascii_uppercase();
         self.log(&name, rest);
-        self.send(format!(
-            "{tag} NO [UNAVAILABLE] the test refused this command"
-        ));
+        if let Some(answer) = answer {
+            self.send(format!("{tag} {answer}"));
+        }
         Flow::Continue
     }
 

@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use async_imap::extensions::idle::IdleResponse;
 use missive_core::account::{Account, AccountStore, Password};
 use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap};
 use missive_core::copy::Copy;
@@ -45,8 +44,8 @@ use tokio::task::JoinSet;
 /// IDLE is re-issued after this long at most: RFC 2177 lets a server drop a client idle for 30
 /// minutes, and asks clients to re-issue it every 29.
 const IDLE_RENEWAL: Duration = Duration::from_secs(25 * 60);
-/// How long a server is given to start IDLE, and to end it. A server that advertises IDLE but
-/// refuses it (`NO`) is not heard from again by `async-imap`, which goes on reading.
+/// How long a server is given to start IDLE, and to end it: a half-dead connection answers
+/// nothing, and would hold the worker for ever.
 const IDLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a worker in the middle of a sync is given to finish it when the daemon stops.
 const STOP_GRACE: Duration = Duration::from_secs(3);
@@ -320,6 +319,7 @@ impl Daemon {
                 stop: self.stopping.clone(),
                 waiting: Vec::new(),
                 idle_refused: false,
+                idle_backoff: Backoff::default(),
                 completed: reader.completed(key).unwrap_or(false),
                 reader,
                 copy,
@@ -529,9 +529,9 @@ enum Ended {
     Stopped,
     /// The connection failed, or the copy could not be written: connect again later.
     Lost(SyncError),
-    /// The server did not start IDLE although it advertises it: the connection is dropped, and
-    /// the next one does without IDLE.
-    IdleRefused,
+    /// The server did not answer IDLE in time although it advertises it: what the connection is
+    /// in is not known, so it is dropped, and the next one tries IDLE again.
+    IdleStalled,
 }
 
 /// What ended a wait between two syncs.
@@ -540,7 +540,7 @@ enum Wake {
     Inbox,
     /// A sync was asked for, or the periodic check is due.
     Sync,
-    /// IDLE ran its time; the periodic check may not be due yet.
+    /// IDLE ran its time, or the server refused it; the periodic check may not be due yet.
     Renew,
     Stop,
 }
@@ -573,8 +573,12 @@ struct Worker {
     stop: watch::Receiver<bool>,
     /// The requests the next sync answers.
     waiting: Vec<Waiter>,
-    /// Whether the server refused IDLE: the inbox is then checked with the other folders.
+    /// Whether the server refused IDLE on this connection: the inbox is then checked with the
+    /// other folders until the next connection, which tries IDLE again.
     idle_refused: bool,
+    /// Connection attempts after IDLE stalled, so that a server that never answers it is not
+    /// connected to again and again: reset when IDLE starts.
+    idle_backoff: Backoff,
     /// Whether a pass over every folder of the account ever ended: until then what a sync brings
     /// is the account's mail so far, not mail that arrives.
     completed: bool,
@@ -614,16 +618,17 @@ impl Worker {
             let retry = match opened {
                 Ok(session) => match self.connected(session, &mut backoff).await {
                     Ended::Stopped => return,
-                    Ended::IdleRefused => {
+                    // Not unreachable: the server answered everything else.
+                    Ended::IdleStalled => {
+                        let delay = self.idle_backoff.next();
                         log!(
-                            "account {}: the server refuses IDLE, so the inbox is checked every \
-                             {} s with the other folders",
+                            "account {}: the server did not start IDLE within {} s; connecting \
+                             again in {} s",
                             self.key,
-                            self.options.check_interval.as_secs()
+                            IDLE_COMMAND_TIMEOUT.as_secs(),
+                            delay.as_secs()
                         );
-                        self.idle_refused = true;
-                        // Not unreachable: connect again at once.
-                        Some(Duration::ZERO)
+                        Some(delay)
                     }
                     // Answered and recorded now: a session lost at the same point at every
                     // pass would otherwise leave the requests waiting, and the state `syncing`,
@@ -786,6 +791,7 @@ impl Worker {
             };
         }
         let capabilities = check!(sync::prepare(&mut session).await);
+        self.idle_refused = false;
         log!(
             "account {}: connected ({}, {})",
             self.key,
@@ -982,60 +988,48 @@ impl Worker {
     /// Idles in the selected folder for at most `timeout` in all, and says what ended it.
     async fn idle(
         &mut self,
-        session: ImapSession,
+        mut session: ImapSession,
         timeout: Duration,
     ) -> Result<(Wake, ImapSession), Ended> {
-        let mut handle = session.idle();
-        match tokio::time::timeout(IDLE_COMMAND_TIMEOUT, handle.init()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(Ended::Lost(error.into())),
-            Err(_) => return Err(Ended::IdleRefused),
-        }
-        let (result, asked) = {
-            // The wait's own timeout only counts silence, and a server's keepalives
-            // (`* OK Still here`) break it: the sleep bounds the whole of it.
-            let (wait, interrupt) = handle.wait_with_timeout(timeout);
-            tokio::pin!(wait);
-            let renewal = tokio::time::sleep(timeout);
-            tokio::pin!(renewal);
-            let mut interrupt = Some(interrupt);
-            let mut asked = None;
-            // A request, a stop or the end of the time interrupts IDLE; the wait then ends, and
-            // the session is whole.
-            let result = loop {
-                tokio::select! {
-                    result = &mut wait => break result,
-                    _ = &mut renewal, if interrupt.is_some() => {
-                        asked = Some(Wake::Renew);
-                        interrupt = None;
-                    }
-                    request = self.requests.recv(), if interrupt.is_some() => {
-                        asked = Some(match request {
-                            Some(waiter) => {
-                                self.waiting.push(waiter);
-                                Wake::Sync
-                            }
-                            None => Wake::Stop,
-                        });
-                        interrupt = None;
-                    }
-                    _ = stopped(&mut self.stop), if interrupt.is_some() => {
-                        asked = Some(Wake::Stop);
-                        interrupt = None;
-                    }
+        let mut idle =
+            match tokio::time::timeout(IDLE_COMMAND_TIMEOUT, sync::idle(&mut session)).await {
+                Ok(Ok(Some(idle))) => idle,
+                // The server answered IDLE without starting it: the session is whole, and goes on
+                // without IDLE.
+                Ok(Ok(None)) => {
+                    log!(
+                        "account {}: the server refuses IDLE, so the inbox is checked every {} s \
+                         with the other folders",
+                        self.key,
+                        self.options.check_interval.as_secs()
+                    );
+                    self.idle_refused = true;
+                    return Ok((Wake::Renew, session));
                 }
+                Ok(Err(error)) => return Err(Ended::Lost(error)),
+                Err(_) => return Err(Ended::IdleStalled),
             };
-            (result, asked)
+        self.idle_backoff = Backoff::default();
+        // A request, a stop or the end of the time interrupts the wait, which loses nothing when
+        // it is dropped; the server's keepalives (`* OK Still here`) do not.
+        let wake = tokio::select! {
+            news = idle.news(&mut session) => match news {
+                Ok(()) => Wake::Inbox,
+                Err(error) => return Err(Ended::Lost(error)),
+            },
+            _ = tokio::time::sleep(timeout) => Wake::Renew,
+            request = self.requests.recv() => match request {
+                Some(waiter) => {
+                    self.waiting.push(waiter);
+                    Wake::Sync
+                }
+                None => Wake::Stop,
+            },
+            _ = stopped(&mut self.stop) => Wake::Stop,
         };
-        let wake = match result {
-            Ok(IdleResponse::NewData(_)) => asked.unwrap_or(Wake::Inbox),
-            Ok(IdleResponse::Timeout) => asked.unwrap_or(Wake::Renew),
-            Ok(IdleResponse::ManualInterrupt) => asked.unwrap_or(Wake::Sync),
-            Err(error) => return Err(Ended::Lost(error.into())),
-        };
-        match tokio::time::timeout(IDLE_COMMAND_TIMEOUT, handle.done()).await {
-            Ok(Ok(session)) => Ok((wake, session)),
-            Ok(Err(error)) => Err(Ended::Lost(error.into())),
+        match tokio::time::timeout(IDLE_COMMAND_TIMEOUT, idle.done(&mut session)).await {
+            Ok(Ok(())) => Ok((wake, session)),
+            Ok(Err(error)) => Err(Ended::Lost(error)),
             Err(_) => Err(Ended::Lost(SyncError::Connection(
                 ConnectError::Unreachable("the IMAP server did not end IDLE".to_owned()),
             ))),
