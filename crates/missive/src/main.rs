@@ -1,3 +1,4 @@
+mod act;
 mod daemon;
 mod open;
 mod read;
@@ -78,6 +79,16 @@ enum Command {
     /// phones home (see docs/cli.md), from a private file; prints that file's path. Reads the
     /// local copy only; exits with 3 when the identifier names no message.
     Open(open::OpenArgs),
+    /// Mark messages read or unread, flagged or not. Shown in the local copy at once, applied on
+    /// the server when the account is connected; starts the daemon when none runs.
+    Mark(act::MarkArgs),
+    /// Move messages to another folder of their account. Shown in the local copy at once, applied
+    /// on the server when the account is connected; starts the daemon when none runs.
+    Move(act::MoveArgs),
+    /// Move messages to the trash, or with --permanently delete them for good from it. Shown in
+    /// the local copy at once, applied on the server when the account is connected; starts the
+    /// daemon when none runs.
+    Delete(act::DeleteArgs),
 }
 
 #[derive(Args)]
@@ -90,6 +101,9 @@ struct DaemonArgs {
     /// (and never more than 32 MiB of them, but for a single larger message).
     #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..=100))]
     batch_size: u64,
+    /// How long, in seconds, the server is given to answer each command of an action.
+    #[arg(long, value_name = "SECONDS", default_value_t = missive_core::actions::COMMAND_TIMEOUT.as_secs(), value_parser = clap::value_parser!(u64).range(1..), hide = true)]
+    action_timeout: u64,
 }
 
 #[derive(Subcommand)]
@@ -188,6 +202,7 @@ async fn main() -> ExitCode {
         Command::Daemon(args) => daemon::run(daemon::Options {
             check_interval: Duration::from_secs(args.check_interval),
             batch_size: args.batch_size as usize,
+            action_timeout: Duration::from_secs(args.action_timeout),
         })
         .await
         .map_err(Failure),
@@ -211,6 +226,9 @@ async fn main() -> ExitCode {
             }
             Err(read::ShowError::Failed(message)) => Err(Failure(message)),
         },
+        Command::Mark(args) => acted(act::mark(args).await),
+        Command::Move(args) => acted(act::move_to(args).await),
+        Command::Delete(args) => acted(act::delete(args).await),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -218,6 +236,18 @@ async fn main() -> ExitCode {
             eprintln!("missive: {message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// An action's result, with the exit status of an identifier that names no message.
+fn acted(result: std::result::Result<(), act::ActError>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(act::ActError::NotFound(message)) => {
+            eprintln!("missive: {message}");
+            std::process::exit(act::NOT_FOUND.into());
+        }
+        Err(act::ActError::Failed(message)) => Err(Failure(message)),
     }
 }
 

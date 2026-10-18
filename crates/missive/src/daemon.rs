@@ -6,6 +6,12 @@
 //! the inbox (`IDLE`, re-issued at least every 25 minutes, under the 29 the RFC allows) until new
 //! mail, a request, or the periodic check of the other folders.
 //!
+//! An action the user asks for (`mark`, `move`, `delete`) is recorded in the copy's queue by the
+//! connection that asked, with its change to the copy, and answered at once, connected or not.
+//! The account's worker is then woken: it applies the queue when it is connected, before each
+//! pass over the folders and whenever it is woken, between syncs (see
+//! [`missive_core::actions`]).
+//!
 //! A connection that sends `subscribe` is a watcher: the daemon then writes it the events of the
 //! workers (`docs/events.md`). They travel on a bounded broadcast channel, so that a watcher that
 //! reads too slowly misses events, is told how many, and holds nothing else back.
@@ -23,15 +29,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use missive_core::account::{Account, AccountStore, Password};
+use missive_core::actions::{self, Kind, Outcome, Wanted};
 use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap};
-use missive_core::copy::Copy;
-use missive_core::events::{Event, Reader, Unread};
+use missive_core::copy::{Copy, MessageId};
+use missive_core::events::{ActionEvent, Event, Reader, Unread};
 use missive_core::keyring::{Keyring, KeyringError};
 use missive_core::protocol::{
     AccountState, Answer, Command, PROTOCOL, pid_path, read_request, runtime_dir, socket_path,
 };
 use missive_core::store::Store;
-use missive_core::sync::{self, Changes, Folder, SyncError};
+use missive_core::sync::{self, Capabilities, Changes, Folder, SyncError};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
@@ -68,6 +75,8 @@ pub struct Options {
     pub check_interval: Duration,
     /// How many new messages are fetched, and written to the copy, at a time.
     pub batch_size: usize,
+    /// How long the server is given to answer each command of an action.
+    pub action_timeout: Duration,
 }
 
 macro_rules! log {
@@ -79,6 +88,14 @@ macro_rules! log {
 /// Where a request waits for the end of the sync it asked for: it receives the account's state,
 /// or why the local copy could not be written.
 type Waiter = oneshot::Sender<Result<String, String>>;
+
+/// What a worker is asked.
+enum Request {
+    /// A sync, answered when it ended.
+    Sync(Waiter),
+    /// Actions were recorded in the queue.
+    Actions,
+}
 
 /// Runs the daemon until SIGTERM or SIGINT.
 pub async fn run(options: Options) -> Result<(), String> {
@@ -245,8 +262,8 @@ struct Daemon {
     events: Arc<Events>,
     store: PathBuf,
     stopping: watch::Receiver<bool>,
-    /// Where to send each account's sync requests, by identifier.
-    workers: Mutex<BTreeMap<String, mpsc::UnboundedSender<Waiter>>>,
+    /// Where to send each account's requests, by identifier.
+    workers: Mutex<BTreeMap<String, mpsc::UnboundedSender<Request>>>,
     tasks: Mutex<JoinSet<()>>,
 }
 
@@ -320,6 +337,8 @@ impl Daemon {
                 waiting: Vec::new(),
                 idle_refused: false,
                 idle_backoff: Backoff::default(),
+                queue_waits: false,
+                queue_failed: false,
                 completed: reader.completed(key).unwrap_or(false),
                 reader,
                 copy,
@@ -422,7 +441,7 @@ impl Daemon {
         match command {
             Command::Sync { account } => {
                 self.reload();
-                let targets: Vec<(String, mpsc::UnboundedSender<Waiter>)> = locked(&self.workers)
+                let targets: Vec<(String, mpsc::UnboundedSender<Request>)> = locked(&self.workers)
                     .iter()
                     .filter(|(id, _)| account.as_ref().is_none_or(|a| a == *id))
                     .map(|(id, sender)| (id.clone(), sender.clone()))
@@ -439,7 +458,7 @@ impl Daemon {
                 let mut pending = Vec::new();
                 for (id, sender) in targets {
                     let (waiter, answer) = oneshot::channel();
-                    let _ = sender.send(waiter);
+                    let _ = sender.send(Request::Sync(waiter));
                     pending.push((id, answer));
                 }
                 let mut accounts = Vec::new();
@@ -463,6 +482,78 @@ impl Daemon {
                 }
             }
             Command::Subscribe => unreachable!("`serve` answers a subscription itself"),
+            Command::Mark { messages, mark_as } => match Kind::parse(&mark_as) {
+                Some(kind) if kind.flag().is_some() => {
+                    self.record(name, &messages, Wanted::Mark(kind))
+                }
+                _ => Answer::error(
+                    Some(name),
+                    "bad-request",
+                    "`as` is read, unread, flagged or unflagged",
+                ),
+            },
+            Command::Move { messages, to } => self.record(name, &messages, Wanted::Move(to)),
+            Command::Delete {
+                messages,
+                permanently,
+            } => self.record(name, &messages, Wanted::Delete { permanently }),
+        }
+    }
+
+    /// Records an action in the queue, with its change to the copy, and wakes the workers of its
+    /// accounts. Answered once recorded: whether the server is reachable does not matter here.
+    fn record(&self, name: &str, messages: &[String], wanted: Wanted) -> Answer {
+        if messages.is_empty() {
+            return Answer::error(Some(name), "bad-request", "no message is named");
+        }
+        self.reload();
+        let workers = locked(&self.workers).clone();
+        // A message of an account that is no longer configured has no worker to apply it.
+        for id in messages {
+            if let Some(parsed) = MessageId::parse(id)
+                && !workers.contains_key(&parsed.account)
+            {
+                return Answer::error(
+                    Some(name),
+                    "no-such-account",
+                    format!(
+                        "no account {} (missive account list shows them)",
+                        parsed.account
+                    ),
+                );
+            }
+        }
+        let queued = Store::open(&self.store).and_then(|mut store| store.queue(messages, &wanted));
+        let queued = match queued {
+            Ok(Ok(queued)) => queued,
+            Ok(Err(refused)) => return Answer::error(Some(name), refused.error, refused.message),
+            Err(e) => {
+                log!("cannot record an action in the local copy ({e})");
+                return Answer::error(
+                    Some(name),
+                    "failed",
+                    format!("the local copy could not be written ({e})"),
+                );
+            }
+        };
+        log!(
+            "recorded an action ({name}) on {} messages",
+            queued.messages.len()
+        );
+        for account in &queued.accounts {
+            if let Some(worker) = workers.get(account) {
+                let _ = worker.send(Request::Actions);
+            }
+        }
+        if let Some(copy) = open_copy(&self.store) {
+            self.events.unread(&copy);
+        }
+        Answer {
+            protocol: PROTOCOL,
+            answer: Some(name.to_owned()),
+            ok: true,
+            messages: Some(queued.messages),
+            ..Answer::default()
         }
     }
 }
@@ -540,8 +631,19 @@ enum Wake {
     Inbox,
     /// A sync was asked for, or the periodic check is due.
     Sync,
+    /// Actions were recorded.
+    Actions,
     /// IDLE ran its time, or the server refused it; the periodic check may not be due yet.
     Renew,
+    Stop,
+}
+
+/// What ended [`Worker::wait`].
+#[derive(Debug, PartialEq, Eq)]
+enum Waited {
+    Sync,
+    Actions,
+    Timeout,
     Stop,
 }
 
@@ -569,7 +671,7 @@ struct Worker {
     certificate: Option<CertificateDer<'static>>,
     store: Store,
     options: Options,
-    requests: mpsc::UnboundedReceiver<Waiter>,
+    requests: mpsc::UnboundedReceiver<Request>,
     stop: watch::Receiver<bool>,
     /// The requests the next sync answers.
     waiting: Vec<Waiter>,
@@ -579,6 +681,12 @@ struct Worker {
     /// Connection attempts after IDLE stalled, so that a server that never answers it is not
     /// connected to again and again: reset when IDLE starts.
     idle_backoff: Backoff,
+    /// Whether the first action of the queue failed (a `NO`, a lost connection…): the queue then
+    /// waits for the next pass, rather than being tried again at each wake.
+    queue_waits: bool,
+    /// Whether the queue stopped on an error: the next pass syncs the folders before it tries
+    /// the queue again, so that an action that always fails never keeps the account from its mail.
+    queue_failed: bool,
     /// Whether a pass over every folder of the account ever ended: until then what a sync brings
     /// is the account's mail so far, not mail that arrives.
     completed: bool,
@@ -602,7 +710,7 @@ impl Worker {
                     Some(found) => password = Some(found),
                     None => {
                         self.settle("no-login");
-                        if !self.wait(None).await {
+                        if self.wait(None, false).await == Waited::Stop {
                             return;
                         }
                         continue;
@@ -669,7 +777,7 @@ impl Worker {
                     Some(delay)
                 }
             };
-            if !self.wait(retry).await {
+            if self.wait(retry, false).await == Waited::Stop {
                 return;
             }
         }
@@ -696,10 +804,13 @@ impl Worker {
         }
     }
 
-    /// Moves the requests sent so far to those the next sync answers.
+    /// Moves the requests sent so far to those the next sync answers. Actions need no answer:
+    /// the next pass applies the queue.
     fn take_requests(&mut self) {
-        while let Ok(waiter) = self.requests.try_recv() {
-            self.waiting.push(waiter);
+        while let Ok(request) = self.requests.try_recv() {
+            if let Request::Sync(waiter) = request {
+                self.waiting.push(waiter);
+            }
         }
     }
 
@@ -734,25 +845,31 @@ impl Worker {
         }
     }
 
-    /// Waits for a request, for `timeout` when there is one, or for the daemon to stop. `false`
-    /// when the worker must end.
-    async fn wait(&mut self, timeout: Option<Duration>) -> bool {
+    /// Waits for a request, for `timeout` when there is one, or for the daemon to stop. Actions
+    /// end the wait only when `actions`: without a connection they wait for the next one, and do
+    /// not make the worker connect sooner than its backoff says.
+    async fn wait(&mut self, timeout: Option<Duration>, actions: bool) -> Waited {
         let sleep = async {
             match timeout {
                 Some(timeout) => tokio::time::sleep(timeout).await,
                 None => std::future::pending().await,
             }
         };
-        tokio::select! {
-            request = self.requests.recv() => match request {
-                Some(waiter) => {
-                    self.waiting.push(waiter);
-                    true
-                }
-                None => false,
-            },
-            _ = sleep => true,
-            _ = stopped(&mut self.stop) => false,
+        tokio::pin!(sleep);
+        loop {
+            return tokio::select! {
+                request = self.requests.recv() => match request {
+                    Some(Request::Sync(waiter)) => {
+                        self.waiting.push(waiter);
+                        Waited::Sync
+                    }
+                    Some(Request::Actions) if actions => Waited::Actions,
+                    Some(Request::Actions) => continue,
+                    None => Waited::Stop,
+                },
+                _ = &mut sleep => Waited::Timeout,
+                _ = stopped(&mut self.stop) => Waited::Stop,
+            };
         }
     }
 
@@ -803,8 +920,13 @@ impl Worker {
             if capabilities.idle { "IDLE" } else { "no IDLE" }
         );
         loop {
-            // Every folder.
+            // What waits in the queue first, then every folder; after a queue that failed, the
+            // folders first.
             self.take_requests();
+            let queue_first = !self.queue_failed;
+            if queue_first {
+                check!(self.apply(&mut session, capabilities, &mut [], true).await);
+            }
             self.events.send(Event::SyncStarted {
                 account: self.id.clone(),
             });
@@ -843,11 +965,21 @@ impl Worker {
             );
             self.answer("ready");
             *backoff = Backoff::default();
+            if !queue_first {
+                check!(
+                    self.apply(&mut session, capabilities, &mut folders, true)
+                        .await
+                );
+            }
 
             // Then the inbox only, until the next check of every folder.
             let inbox = folders.iter().position(|f| f.role == Some("inbox"));
             let next_check = Instant::now() + self.options.check_interval;
             loop {
+                check!(
+                    self.apply(&mut session, capabilities, &mut folders, false)
+                        .await
+                );
                 let left = next_check.saturating_duration_since(Instant::now());
                 let wake = match (capabilities.idle && !self.idle_refused, inbox) {
                     (true, Some(inbox)) => {
@@ -869,22 +1001,109 @@ impl Worker {
                         };
                         wake
                     }
-                    _ => {
-                        if self.wait(Some(left)).await {
-                            Wake::Sync
-                        } else {
-                            Wake::Stop
-                        }
-                    }
+                    _ => match self.wait(Some(left), true).await {
+                        Waited::Stop => Wake::Stop,
+                        Waited::Actions => Wake::Actions,
+                        Waited::Sync | Waited::Timeout => Wake::Sync,
+                    },
                 };
                 match wake {
                     Wake::Stop => return (Ended::Stopped, Some(session)),
                     Wake::Sync => break,
                     Wake::Renew if Instant::now() >= next_check => break,
-                    Wake::Renew | Wake::Inbox => {}
+                    // The actions are applied at the top of the loop.
+                    Wake::Renew | Wake::Inbox | Wake::Actions => {}
                 }
             }
         }
+    }
+
+    /// Applies the account's queue on the server, tells what became of each action, and syncs
+    /// at once those of `folders` whose copy has to catch up with the server. An action that
+    /// failed is tried again at the next `pass` only. A connection error of the queue is an error
+    /// only when a command got no answer in time; otherwise the session goes on, and its next
+    /// command tells whether the connection is still there.
+    async fn apply(
+        &mut self,
+        session: &mut ImapSession,
+        capabilities: Capabilities,
+        folders: &mut [Folder],
+        pass: bool,
+    ) -> Result<(), SyncError> {
+        if self.queue_waits && !pass {
+            return Ok(());
+        }
+        let (applied, result) = actions::apply(
+            session,
+            &mut self.store,
+            self.key,
+            &self.id,
+            capabilities,
+            self.options.action_timeout,
+        )
+        .await;
+        self.queue_waits = applied
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome.result, actions::Result::Retried { .. }));
+        self.queue_failed = result.is_err();
+        for outcome in &applied.outcomes {
+            self.tell_outcome(outcome);
+        }
+        if !applied.outcomes.is_empty() {
+            self.events.unread(&self.copy);
+        }
+        match result {
+            Ok(()) => {}
+            // What the connection says next cannot be trusted.
+            Err(error) if applied.timed_out => return Err(error),
+            Err(error @ SyncError::Connection(_)) => {
+                log!("account {}: the queue stopped ({})", self.key, kind(&error));
+            }
+            Err(error) => return Err(error),
+        }
+        for id in applied.resync {
+            if let Some(folder) = folders.iter_mut().find(|f| f.row.id == id) {
+                // The queue may have changed what the copy knows of it (its HIGHESTMODSEQ).
+                folder.row = self.store.folder(self.key, &folder.name, folder.role)?;
+                self.folder(session, folder).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Logs what became of an action, and tells the watchers.
+    fn tell_outcome(&mut self, outcome: &Outcome) {
+        let (name, reason, attempts, message) = match &outcome.result {
+            actions::Result::Applied => ("applied", None, None, None),
+            actions::Result::Retried { attempts, reason } => {
+                ("retried", Some(*reason), Some(*attempts), None)
+            }
+            actions::Result::Refused { reason, message } => {
+                ("refused", Some(*reason), None, Some(message.clone()))
+            }
+        };
+        log!(
+            "account {}: action {} ({}, {} messages) {name}{}",
+            self.key,
+            outcome.action,
+            outcome.kind.name(),
+            outcome.messages.len(),
+            match (reason, &message) {
+                (_, Some(message)) => format!(": {message}"),
+                (Some(reason), None) => format!(" ({reason})"),
+                (None, None) => String::new(),
+            }
+        );
+        self.events.send(Event::Action(ActionEvent {
+            account: self.id.clone(),
+            action: outcome.kind.name().to_owned(),
+            outcome: name.to_owned(),
+            messages: outcome.messages.clone(),
+            reason: reason.map(str::to_owned),
+            attempts,
+            message,
+        }));
     }
 
     /// Syncs one folder and logs what is worth knowing.
@@ -1019,10 +1238,11 @@ impl Worker {
             },
             _ = tokio::time::sleep(timeout) => Wake::Renew,
             request = self.requests.recv() => match request {
-                Some(waiter) => {
+                Some(Request::Sync(waiter)) => {
                     self.waiting.push(waiter);
                     Wake::Sync
                 }
+                Some(Request::Actions) => Wake::Actions,
                 None => Wake::Stop,
             },
             _ = stopped(&mut self.stop) => Wake::Stop,

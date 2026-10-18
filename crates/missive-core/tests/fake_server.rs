@@ -777,3 +777,171 @@ async fn smtp_refuses_a_wrong_password_and_mail_without_auth() {
     );
     assert!(server.smtp_messages().is_empty());
 }
+
+/// INBOX with three messages, the second already marked `\Deleted` by another client, an
+/// archive and a trash.
+async fn writable(builder: missive_core::fake::Builder) -> FakeServer {
+    builder
+        .user(USER, PASSWORD)
+        .folder(
+            Folder::new("INBOX")
+                .message(Message::new(HELLO))
+                .message(Message::new(AGAIN).flag("\\Deleted"))
+                .message(Message::new(HELLO).flag("\\Seen")),
+        )
+        .folder(Folder::new("Archive").special_use(SpecialUse::Archive))
+        .folder(Folder::new("Trash").special_use(SpecialUse::Trash))
+        .start()
+        .await
+}
+
+#[tokio::test]
+async fn uid_store_changes_flags_and_answers_them_only_in_a_selected_folder() {
+    let server = writable(FakeServer::builder()).await;
+    let mut session = login(imap_tls(server.imap_tls_addr(), pinned(&server)).await).await;
+
+    session.examine("INBOX").await.unwrap();
+    let id = session
+        .run_command("UID STORE 1 +FLAGS (\\Seen)")
+        .await
+        .unwrap();
+    let (_, ok) = answers_until_done(&mut session, &id).await;
+    assert!(!ok, "a read-only folder takes no STORE");
+    assert_eq!(server.flags("INBOX", 1), Some(Vec::new()));
+
+    session.select("INBOX").await.unwrap();
+    let id = session
+        .run_command("UID STORE 1,3 +FLAGS (\\Seen \\Flagged)")
+        .await
+        .unwrap();
+    let (untagged, ok) = answers_until_done(&mut session, &id).await;
+    assert!(ok);
+    assert_eq!(untagged.len(), 2, "{untagged:?}");
+    assert!(untagged[0].contains("Uid(1)") && untagged[0].contains("Flagged"));
+    assert_eq!(
+        server.flags("INBOX", 1),
+        Some(vec!["\\Seen".to_owned(), "\\Flagged".to_owned()])
+    );
+    let id = session
+        .run_command("UID STORE 3 -FLAGS.SILENT (\\Seen)")
+        .await
+        .unwrap();
+    let (untagged, ok) = answers_until_done(&mut session, &id).await;
+    assert!(ok);
+    assert!(untagged.is_empty(), "{untagged:?}");
+    assert_eq!(server.flags("INBOX", 3), Some(vec!["\\Flagged".to_owned()]));
+    // A UID the folder does not hold is no error, and has no answer.
+    let id = session
+        .run_command("UID STORE 7 +FLAGS (\\Seen)")
+        .await
+        .unwrap();
+    assert_eq!(
+        answers_until_done(&mut session, &id).await,
+        (Vec::new(), true)
+    );
+}
+
+#[tokio::test]
+async fn uid_move_gives_the_new_uids_and_expunges_only_what_it_moved() {
+    let server = writable(FakeServer::builder()).await;
+    let mut session = login(imap_tls(server.imap_tls_addr(), pinned(&server)).await).await;
+    session.select("INBOX").await.unwrap();
+
+    let id = session
+        .run_command("UID MOVE 1,3 \"Archive\"")
+        .await
+        .unwrap();
+    let (untagged, ok) = answers_until_done(&mut session, &id).await;
+
+    assert!(ok);
+    assert!(untagged[0].contains("CopyUid(101"), "{untagged:?}");
+    assert_eq!(
+        untagged.iter().filter(|a| a.contains("Expunge")).count(),
+        2,
+        "{untagged:?}"
+    );
+    assert_eq!(server.uids("INBOX"), [2]);
+    assert_eq!(server.uids("Archive"), [1, 2]);
+    assert_eq!(server.raw("Archive", 1).unwrap(), HELLO.as_bytes());
+    assert_eq!(server.flags("Archive", 2), Some(vec!["\\Seen".to_owned()]));
+    // A folder that does not exist.
+    let id = session.run_command("UID MOVE 2 \"Nowhere\"").await.unwrap();
+    let (untagged, ok) = answers_until_done(&mut session, &id).await;
+    assert!(!ok);
+    assert!(untagged.is_empty());
+    assert_eq!(server.uids("INBOX"), [2]);
+}
+
+#[tokio::test]
+async fn uid_copy_then_uid_expunge_removes_only_the_uids_named() {
+    let server = writable(FakeServer::builder().without_move()).await;
+    let mut session = login(imap_tls(server.imap_tls_addr(), pinned(&server)).await).await;
+    let capabilities = session.capabilities().await.unwrap();
+    assert!(!capabilities.has_str("MOVE"));
+    assert!(capabilities.has_str("UIDPLUS"));
+    session.select("INBOX").await.unwrap();
+
+    let id = session.run_command("UID MOVE 1 \"Trash\"").await.unwrap();
+    assert!(!answers_until_done(&mut session, &id).await.1);
+    let id = session.run_command("UID COPY 1 \"Trash\"").await.unwrap();
+    assert!(answers_until_done(&mut session, &id).await.1);
+    assert_eq!(server.uids("Trash"), [1]);
+    let id = session
+        .run_command("UID STORE 1 +FLAGS (\\Deleted)")
+        .await
+        .unwrap();
+    assert!(answers_until_done(&mut session, &id).await.1);
+    let id = session.run_command("UID EXPUNGE 1").await.unwrap();
+    let (untagged, ok) = answers_until_done(&mut session, &id).await;
+
+    assert!(ok);
+    assert_eq!(untagged.len(), 1, "{untagged:?}");
+    // The message another client marked deleted is still there.
+    assert_eq!(server.uids("INBOX"), [2, 3]);
+    assert_eq!(server.flags("INBOX", 2), Some(vec!["\\Deleted".to_owned()]));
+}
+
+#[tokio::test]
+async fn copy_answers_its_copyuid_in_the_tagged_ok() {
+    let server = writable(FakeServer::builder().without_move()).await;
+    let mut session = login(imap_tls(server.imap_tls_addr(), pinned(&server)).await).await;
+    session.select("INBOX").await.unwrap();
+    let id = session.run_command("UID COPY 3 \"Trash\"").await.unwrap();
+    let answer = loop {
+        let answer = session.read_response().await.unwrap().unwrap();
+        if matches!(answer.parsed(), Response::Done { tag, .. } if *tag == id) {
+            break format!("{:?}", answer.parsed());
+        }
+    };
+    assert!(answer.contains("CopyUid(102"), "{answer}");
+}
+
+#[tokio::test]
+async fn a_server_without_move_and_uidplus_refuses_both() {
+    let server = writable(FakeServer::builder().without_move().without_uidplus()).await;
+    let mut session = login(imap_tls(server.imap_tls_addr(), pinned(&server)).await).await;
+    let capabilities = session.capabilities().await.unwrap();
+    assert!(!capabilities.has_str("MOVE"));
+    assert!(!capabilities.has_str("UIDPLUS"));
+    session.select("INBOX").await.unwrap();
+    for command in ["UID MOVE 1 \"Trash\"", "UID EXPUNGE 1"] {
+        let id = session.run_command(command).await.unwrap();
+        assert!(!answers_until_done(&mut session, &id).await.1, "{command}");
+    }
+    let id = session.run_command("UID COPY 1 \"Trash\"").await.unwrap();
+    let (_, ok) = answers_until_done(&mut session, &id).await;
+    assert!(ok);
+    assert_eq!(server.uids("INBOX"), [1, 2, 3]);
+}
+
+#[tokio::test]
+async fn uid_search_finds_a_message_by_a_header() {
+    let server = writable(FakeServer::builder()).await;
+    let mut session = login(imap_tls(server.imap_tls_addr(), pinned(&server)).await).await;
+    session.examine("INBOX").await.unwrap();
+    let found = session
+        .uid_search("UID 2:* HEADER Message-ID \"<hello@example.com>\"")
+        .await
+        .unwrap();
+    assert_eq!(found.into_iter().collect::<Vec<_>>(), [3]);
+}

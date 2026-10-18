@@ -2,6 +2,7 @@
 //! protocol.
 
 pub mod account;
+pub mod actions;
 pub mod body;
 pub mod connect;
 pub mod copy;

@@ -10,6 +10,11 @@
 //! shorter, but it is lost when a folder is rebuilt after the server renumbered it; with this
 //! one, a later `open` can tell "that message is gone" from "that is another message now" by
 //! comparing the UIDVALIDITY: [`Copy::message`] does, and says which of the two it is.
+//!
+//! A message whose move waits for the server is shown in the folder it goes to (its folder, its
+//! role, its counts), while its identifier still names the folder the server has it in, where
+//! an action on it applies: the identifier changes once the server moved it, as it does for a
+//! message another client moves.
 
 use std::path::Path;
 use std::time::Duration;
@@ -34,6 +39,9 @@ const SEARCH_VERSION: i64 = 2;
 
 /// The first schema version that says whether a message has an attachment.
 const ATTACHMENTS_VERSION: i64 = 3;
+
+/// The first schema version that has the queue of actions, and messages waiting for a move.
+const QUEUE_VERSION: i64 = 4;
 
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
@@ -267,12 +275,13 @@ fn has_flag(flags: &str, flag: &str) -> bool {
     flags.split(' ').any(|f| f.eq_ignore_ascii_case(flag))
 }
 
-/// The columns of [`hit`], in this order.
-const HIT_COLUMNS: &str = "account.id, folder.id, folder.name, folder.role, folder.uidvalidity,
+/// The columns of [`hit`], in this order, from [`Copy::from`]: `folder` is the folder a message
+/// is shown in, `home` the one the server has it in.
+const HIT_COLUMNS: &str = "account.id, folder.id, folder.name, folder.role, home.uidvalidity,
     message.uid, coalesce(message.date, message.internal_date), message.subject,
-    message.sender, message.recipients, message.flags";
+    message.sender, message.recipients, message.flags, home.id";
 
-/// A hit from a row that starts with [`HIT_COLUMNS`]; the flags it read are the last of them.
+/// A hit from a row that starts with [`HIT_COLUMNS`].
 fn hit(r: &rusqlite::Row) -> rusqlite::Result<(Hit, String)> {
     let account: String = r.get(0)?;
     let folder = FolderRef {
@@ -282,13 +291,14 @@ fn hit(r: &rusqlite::Row) -> rusqlite::Result<(Hit, String)> {
     };
     let uidvalidity: Option<u32> = r.get(4)?;
     let uid: u32 = r.get(5)?;
+    let home: i64 = r.get(11)?;
     let people = |column: usize| -> rusqlite::Result<Vec<Person>> {
         let json: String = r.get(column)?;
         Ok(serde_json::from_str(&json).unwrap_or_default())
     };
     let flags: String = r.get(10)?;
     let hit = Hit {
-        id: message_id(&account, folder.id, uidvalidity.unwrap_or(0), uid),
+        id: message_id(&account, home, uidvalidity.unwrap_or(0), uid),
         account,
         folder,
         uidvalidity,
@@ -303,6 +313,26 @@ fn hit(r: &rusqlite::Row) -> rusqlite::Result<(Hit, String)> {
 }
 
 impl Copy {
+    /// The tables the queries of messages read from, for [`HIT_COLUMNS`].
+    fn from(&self) -> String {
+        format!(
+            "message
+               JOIN folder AS home ON home.id = message.folder
+               JOIN folder ON folder.id = {}
+               JOIN account ON account.key = folder.account",
+            self.shown()
+        )
+    }
+
+    /// The folder a message is shown in: where a move that waits takes it, else its own.
+    fn shown(&self) -> &'static str {
+        if self.version >= QUEUE_VERSION {
+            "coalesce(message.moving_to, message.folder)"
+        } else {
+            "message.folder"
+        }
+    }
+
     /// Opens the copy read only. `None` when there is none yet: no file, or one the daemon has
     /// created and not yet given its schema.
     pub fn open(path: &Path) -> Result<Option<Copy>> {
@@ -357,14 +387,28 @@ impl Copy {
     /// By account, then folder: the inbox first, the other roles, then the user's own folders by
     /// name.
     pub fn unread(&self) -> Result<Vec<FolderUnread>> {
-        let mut statement = self.connection.prepare_cached(
+        const UNREAD: &str = "' ' || message.flags || ' ' NOT LIKE '% \\Seen %'
+            AND ' ' || message.flags || ' ' NOT LIKE '% \\Deleted %'";
+        // The messages of the folder, less those shown elsewhere, plus those shown here: each
+        // count reads an index (the moves that wait are few), not every row. The `+` keeps the
+        // planner off the index by folder, which would read every row of the folder.
+        let moving = if self.version >= QUEUE_VERSION {
+            format!(
+                "- (SELECT count(*) FROM message
+                     WHERE message.moving_to IS NOT NULL AND +message.folder = folder.id
+                       AND {UNREAD})
+                 + (SELECT count(*) FROM message
+                     WHERE message.moving_to = folder.id AND {UNREAD})"
+            )
+        } else {
+            String::new()
+        };
+        let mut statement = self.connection.prepare_cached(&format!(
             "SELECT account.id, folder.id, folder.name, folder.role,
                     (SELECT count(*) FROM message
-                      WHERE message.folder = folder.id
-                        AND ' ' || message.flags || ' ' NOT LIKE '% \\Seen %'
-                        AND ' ' || message.flags || ' ' NOT LIKE '% \\Deleted %')
-               FROM folder JOIN account ON account.key = folder.account",
-        )?;
+                      WHERE message.folder = folder.id AND {UNREAD}) {moving}
+               FROM folder JOIN account ON account.key = folder.account"
+        ))?;
         let rows = statement.query_map([], |r| {
             Ok(FolderUnread {
                 account: r.get(0)?,
@@ -399,14 +443,14 @@ impl Copy {
         let mut statement = self.connection.prepare_cached(&format!(
             "SELECT {HIT_COLUMNS}
                FROM message_search
-               JOIN message ON message.id = message_search.rowid
-               JOIN folder ON folder.id = message.folder
-               JOIN account ON account.key = folder.account
-              WHERE message_search MATCH ?1
+               JOIN {}
+              WHERE message.id = message_search.rowid
+                AND message_search MATCH ?1
                 AND account.id IN (SELECT value FROM json_each(?2))
                 AND (?3 IS NULL OR folder.role = ?3)
               ORDER BY coalesce(message.date, message.internal_date) DESC, message.id DESC
-              LIMIT ?4"
+              LIMIT ?4",
+            self.from()
         ))?;
         let role = search.role.clone().map_or(Value::Null, Value::Text);
         let rows = statement.query_map(
@@ -424,15 +468,14 @@ impl Copy {
         let accounts = serde_json::to_string(&list.accounts).expect("strings serialize");
         let mut statement = self.connection.prepare_cached(&format!(
             "SELECT {HIT_COLUMNS}, message.size, message.has_attachments
-               FROM message
-               JOIN folder ON folder.id = message.folder
-               JOIN account ON account.key = folder.account
+               FROM {}
               WHERE account.id IN (SELECT value FROM json_each(?1))
                 AND (?2 IS NULL AND ?3 IS NULL OR folder.role = ?2 OR folder.name = ?3)
                 AND (NOT ?4 OR (' ' || message.flags || ' ' NOT LIKE '% \\Seen %'
                             AND ' ' || message.flags || ' ' NOT LIKE '% \\Deleted %'))
               ORDER BY coalesce(message.date, message.internal_date) DESC, message.id DESC
-              LIMIT ?5"
+              LIMIT ?5",
+            self.from()
         ))?;
         let text = |text: &Option<String>| text.clone().map_or(Value::Null, Value::Text);
         let rows = statement.query_map(
@@ -449,8 +492,8 @@ impl Copy {
                     hit,
                     flagged: has_flag(&flags, "\\Flagged"),
                     answered: has_flag(&flags, "\\Answered"),
-                    size: r.get::<_, i64>(11)? as u64,
-                    has_attachments: r.get(12)?,
+                    size: r.get::<_, i64>(12)? as u64,
+                    has_attachments: r.get(13)?,
                 })
             },
         )?;
@@ -490,23 +533,22 @@ impl Copy {
             .prepare_cached(&format!(
                 "SELECT {HIT_COLUMNS}, message.size, message.cc, message.message_id,
                         message_raw.raw
-                   FROM message
-                   JOIN folder ON folder.id = message.folder
-                   JOIN account ON account.key = folder.account
+                   FROM {}
                    JOIN message_raw ON message_raw.message = message.id
-                  WHERE account.id = ?1 AND folder.id = ?2 AND message.uid = ?3"
+                  WHERE account.id = ?1 AND home.id = ?2 AND message.uid = ?3",
+                self.from()
             ))?
             .query_row(params![id.account, id.folder, id.uid], |r| {
                 let (hit, flags) = hit(r)?;
-                let cc: String = r.get(12)?;
+                let cc: String = r.get(13)?;
                 Ok(Stored {
                     hit,
                     flagged: has_flag(&flags, "\\Flagged"),
                     answered: has_flag(&flags, "\\Answered"),
-                    size: r.get::<_, i64>(11)? as u64,
+                    size: r.get::<_, i64>(12)? as u64,
                     cc: serde_json::from_str(&cc).unwrap_or_default(),
-                    message_id: r.get(13)?,
-                    raw: r.get(14)?,
+                    message_id: r.get(14)?,
+                    raw: r.get(15)?,
                 })
             });
         match stored {
