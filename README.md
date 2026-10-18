@@ -9,8 +9,9 @@ Work in progress: see the issues. Agents read `AGENTS.md`.
 ## Install
 
 No build needed: a release is an archive of the Releases page of this repository,
-`missive-<tag>-x86_64-linux.tar.gz` with its `.sha256`, holding `missive` and `install.sh`. It is
-built on Ubuntu 24.04 for Linux x86_64 and needs glibc 2.39 or newer.
+`missive-<tag>-x86_64-linux.tar.gz` with its `.sha256`, holding `missive`, `install.sh` and
+`missive-mailto.desktop`. It is built on Ubuntu 24.04 for Linux x86_64 and needs glibc 2.39 or
+newer.
 
 - **A release** (`vX.Y.Z`) is made when `dev` is merged into `main`.
 - **The beta** (`vX.Y.Z-beta.N`, marked pre-release) is made at every push to `dev`, and only the
@@ -30,6 +31,10 @@ cd missive-*-x86_64-linux
 Without `gh`, download the two files from the Releases page in a browser and run the same commands
 from `sha256sum` on. `install.sh` copies `missive` into `~/.local/bin` (or `$PREFIX/bin`), never
 asks for root and never touches your configuration, your local copy of the mail or your keyring.
-`~/.local/bin` must be in your `PATH`. `missive --version` prints the tag the build was published
-under (`missive v0.1.1-beta.21`), or `missive development build` for a build made locally. To
-update, do the same with the newer archive; to remove Missive, delete `~/.local/bin/missive`.
+`~/.local/bin` must be in your `PATH`. `install.sh` also copies the desktop entry for `mailto:`
+links into `${XDG_DATA_HOME:-~/.local/share}/applications` and prints the `xdg-mime default …`
+command that makes Missive the handler of those links; it never runs it for you (see
+`docs/cli.md`). `missive --version` prints the tag the build was published under
+(`missive v0.1.1-beta.21`), or `missive development build` for a build made locally. To update,
+do the same with the newer archive; to remove Missive, delete `~/.local/bin/missive` and
+`~/.local/share/applications/missive-mailto.desktop`.

@@ -163,6 +163,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         },
         attachments: (args.draft.is_none() || !args.attach.is_empty())
             .then(|| attached(draft.attachments)),
+        in_reply_to: None,
         send: args.send,
     }))
     .await?;
@@ -208,7 +209,7 @@ async fn send(message: Send, json: bool) -> Result<(), ActError> {
 }
 
 /// The answer of a daemon that did what was asked, else why it did not.
-fn answered(answer: Answer) -> Result<Answer, ActError> {
+pub(crate) fn answered(answer: Answer) -> Result<Answer, ActError> {
     if answer.ok {
         return Ok(answer);
     }
@@ -224,7 +225,7 @@ fn answered(answer: Answer) -> Result<Answer, ActError> {
     })
 }
 
-fn unreadable() -> ActError {
+pub(crate) fn unreadable() -> ActError {
     ActError::Failed("the daemon gave an answer this missive cannot read".to_owned())
 }
 
@@ -242,7 +243,7 @@ fn queued(outbox: i64, message_id: String, json: bool) -> Result<(), ActError> {
 }
 
 /// The account named, or the only one.
-fn account(named: Option<String>) -> Result<String, String> {
+pub(crate) fn account(named: Option<String>) -> Result<String, String> {
     let listing = AccountStore::from_env()
         .and_then(|store| store.list())
         .map_err(|e| e.to_string())?;

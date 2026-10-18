@@ -777,3 +777,47 @@ without them. An account without a Sent folder gets no copy (the `sent` event sa
 never creates a folder. Appending is tried again when it fails, up to five times; an append whose
 answer was lost is looked for in Sent by its `Message-ID` before it is tried again.
 
+### `missive mailto <uri> [--account <id>] [--json]`
+
+Composes from a `mailto:` link (RFC 6068), as the system's handler for them: the desktop entry
+`missive-mailto.desktop` runs `missive mailto %u`. Until the compose window exists, the link is
+saved as a **draft** (see `missive compose`), and nothing is opened. For people, one line gives
+the draft's identifier and says where to find it (`missive list --folder drafts`); with `--json`,
+one object, as `compose` prints:
+
+```json
+{"id": "4b2e…@example.org"}
+```
+
+The account is the only one configured, or the one `--account` names.
+
+What is read from the link: the addresses of its path (several, separated by commas) and its
+`to`, `cc` and `bcc` fields (the addresses of a field are added to the others), `subject`, `body`
+and `in-reply-to` (the draft's `In-Reply-To`). Names of fields ignore case; percent-encoding is
+decoded as UTF-8, and a `+` stays a plus sign. The first of a `subject`, `body` or `in-reply-to`
+given twice is kept; the fragment (`#…`) is dropped.
+
+A link comes from anywhere, so it is never trusted to do more than write a draft:
+
+- every other field is **ignored**: `from` (the sender is the account's), `attach` and
+  `attachment` (a link never adds a file), `reply-to`, `references`, any header at all;
+- a `to`, `cc`, `bcc`, `subject` or `in-reply-to` that holds a line break, or another control
+  character, once decoded (`%0D%0ABcc:…`) is **refused**, not repaired: it would start a header
+  the link may not set. A line break in the `body` is only text;
+- a link is refused when it is longer than 32 KiB, is not a `mailto:` link, has an invalid
+  percent-encoding (or one that does not decode to UTF-8), an address Missive cannot send to
+  (ASCII only, as for `compose`), or an `in-reply-to` that is not one message identifier.
+
+Nothing is saved from a refused link: the exit status is 1, with the reason on standard error.
+The recipients are not required (`mailto:?subject=Hello` is a draft without one).
+
+#### Being the default handler
+
+The release archive holds `missive-mailto.desktop` (`MimeType=x-scheme-handler/mailto;`,
+`NoDisplay=true`: it is not in the menus). `install.sh` copies it into
+`${XDG_DATA_HOME:-~/.local/share}/applications`, with `Exec` naming the installed program by its
+full path, and prints the command that makes it the default, which it never runs itself:
+
+```
+xdg-mime default missive-mailto.desktop x-scheme-handler/mailto
+```
