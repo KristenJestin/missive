@@ -1426,3 +1426,129 @@ async fn a_refused_uid_expunge_takes_the_deleted_flag_back_on_the_server() {
     assert_eq!(server.flags("Trash", 2), flags(&["\\Deleted"]));
     assert_eq!(env.uids("Trash"), [1, 2]);
 }
+
+/// The Message-IDs of a folder on the server, in UID order.
+fn message_ids(server: &FakeServer, folder: &str) -> Vec<String> {
+    server
+        .uids(folder)
+        .into_iter()
+        .map(|uid| {
+            let raw = String::from_utf8(server.raw(folder, uid).unwrap()).unwrap();
+            raw.lines()
+                .find_map(|line| line.strip_prefix("Message-ID: "))
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Checks that the removal from the source came after the last `UID COPY`.
+fn removed_after_the_last_copy(server: &FakeServer) {
+    let log = server.imap_log();
+    let last_copy = log.iter().rposition(|c| c.starts_with("UID COPY")).unwrap();
+    let store = log
+        .iter()
+        .position(|c| c.contains("+FLAGS.SILENT (\\Deleted)"))
+        .unwrap();
+    let expunge = log
+        .iter()
+        .position(|c| c.starts_with("UID EXPUNGE"))
+        .unwrap();
+    assert!(last_copy < store && store < expunge, "{log:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_whose_answer_never_came_and_that_copied_nothing_is_copied_again() {
+    let (server, env, _daemon) = started_with(
+        mailbox().without_move().stall("UID COPY"),
+        &["--action-timeout", "1"],
+    )
+    .await;
+    succeeded(
+        &env.act(&["move", &env.id("INBOX", 3), "--to", "archive"])
+            .await,
+    );
+    // The server never ran it, and never answered.
+    eventually(10, "the COPY", || tries(&server, "UID COPY") == 1).await;
+    server.heal();
+
+    eventually(30, "the queue empty", || env.queue() == 0).await;
+    succeeded(&sync_soon(&env).await);
+
+    assert_eq!(tries(&server, "UID COPY"), 2);
+    // The target's UIDNEXT had not moved: nothing was looked for there.
+    assert_eq!(
+        tries(&server, "UID SEARCH UID"),
+        0,
+        "{:?}",
+        server.imap_log()
+    );
+    assert_eq!(message_ids(&server, "Archive"), ["<3@example.com>"]);
+    assert_eq!(server.uids("INBOX"), [1, 2, 4]);
+    removed_after_the_last_copy(&server);
+    assert_eq!(env.uids("Archive"), server.uids("Archive"));
+    assert_eq!(env.uids("INBOX"), [1, 2, 4]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_whose_answer_never_came_and_that_copied_some_messages_copies_only_the_others() {
+    let (server, env, _daemon) = started_with(
+        mailbox().without_move().stall("UID COPY"),
+        &["--action-timeout", "1"],
+    )
+    .await;
+    succeeded(
+        &env.act(&[
+            "move",
+            &env.id("INBOX", 2),
+            &env.id("INBOX", 3),
+            "--to",
+            "archive",
+        ])
+        .await,
+    );
+    eventually(10, "the COPY", || tries(&server, "UID COPY") == 1).await;
+    // As a server that copied one of the two before the connection was lost.
+    server.deliver("Archive", message(3));
+    server.heal();
+
+    eventually(30, "the queue empty", || env.queue() == 0).await;
+    succeeded(&sync_soon(&env).await);
+
+    let log = server.imap_log();
+    let copies: Vec<&String> = log.iter().filter(|c| c.starts_with("UID COPY")).collect();
+    assert_eq!(
+        copies,
+        ["UID COPY 2:3 \"Archive\"", "UID COPY 2 \"Archive\""]
+    );
+    assert_eq!(
+        message_ids(&server, "Archive"),
+        ["<3@example.com>", "<2@example.com>"]
+    );
+    assert_eq!(server.uids("INBOX"), [1, 4]);
+    removed_after_the_last_copy(&server);
+    assert_eq!(env.uids("Archive"), server.uids("Archive"));
+    assert_eq!(env.uids("INBOX"), [1, 4]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn after_an_action_the_sync_goes_back_to_examine_before_any_fetch() {
+    let (server, env, _daemon) = started(mailbox()).await;
+    succeeded(&env.act(&["mark", &env.id("INBOX", 3), "--read"]).await);
+    eventually(10, "the queue empty", || env.queue() == 0).await;
+    succeeded(&sync_soon(&env).await);
+
+    let log = server.imap_log();
+    let store = log.iter().position(|c| c.starts_with("UID STORE")).unwrap();
+    assert_eq!(log[store - 1], "SELECT \"INBOX\"", "{log:?}");
+    let after = &log[store + 1..];
+    let opened_or_fetched = after
+        .iter()
+        .find(|c| c.starts_with("EXAMINE") || c.starts_with("SELECT") || c.contains("FETCH"));
+    assert!(
+        opened_or_fetched.is_some_and(|c| c.starts_with("EXAMINE")),
+        "{log:?}"
+    );
+    assert!(!after.iter().any(|c| c.starts_with("SELECT")), "{log:?}");
+    assert!(after.iter().any(|c| c == "EXAMINE \"INBOX\""), "{log:?}");
+}
