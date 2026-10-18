@@ -10,6 +10,7 @@ pub mod events;
 #[cfg(feature = "fake")]
 pub mod fake;
 pub mod keyring;
+pub mod opener;
 pub mod original;
 pub mod protocol;
 pub mod store;

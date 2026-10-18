@@ -8,19 +8,12 @@ description = "A mail client for Linux: background daemon, command line, event s
 [dependencies]
 async-imap.workspace = true
 clap.workspace = true
-futures-util.workspace = true
 missive-core.workspace = true
 rpassword.workspace = true
 rustls.workspace = true
-# `missive open` checks that its folder is the user's own.
-rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# The page of `missive open`: a file created anew, under a random name, readable by the user only.
-tempfile.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt", "signal", "sync", "time"] }
-# The desktop portal, for `missive open`.
-zbus.workspace = true
 
 [dev-dependencies]
 missive-core = { workspace = true, features = ["fake"] }
