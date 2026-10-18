@@ -35,12 +35,29 @@ impl Drop for Work {
     }
 }
 
-/// A program that says its version, as `cargo build --release` leaves one in a folder.
-fn built(dir: &Path, tag: &str) {
+/// The file the stand-in window writes when it is started: an install must never start it (it
+/// would open a window).
+fn window_ran(work: &Path) -> PathBuf {
+    work.join("window-ran")
+}
+
+/// The two programs, as `cargo build --release` leaves them in a folder: `missive` says its
+/// version, `missive-window` records that it was started.
+fn built(work: &Path, dir: &Path, tag: &str) {
     fs::create_dir_all(dir).unwrap();
     let program = dir.join("missive");
     fs::write(&program, format!("#!/bin/sh\necho \"missive {tag}\"\n")).unwrap();
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let window = dir.join("missive-window");
+    fs::write(
+        &window,
+        format!(
+            "#!/bin/sh\necho started > '{}'\n",
+            window_ran(work).display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&window, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn run(command: &mut Command) -> Output {
@@ -57,7 +74,7 @@ fn run(command: &mut Command) -> Output {
 /// Packs the stand-in as `tag` and unpacks the archive: the folder an install starts from.
 fn unpacked(work: &Path, tag: &str) -> PathBuf {
     let binaries = work.join("target");
-    built(&binaries, tag);
+    built(work, &binaries, tag);
     let out = work.join("dist");
     let packed = run(Command::new(root().join("tools/package.sh"))
         .arg(tag)
@@ -93,7 +110,7 @@ fn install(folder: &Path, work: &Path, prefix: &Path) -> Output {
 }
 
 #[test]
-fn the_archive_holds_the_binary_and_the_install_script_with_its_checksum() {
+fn the_archive_holds_both_binaries_the_install_script_and_the_desktop_entries_with_its_checksum() {
     let work = Work::new("archive");
     let folder = unpacked(&work.0, "v0.1.0");
     let mut names: Vec<_> = fs::read_dir(&folder)
@@ -101,7 +118,24 @@ fn the_archive_holds_the_binary_and_the_install_script_with_its_checksum() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     names.sort();
-    assert_eq!(names, ["install.sh", "missive", "missive-mailto.desktop"]);
+    assert_eq!(
+        names,
+        [
+            "install.sh",
+            "missive",
+            "missive-mailto.desktop",
+            "missive-window",
+            "missive.desktop"
+        ]
+    );
+    // Both programs are runnable once unpacked.
+    for program in ["missive", "missive-window"] {
+        let mode = fs::metadata(folder.join(program))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o755, 0o755, "{program}");
+    }
 
     // Checked from the folder the two files are in, as a person who downloaded them does.
     run(Command::new("sha256sum")
@@ -122,7 +156,8 @@ fn a_beta_tag_names_the_archive() {
 }
 
 #[test]
-fn install_in_an_empty_prefix_puts_the_binary_and_the_desktop_entry_and_leaves_the_user_alone() {
+fn install_in_an_empty_prefix_puts_both_binaries_and_the_desktop_entries_and_leaves_the_user_alone()
+{
     let work = Work::new("install");
     let folder = unpacked(&work.0, "v0.1.0");
     let prefix = work.0.join("prefix");
@@ -131,14 +166,25 @@ fn install_in_an_empty_prefix_puts_the_binary_and_the_desktop_entry_and_leaves_t
 
     let installed = prefix.join("bin/missive");
     assert!(installed.is_file());
-    assert_eq!(
-        fs::metadata(&installed).unwrap().permissions().mode() & 0o755,
-        0o755
+    for program in [&installed, &prefix.join("bin/missive-window")] {
+        assert_eq!(
+            fs::metadata(program).unwrap().permissions().mode() & 0o755,
+            0o755
+        );
+    }
+    assert!(
+        said.contains(&prefix.join("bin/missive-window").display().to_string()),
+        "{said}"
+    );
+    // The window opens a window: install.sh checks the command line program only.
+    assert!(
+        !window_ran(&work.0).exists(),
+        "install.sh started the window"
     );
     assert!(said.contains(&installed.display().to_string()), "{said}");
     // The installed binary tells which build it is, and install.sh shows it.
     assert!(said.contains("missive v0.1.0"), "{said}");
-    // Nothing but the binary: the copy beside it was renamed, and no other folder was made.
+    // Nothing but the binaries: the copies beside them were renamed, and no other folder was made.
     let in_prefix: Vec<_> = fs::read_dir(&prefix)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -148,13 +194,13 @@ fn install_in_an_empty_prefix_puts_the_binary_and_the_desktop_entry_and_leaves_t
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
-    assert_eq!(in_bin, ["missive"]);
+    let mut in_bin = in_bin;
+    in_bin.sort();
+    assert_eq!(in_bin, ["missive", "missive-window"]);
     // The desktop entry is in the user's data folder, not in the prefix.
-    assert!(
-        data(&work.0)
-            .join("applications/missive-mailto.desktop")
-            .is_file()
-    );
+    for entry in ["missive-mailto.desktop", "missive.desktop"] {
+        assert!(data(&work.0).join("applications").join(entry).is_file());
+    }
     // Not a file in the home folder: no configuration, no local copy, no keyring.
     assert!(fs::read_dir(work.0.join("home")).unwrap().next().is_none());
 }
@@ -335,7 +381,82 @@ fn install_writes_the_desktop_entry_with_the_installed_program_and_tells_how_to_
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
-    assert_eq!(in_applications, ["missive-mailto.desktop"]);
+    let mut in_applications = in_applications;
+    in_applications.sort();
+    assert_eq!(
+        in_applications,
+        ["missive-mailto.desktop", "missive.desktop"]
+    );
+}
+
+#[test]
+fn the_window_has_a_menu_entry_without_an_icon() {
+    let path = root().join("dist/missive.desktop");
+    let text = fs::read_to_string(&path).unwrap();
+    let keys = entry(&text);
+    assert_eq!(keys["Type"], "Application");
+    assert_eq!(keys["Name"], "Missive");
+    assert_eq!(keys["Exec"], "missive-window");
+    assert_eq!(keys["Categories"], "Network;Email;");
+    assert_eq!(keys["Terminal"], "false");
+    // Listed in the menus, so not hidden; no Icon until the project has its own, and no
+    // mailto: handler (missive-mailto.desktop is that one).
+    assert!(!keys.contains_key("NoDisplay"));
+    assert!(!keys.contains_key("Icon"));
+    assert!(!keys.contains_key("MimeType"));
+    // The window names itself `missive` to the compositor: the entry matches it.
+    assert_eq!(keys["StartupWMClass"], "missive");
+
+    if Command::new("desktop-file-validate")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        run(Command::new("desktop-file-validate").arg(&path));
+    }
+}
+
+#[test]
+fn install_writes_the_menu_entry_with_the_installed_window() {
+    let work = Work::new("menu-entry");
+    let folder = unpacked(&work.0, "v0.1.0");
+    let prefix = work.0.join("prefix");
+
+    install(&folder, &work.0, &prefix);
+
+    let keys =
+        entry(&fs::read_to_string(data(&work.0).join("applications/missive.desktop")).unwrap());
+    assert_eq!(
+        keys["Exec"],
+        format!("\"{}\"", prefix.join("bin/missive-window").display())
+    );
+    assert_eq!(keys["Name"], "Missive");
+    assert!(!keys.contains_key("Icon"));
+}
+
+#[test]
+fn an_archive_without_the_window_is_refused_before_anything_is_installed() {
+    let work = Work::new("no-window");
+    let folder = unpacked(&work.0, "v0.1.0");
+    fs::remove_file(folder.join("missive-window")).unwrap();
+    let prefix = work.0.join("prefix");
+    let home = work.0.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let output = Command::new("sh")
+        .arg(folder.join("install.sh"))
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", data(&work.0))
+        .env("PREFIX", &prefix)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("missive-window is missing"), "{said}");
+    assert!(!prefix.exists(), "something was installed");
 }
 
 #[test]

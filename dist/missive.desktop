@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Missive
+Comment=Read your mail
+# install.sh gives Exec the full path of the installed program. No Icon= until the project has
+# its own icon.
+Exec=missive-window
+Terminal=false
+Categories=Network;Email;
+# The window names itself `missive` to the compositor, which pairs it with this entry.
+StartupWMClass=missive

@@ -75,8 +75,14 @@ jobs:
         with:
           ref: ${{ needs.tag.outputs.tag }}
           persist-credentials: false
+      # The window (crates/missive-window) links against the fonts and the keyboard maps; the
+      # archive needs the same libraries at run time (see the README).
+      - name: Have the window's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig-dev libfreetype-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
       - name: Build, which takes its version from the tag
-        run: MISSIVE_VERSION="$TAG" cargo build --release --locked -p missive
+        run: MISSIVE_VERSION="$TAG" cargo build --release --locked -p missive -p missive-window
       - name: Pack it with its checksum
         run: tools/package.sh "$TAG" target/release "$RUNNER_TEMP/dist"
       - uses: actions/upload-artifact@v4
