@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use zbus::object_server::{ObjectServer, SignalEmitter};
@@ -35,6 +35,7 @@ pub struct FakeKeyring {
     _daemon: Daemon,
     address: String,
     items: Arc<Mutex<Vec<StoredItem>>>,
+    lock: Arc<Lock>,
 }
 
 /// What the user does with the unlock prompt of a locked [`FakeKeyring`].
@@ -67,6 +68,8 @@ impl Drop for Daemon {
 struct Lock {
     locked: AtomicBool,
     answer: PromptAnswer,
+    /// How many times a secret was read (`GetSecret`).
+    secret_reads: AtomicUsize,
 }
 
 impl Lock {
@@ -99,6 +102,7 @@ impl FakeKeyring {
         Self::start_with(Lock {
             locked: AtomicBool::new(false),
             answer: PromptAnswer::Accept,
+            secret_reads: AtomicUsize::new(0),
         })
         .await
     }
@@ -108,6 +112,7 @@ impl FakeKeyring {
         Self::start_with(Lock {
             locked: AtomicBool::new(true),
             answer,
+            secret_reads: AtomicUsize::new(0),
         })
         .await
     }
@@ -171,12 +176,18 @@ impl FakeKeyring {
             _daemon: daemon,
             address,
             items,
+            lock,
         }
     }
 
     /// The address of the private bus, for `DBUS_SESSION_BUS_ADDRESS`.
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// How many times a client read a secret (`GetSecret`), whichever entry it was.
+    pub fn secret_reads(&self) -> usize {
+        self.lock.secret_reads.load(Ordering::SeqCst)
     }
 
     /// Every entry, in the order they were created.
@@ -430,6 +441,7 @@ impl Item {
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<Secret> {
         self.lock.refuse_if_locked()?;
+        self.lock.secret_reads.fetch_add(1, Ordering::SeqCst);
         let me = header.path().map(|p| p.as_str().to_owned());
         let items = lock(&self.items);
         let stored = items

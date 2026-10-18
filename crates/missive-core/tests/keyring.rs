@@ -82,3 +82,21 @@ async fn a_locked_keyring_whose_prompt_is_dismissed_stores_nothing() {
     assert!(error.to_string().contains("stayed locked"), "{error}");
     assert!(fake.items().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fake_counts_the_secrets_read() {
+    let fake = FakeKeyring::start().await;
+    let keyring = open(&fake).await;
+    keyring
+        .store("alice", &Password::new("first".to_owned()))
+        .await
+        .unwrap();
+    assert_eq!(fake.secret_reads(), 0);
+
+    keyring.password("alice").await.unwrap().unwrap();
+    keyring.password("alice").await.unwrap().unwrap();
+    // No entry, nothing read.
+    assert!(keyring.password("bob").await.unwrap().is_none());
+
+    assert_eq!(fake.secret_reads(), 2);
+}
