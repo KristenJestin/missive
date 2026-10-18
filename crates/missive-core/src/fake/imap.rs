@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
-use super::{FolderState, Io, Shared, StoredMessage};
+use super::{Action, FolderState, Io, Shared, StoredMessage};
 
 const SYSTEM_FLAGS: &str = "(\\Answered \\Flagged \\Deleted \\Seen \\Draft)";
 
@@ -43,7 +43,27 @@ pub(super) async fn serve(
         }
         let text = String::from_utf8_lossy(&line);
         let text = text.trim_end_matches(['\r', '\n']);
-        match session.command(text) {
+        let rule = session.shared.rule(text);
+        let flow = if rule == Some(Action::Refuse) {
+            session.refuse(text)
+        } else {
+            session.command(text)
+        };
+        if !session.shared.fetch_delay.is_zero() && is_fetch(text) {
+            tokio::time::sleep(session.shared.fetch_delay).await;
+        }
+        if let Some(Action::Truncate(lines)) = rule {
+            truncate(&mut session.out, lines);
+        }
+        if let Some(Action::Cut(lines)) = rule {
+            cut(&mut session.out, lines);
+            session.send("* BYE the test cut this answer short");
+            if flush(&mut io, &mut session.out).await.is_ok() {
+                let _ = io.shutdown().await;
+            }
+            return;
+        }
+        match flow {
             Flow::Continue => {}
             Flow::Close => {
                 let _ = flush(&mut io, &mut session.out).await;
@@ -66,6 +86,40 @@ pub(super) async fn serve(
             }
         }
     }
+}
+
+/// Whether a command line is a `FETCH` or a `UID FETCH`.
+fn is_fetch(line: &str) -> bool {
+    let mut words = line.split(' ').skip(1);
+    let name = match words.next() {
+        Some(word) if word.eq_ignore_ascii_case("UID") => words.next(),
+        word => word,
+    };
+    name.is_some_and(|name| name.eq_ignore_ascii_case("FETCH"))
+}
+
+/// Keeps the first `lines` lines of an answer.
+fn cut(out: &mut Vec<u8>, lines: usize) {
+    let mut kept = 0;
+    for _ in 0..lines {
+        match out[kept..].windows(2).position(|w| w == b"\r\n") {
+            Some(end) => kept += end + 2,
+            None => break,
+        }
+    }
+    out.truncate(kept);
+}
+
+/// Keeps the first `lines` lines of an answer and its last line, the tagged one.
+fn truncate(out: &mut Vec<u8>, lines: usize) {
+    let body = out.len().saturating_sub(2);
+    let tagged = out[..body]
+        .windows(2)
+        .rposition(|w| w == b"\r\n")
+        .map_or(0, |end| end + 2);
+    let tagged = out.split_off(tagged);
+    cut(out, lines);
+    out.extend_from_slice(&tagged);
 }
 
 async fn flush(io: &mut BufReader<Box<dyn Io>>, out: &mut Vec<u8>) -> std::io::Result<()> {
@@ -202,6 +256,21 @@ impl Session {
         Flow::Continue
     }
 
+    /// Answers `NO` to a command a test asked to refuse, without running it.
+    fn refuse(&mut self, line: &str) -> Flow {
+        let (tag, rest) = line.split_once(' ').unwrap_or((line, ""));
+        let name = rest
+            .split(' ')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        self.log(&name, rest);
+        self.send(format!(
+            "{tag} NO [UNAVAILABLE] the test refused this command"
+        ));
+        Flow::Continue
+    }
+
     /// Logs the command without its tag, and without the password of a `LOGIN`.
     fn log(&self, name: &str, command: &str) {
         let logged = if name == "LOGIN" {
@@ -331,6 +400,8 @@ impl Session {
             self.send(format!("{tag} NO [NONEXISTENT] no such folder"));
             return Flow::Continue;
         };
+        // In the order Gmail sends them: UIDVALIDITY before EXISTS, so that an answer cut short
+        // can hold one without the other.
         let mut lines = vec![
             format!("* FLAGS {SYSTEM_FLAGS}"),
             if read_only {
@@ -338,16 +409,13 @@ impl Session {
             } else {
                 format!("* OK [PERMANENTFLAGS {SYSTEM_FLAGS}] flags allowed")
             },
+            format!("* OK [UIDVALIDITY {}] UIDs valid", folder.uidvalidity),
             format!("* {} EXISTS", folder.messages.len()),
             "* 0 RECENT".to_owned(),
         ];
         if let Some(position) = folder.messages.iter().position(|m| !seen(m)) {
             lines.push(format!("* OK [UNSEEN {}] first unseen", position + 1));
         }
-        lines.push(format!(
-            "* OK [UIDVALIDITY {}] UIDs valid",
-            folder.uidvalidity
-        ));
         lines.push(format!(
             "* OK [UIDNEXT {}] predicted next UID",
             folder.uidnext
@@ -433,12 +501,18 @@ impl Session {
         };
         let marks_seen = !selected.read_only && items.iter().any(Item::marks_seen);
         let mut state = self.shared.state();
+        let refused_uids = state.refused_uids.clone();
         let folder = state.folder(&selected.folder);
         let mut answer = Vec::new();
         let mut changed = false;
+        let mut refused = false;
         for (index, entry) in selected.view.iter_mut().enumerate() {
             let sequence = index as u32 + 1;
             if !set.contains(if uid { entry.uid } else { sequence }, max) {
+                continue;
+            }
+            if uid && refused_uids.contains(&entry.uid) {
+                refused = true;
                 continue;
             }
             // A message expunged meanwhile is only told at the next NOOP; it has no data now.
@@ -475,6 +549,9 @@ impl Session {
             self.changes.borrow_and_update();
         }
         self.out.extend_from_slice(&answer);
+        if refused {
+            return Err("NO [UNAVAILABLE] the test refused a message of this set".to_owned());
+        }
         Ok(())
     }
 
@@ -618,9 +695,14 @@ impl Session {
             if flush(io, &mut self.out).await.is_err() {
                 return false;
             }
+            let keepalive = self.shared.idle_keepalive;
             let read = tokio::select! {
                 read = io.read_until(b'\n', &mut line) => Some(read),
                 _ = self.changes.changed() => None,
+                _ = tokio::time::sleep(keepalive), if !keepalive.is_zero() => {
+                    self.send("* OK Still here");
+                    None
+                }
             };
             match read {
                 None => continue,
