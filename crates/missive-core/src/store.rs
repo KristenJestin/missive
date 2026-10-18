@@ -6,7 +6,7 @@
 //! is ever held across a wait on the network: a process killed at any point leaves a copy that is
 //! whole as of its last commit.
 //!
-//! The schema, version 4 (`PRAGMA user_version`). Version 1 is the copy itself:
+//! The schema, version 6 (`PRAGMA user_version`). Version 1 is the copy itself:
 //!
 //! ```sql
 #![doc = include_str!("store/schema-1.sql")]
@@ -33,6 +33,19 @@
 #![doc = include_str!("store/schema-4.sql")]
 //! ```
 //!
+//! Version 5 adds the folders a pass left as they were:
+//!
+//! ```sql
+#![doc = include_str!("store/schema-5.sql")]
+//! ```
+//!
+//! Version 6 adds the outbox: the messages to send, until their server took them
+//! ([`crate::outbox`]):
+//!
+//! ```sql
+#![doc = include_str!("store/schema-6.sql")]
+//! ```
+//!
 //! The index is contentless: it keeps the words and where they are, not the text, so a message
 //! costs its words and their places beside its raw message, and no text is stored twice. The text it is built from is read by `mail-parser`: the text parts of a message, and,
 //! for a message with only HTML, that HTML reduced to its text (markup, styles and scripts
@@ -49,7 +62,7 @@ use serde::{Deserialize, Serialize};
 
 /// The schema version this build writes. A copy written by a later version is refused rather
 /// than misread.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Each step brings the schema from the version before it: `MIGRATIONS[0]` from nothing to 1.
 const MIGRATIONS: &[&str] = &[
@@ -58,10 +71,13 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema-3.sql"),
     include_str!("store/schema-4.sql"),
     include_str!("store/schema-5.sql"),
+    include_str!("store/schema-6.sql"),
 ];
 
+mod outbox;
 mod queue;
 
+pub use outbox::{Left, SentCopy, ToSend};
 pub use queue::{Action, ActionFolder};
 
 /// The local copy, opened for writing.
