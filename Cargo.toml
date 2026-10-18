@@ -16,6 +16,7 @@ ammonia = "4"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+futures-channel = "0.3"
 futures-util = "0.3"
 # The tokenizer ammonia is built on, to find the stylesheets of a message.
 html5ever = "0.40"

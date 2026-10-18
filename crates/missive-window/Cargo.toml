@@ -1,0 +1,29 @@
+[package]
+name = "missive-window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Missive's reading window: folders, messages and a message, from the local copy"
+
+[dependencies]
+# fontconfig's configuration, read for the system's sans-serif family (`font.rs`). Already in
+# GPUI's tree, through its text system.
+fontconfig-parser = "0.5"
+# The daemon's events, from their thread to the window's.
+futures-channel.workspace = true
+futures-util.workspace = true
+# Pinned, as in the maintainer's other GPUI application: gpui-kit pins its own GPUI snapshot, so
+# a bump is a deliberate act. No default feature: neither the component library nor its assets
+# (whose WebAssembly build brings an HTTP client) are needed.
+gpui-kit = { version = "=0.7.3", default-features = false }
+missive-core.workspace = true
+missive-render = { path = "../missive-render" }
+serde_json.workspace = true
+# The opener's portal call (zbus on tokio, as in the rest of Missive), on a thread of its own.
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[dev-dependencies]
+gpui-kit = { version = "=0.7.3", default-features = false, features = ["test-support"] }
+missive-core = { workspace = true, features = ["fake"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
