@@ -149,6 +149,27 @@ impl Store {
             .query_row("SELECT key FROM account WHERE id = ?1", [id], |r| r.get(0))
     }
 
+    /// Removes the accounts of the copy whose identifier is not in `keep`, with their folders,
+    /// messages, raw messages, index rows and queued actions, which the foreign keys cascade.
+    /// Local only, in one transaction: nothing is asked of a server. Returns how many accounts
+    /// were removed.
+    pub fn drop_unlisted(&mut self, keep: &[String]) -> rusqlite::Result<usize> {
+        let transaction = self.connection.transaction()?;
+        let gone: Vec<i64> = {
+            let mut statement = transaction.prepare("SELECT key, id FROM account")?;
+            statement
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .filter(|row| !matches!(row, Ok((_, id)) if keep.contains(id)))
+                .map(|row| row.map(|(key, _)| key))
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for key in &gone {
+            transaction.execute("DELETE FROM account WHERE key = ?1", [key])?;
+        }
+        transaction.commit()?;
+        Ok(gone.len())
+    }
+
     /// Records an account's connection state, and when `synced` that a complete sync just ended.
     pub fn set_state(&self, account: i64, state: &str, synced: bool) -> rusqlite::Result<()> {
         if synced {
@@ -685,6 +706,81 @@ mod tests {
         assert_eq!(rows[0].1, "ready");
         assert!(rows[0].2.is_some());
         assert_eq!(rows[1], ("bob".to_owned(), "auth-refused".to_owned(), None));
+    }
+
+    fn count(store: &Store, table: &str) -> i64 {
+        store
+            .connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn accounts_no_longer_configured_leave_with_everything_they_own() {
+        let (_dir, mut store) = open();
+        let mut keys = Vec::new();
+        for id in ["alice", "bob"] {
+            let account = store.account(id).unwrap();
+            let inbox = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
+            let other = store.folder(account, "Other", None).unwrap().id;
+            store
+                .insert(inbox, &[message(1, ""), message(2, "")])
+                .unwrap();
+            store.insert(other, &[message(3, "")]).unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO action (account, folder, uidvalidity, uids, kind)
+                     VALUES (?1, ?2, 1, '[1]', 'read')",
+                    [account, inbox],
+                )
+                .unwrap();
+            keys.push(account);
+        }
+        assert_eq!(found(&store, "hello"), [1, 1, 2, 2, 3, 3]);
+
+        let removed = store.drop_unlisted(&["bob".to_owned()]).unwrap();
+
+        assert_eq!(removed, 1);
+        let accounts: Vec<String> = store
+            .connection
+            .prepare("SELECT id FROM account")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(accounts, ["bob"]);
+        // Bob's rows are all there, alice's are all gone, in every table that held some.
+        for (table, bobs) in [
+            ("folder", 2),
+            ("message", 3),
+            ("message_raw", 3),
+            ("action", 1),
+        ] {
+            assert_eq!(count(&store, table), bobs, "{table}");
+        }
+        assert_eq!(found(&store, "hello"), [1, 2, 3]);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM message_search", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        // The account that stays keeps its number.
+        assert_eq!(store.account("bob").unwrap(), keys[1]);
+    }
+
+    #[test]
+    fn nothing_leaves_when_every_account_is_still_configured() {
+        let (_dir, mut store) = open();
+        let account = store.account("alice").unwrap();
+        let inbox = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
+        store.insert(inbox, &[message(1, "")]).unwrap();
+        assert_eq!(store.drop_unlisted(&["alice".to_owned()]).unwrap(), 0);
+        assert_eq!(count(&store, "message"), 1);
     }
 
     fn mail(uid: u32, headers: &str, body: &str) -> NewMessage {

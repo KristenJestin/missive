@@ -467,6 +467,42 @@ async fn a_message_delivered_to_the_inbox_gives_one_new_message_event_and_one_un
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_removed_account_leaves_the_unread_event_when_the_daemon_reloads() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    env.add_account("bob", &server, OTHER_USER, Some("bobs-real-password"))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    assert!(env.sync().await.status.success());
+    let mut watcher = env.watch();
+    let (_, unread) = watcher.snapshot(2).await;
+    let ids: Vec<&str> = unread["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["alice", "bob"]);
+
+    AccountStore::new(env.path("config").join("missive"))
+        .remove("alice")
+        .unwrap();
+    assert!(env.sync().await.status.success());
+
+    let (_, unread) = watcher.until("unread").await;
+    let ids: Vec<&str> = unread["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["bob"]);
+    assert_eq!(unread["total"], unread["accounts"][0]["total"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_sync_that_ends_in_an_error_after_a_batch_still_announces_what_the_batch_brought() {
     let server = mailbox().start().await;
     let env = Env::new().await;
