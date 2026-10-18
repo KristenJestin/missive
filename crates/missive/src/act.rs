@@ -3,11 +3,9 @@
 //! docs/cli.md). They answer once the action is recorded, connected or not.
 
 use clap::{ArgGroup, Args};
-use missive_core::protocol::{Answer, Command, PROTOCOL, Request};
+use missive_core::client;
+use missive_core::protocol::{Answer, Command, socket_path};
 use serde::Serialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-use crate::daemon;
 
 /// The exit status when an identifier names no message, as for `missive show`.
 pub const NOT_FOUND: u8 = 3;
@@ -144,17 +142,9 @@ async fn run(command: Command, json: bool, asked: usize, done: &str) -> Result<(
 
 /// Sends one request to the daemon, starting it when none answers, and reads its answer.
 pub async fn ask(command: Command) -> Result<Answer, ActError> {
-    let stream = daemon::connect().await.map_err(ActError::Failed)?;
-    let (read, mut write) = stream.into_split();
-    let mut line = serde_json::to_string(&Request {
-        protocol: PROTOCOL,
-        command,
-    })?;
-    line.push('\n');
-    write.write_all(line.as_bytes()).await?;
-    let mut line = String::new();
-    BufReader::new(read).read_line(&mut line).await?;
-    serde_json::from_str(&line).map_err(|_| {
-        ActError::Failed("the daemon gave an answer this missive cannot read".to_owned())
-    })
+    let socket = socket_path()?;
+    let program = std::env::current_exe()?;
+    client::ask(&socket, &program, command)
+        .await
+        .map_err(ActError::Failed)
 }

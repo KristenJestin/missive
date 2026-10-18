@@ -9,7 +9,7 @@ use gpui_kit::{App, Bounds, WindowBounds, WindowOptions, px, size};
 use missive_core::opener;
 use missive_core::protocol::socket_path;
 use missive_window::model::{Model, Sources};
-use missive_window::view::{self, MailWindow, Opening};
+use missive_window::view::{self, Asker, MailWindow, Opening};
 
 fn main() {
     let sources = match Sources::from_env() {
@@ -19,6 +19,9 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Without a runtime folder there is no daemon to ask: each action says so in the window.
+    let asker: Asker =
+        missive_window::ask::from_env().unwrap_or_else(|e| Arc::new(move |_| Err(e.clone())));
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::base::init(cx);
         view::bind_keys(cx);
@@ -30,7 +33,7 @@ fn main() {
         };
         let window = cx
             .open_window(options, |window, cx| {
-                cx.new(|cx| MailWindow::new(Model::new(sources), Arc::new(open), window, cx))
+                cx.new(|cx| MailWindow::new(Model::new(sources), Arc::new(open), asker, window, cx))
             })
             .expect("a window");
 

@@ -80,6 +80,7 @@ impl Mail {
             home: tempfile::tempdir().unwrap(),
             server: builder.start().await,
         };
+        std::fs::create_dir_all(mail.copy_path().parent().unwrap()).unwrap();
         mail.store()
             .save(ID, &mail.account(), Some(&mail.server.certificate_der()))
             .unwrap();
@@ -103,12 +104,14 @@ impl Mail {
         }
     }
 
+    /// Where a daemon run with `XDG_CONFIG_HOME` in the folder `config` reads the accounts.
     fn store(&self) -> AccountStore {
-        AccountStore::new(self.home.path().join("config"))
+        AccountStore::new(self.home.path().join("config/missive"))
     }
 
+    /// Where a daemon run with `XDG_DATA_HOME` in the folder `data` keeps the copy.
     pub fn copy_path(&self) -> PathBuf {
-        self.home.path().join("copy.sqlite")
+        self.home.path().join("data/missive/copy.sqlite")
     }
 
     pub fn sources(&self) -> Sources {
@@ -153,4 +156,24 @@ impl Mail {
     pub fn server_flags(&self, uid: u32) -> Vec<String> {
         self.server.flags("INBOX", uid).unwrap()
     }
+}
+
+/// INBOX: Plan 1, seen; Plan 2, flagged; Plan 3. An archive, a trash holding Plan 6, and a
+/// folder of the user's own, `Projects`.
+pub fn sorted_mailbox() -> missive_core::fake::Builder {
+    FakeServer::builder()
+        .user(USER, PASSWORD)
+        .folder(
+            Folder::new("INBOX")
+                .message(plan(1, "", "Nothing special.").flag("\\Seen"))
+                .message(plan(2, "", "Flagged.").flag("\\Flagged"))
+                .message(plan(3, "", "The Zanzibar archive.")),
+        )
+        .folder(Folder::new("Archive").special_use(SpecialUse::Archive))
+        .folder(
+            Folder::new("Trash")
+                .special_use(SpecialUse::Trash)
+                .message(plan(6, "", "Thrown away.").flag("\\Seen")),
+        )
+        .folder(Folder::new("Projects"))
 }
