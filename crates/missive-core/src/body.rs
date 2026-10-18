@@ -39,7 +39,8 @@ pub struct Body {
 /// Reads a raw message. A message that cannot be read at all gives an empty [`Body`]; one that is
 /// only partly readable gives the parts that are.
 pub fn read(raw: &[u8]) -> Body {
-    let Some(message) = MessageParser::default().parse(raw) else {
+    let raw = crate::header::decoded(raw);
+    let Some(message) = MessageParser::default().parse(raw.as_ref()) else {
         return Body::default();
     };
     let join = |parts: Vec<&str>| (!parts.is_empty()).then(|| parts.join("\n"));
@@ -244,6 +245,13 @@ fn href(tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_raw_latin_1_reply_to_name_is_read_as_windows_1252() {
+        let body = read(b"Reply-To: Zo\xe9 <zoe@example.org>\r\nSubject: x\r\n\r\nHi\r\n");
+
+        assert_eq!(body.reply_to[0].name.as_deref(), Some("Zoé"));
+    }
 
     #[test]
     fn a_message_that_is_none_gives_an_empty_body() {

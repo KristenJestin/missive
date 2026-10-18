@@ -66,8 +66,9 @@ impl Original {
     /// Reads a raw message. An address Missive cannot send to is an error: leaving it out would
     /// answer fewer people than the user meant to.
     pub fn read(raw: &[u8]) -> Result<Original, String> {
+        let readable = crate::header::decoded(raw);
         let parsed = MessageParser::default()
-            .parse(raw)
+            .parse(readable.as_ref())
             .ok_or_else(|| "the message cannot be read".to_owned())?;
         let mailboxes = |address: Option<&mail_parser::Address>| -> Result<Vec<Mailbox>, String> {
             address
@@ -286,6 +287,17 @@ mod tests {
         Are you free?\r\n\
         \r\n\
         Zoé\r\n";
+
+    #[test]
+    fn a_raw_latin_1_subject_and_name_are_read_as_windows_1252() {
+        let raw = b"From: Zo\xe9 \xc7a <zoe@example.com>\r\nTo: alice@example.org\r\n\
+            Subject: Caf\xe9?\r\nDate: Sat, 17 Oct 2026 07:30:00 +0200\r\n\r\nOui\r\n";
+
+        let original = Original::read(raw).unwrap();
+
+        assert_eq!(original.subject.as_deref(), Some("Café?"));
+        assert_eq!(original.from[0].name.as_deref(), Some("Zoé Ça"));
+    }
 
     #[test]
     fn a_reply_goes_to_the_sender() {

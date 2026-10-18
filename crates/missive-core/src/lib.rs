@@ -11,6 +11,7 @@ pub mod drafts;
 pub mod events;
 #[cfg(feature = "fake")]
 pub mod fake;
+pub mod header;
 pub mod keyring;
 pub mod mailto;
 pub mod opener;
