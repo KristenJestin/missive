@@ -154,6 +154,9 @@ impl Env {
             .env("XDG_STATE_HOME", self.path("state"))
             .env("XDG_RUNTIME_DIR", self.path("runtime"))
             .env("DBUS_SESSION_BUS_ADDRESS", bus)
+            // The dates are written in the local time zone: fixed, so that no machine's own
+            // zone changes what the tests read.
+            .env("TZ", "UTC")
             .stdin(Stdio::null());
         command
     }
@@ -163,6 +166,16 @@ impl Env {
     async fn read(&self, args: &[&str]) -> Output {
         let nowhere = format!("unix:path={}", self.path("no-bus").display());
         self.command(args, &nowhere).output().await.unwrap()
+    }
+
+    /// A reading command run in the given time zone (the value of `TZ`).
+    async fn read_in(&self, zone: &str, args: &[&str]) -> Output {
+        let nowhere = format!("unix:path={}", self.path("no-bus").display());
+        self.command(args, &nowhere)
+            .env("TZ", zone)
+            .output()
+            .await
+            .unwrap()
     }
 
     async fn sync(&self) -> Output {
@@ -1776,6 +1789,8 @@ async fn without_a_portal_xdg_open_gets_exactly_the_environment_missive_received
         format!("DBUS_SESSION_BUS_ADDRESS={bus}"),
         format!("PATH={}", path_variable(&env)),
         "MISSIVE_TEST_MARK=the user's own".to_owned(),
+        // The one the test harness fixes for every command (see `Env::command`).
+        "TZ=UTC".to_owned(),
     ];
     given.sort();
     assert_eq!(received, given);
@@ -2188,4 +2203,59 @@ async fn a_missing_configuration_folder_drops_nothing_from_the_copy() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_configuration_with_no_account_drops_nothing_from_the_copy() {
     no_account_configured_leaves_the_copy_and_its_queue_alone(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_search_and_show_write_the_dates_in_the_local_time_zone() {
+    let env = Env::filled().await;
+    // Two hours ahead of UTC, written as a POSIX rule so that no zone database is needed.
+    let zone = "CEST-2";
+
+    let listed = env.read_in(zone, &["list", "--limit", "7"]).await;
+    let searched = env.read_in(zone, &["search", "pelican"]).await;
+    let shown = env.read_in(zone, &["show", &inbox_id(&env, 5).await]).await;
+
+    succeeded(&listed);
+    assert!(
+        stdout(&listed).contains("\t2026-10-17 09:02 +02:00\t"),
+        "{}",
+        stdout(&listed)
+    );
+    assert!(
+        stdout(&searched).contains("\t2026-10-17 09:02 +02:00\t"),
+        "{}",
+        stdout(&searched)
+    );
+    assert!(
+        stdout(&shown).contains("\nDate: 2026-10-17 09:05 +02:00\n"),
+        "{}",
+        stdout(&shown)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zone_behind_utc_keeps_the_minutes_of_its_offset() {
+    let env = Env::filled().await;
+
+    // Newfoundland's winter time: 07:02 UTC is 03:32 at -03:30.
+    let listed = env.read_in("NST3:30", &["list", "--limit", "7"]).await;
+
+    assert!(
+        stdout(&listed).contains("\t2026-10-17 03:32 -03:30\t"),
+        "{}",
+        stdout(&listed)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn json_keeps_epoch_seconds_whatever_the_time_zone() {
+    let env = Env::filled().await;
+
+    let hits = json(
+        &env.read_in("CEST-2", &["search", "pelican", "--json"])
+            .await,
+    );
+
+    // 17 October 2026, 09:02 at +0200.
+    assert_eq!(hits[0]["date"], 1_792_220_520);
 }

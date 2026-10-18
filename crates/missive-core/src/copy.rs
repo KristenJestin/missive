@@ -730,30 +730,23 @@ impl Copy {
     }
 }
 
-/// A time in seconds since the epoch as `2026-10-17 07:30 UTC`.
-pub fn utc(seconds: i64) -> String {
-    let days = seconds.div_euclid(86_400);
-    let rest = seconds.rem_euclid(86_400);
-    // The civil date of a day count (Howard Hinnant's algorithm), days from 1970-01-01.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
+/// A time in seconds since the epoch in the user's time zone (`TZ`, else the system's), as
+/// `2026-10-17 09:30 +02:00`; `2026-10-17 07:30 UTC` where the zone is UTC itself.
+pub fn local_time(seconds: i64) -> String {
+    match chrono::DateTime::from_timestamp(seconds, 0) {
+        Some(time) => written(time.with_timezone(&chrono::Local).fixed_offset()),
+        None => seconds.to_string(),
+    }
+}
+
+fn written(time: chrono::DateTime<chrono::FixedOffset>) -> String {
+    let offset = time.offset().local_minus_utc();
+    let zone = if offset == 0 {
+        "UTC".to_owned()
     } else {
-        shifted_month - 9
+        time.format("%:z").to_string()
     };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
-        rest / 3_600,
-        rest % 3_600 / 60
-    )
+    format!("{} {zone}", time.format("%Y-%m-%d %H:%M"))
 }
 
 fn role_rank(folder: &FolderRef) -> usize {
@@ -819,13 +812,24 @@ mod tests {
     }
 
     #[test]
-    fn a_time_is_written_in_utc() {
-        assert_eq!(utc(0), "1970-01-01 00:00 UTC");
-        assert_eq!(utc(1_792_220_640), "2026-10-17 07:04 UTC");
-        // The end of a leap day and the start of the next day.
-        assert_eq!(utc(1_709_251_199), "2024-02-29 23:59 UTC");
-        assert_eq!(utc(1_709_251_200), "2024-03-01 00:00 UTC");
-        assert_eq!(utc(-1), "1969-12-31 23:59 UTC");
+    fn a_time_is_written_in_its_zone_with_the_offset() {
+        use chrono::{DateTime, FixedOffset, Utc};
+        let at = |seconds: i64, offset: i32| {
+            written(
+                DateTime::<Utc>::from_timestamp(seconds, 0)
+                    .unwrap()
+                    .with_timezone(&FixedOffset::east_opt(offset).unwrap()),
+            )
+        };
+        assert_eq!(at(0, 0), "1970-01-01 00:00 UTC");
+        assert_eq!(at(1_792_220_640, 0), "2026-10-17 07:04 UTC");
+        assert_eq!(at(1_792_220_640, 7_200), "2026-10-17 09:04 +02:00");
+        assert_eq!(at(1_792_220_640, -12_600), "2026-10-17 03:34 -03:30");
+        // The end of a leap day and the start of the next day, and a day that changes with the zone.
+        assert_eq!(at(1_709_251_199, 0), "2024-02-29 23:59 UTC");
+        assert_eq!(at(1_709_251_200, 0), "2024-03-01 00:00 UTC");
+        assert_eq!(at(1_709_251_199, 3_600), "2024-03-01 00:59 +01:00");
+        assert_eq!(at(-1, 0), "1969-12-31 23:59 UTC");
     }
 
     #[test]
