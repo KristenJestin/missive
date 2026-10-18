@@ -22,3 +22,7 @@ CREATE TRIGGER message_search_delete AFTER DELETE ON message
 BEGIN
     DELETE FROM message_search WHERE rowid = old.id;
 END;
+
+-- What `unread` counts, read from here alone: the flags of each folder's messages, without
+-- reading the messages' rows.
+CREATE INDEX message_flags ON message (folder, flags);
