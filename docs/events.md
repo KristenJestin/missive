@@ -244,6 +244,31 @@ shows it.
 | `account`, `outbox`, `message_id` | | as for `sent` |
 | `message` | string | for people |
 
+### `draft`
+
+A draft was written to the account's Drafts folder, removed from it (its message was sent), or
+is tried again later (`missive compose`, or `draft` on the socket).
+
+```json
+{"protocol": 1, "event": "draft", "account": "alice", "draft": "4b2e…@example.org",
+ "outcome": "saved", "id": "alice/3/1745112/12", "left": 0}
+```
+
+| Field | Type | |
+|---|---|---|
+| `account` | string | the account's identifier |
+| `draft` | string | the draft's identifier (its `Message-ID`, without angle brackets), as `compose --json` printed it |
+| `outcome` | string | `saved`: the version is in the Drafts folder; `removed`: the draft left it, its message sent; `retried`: it stays in the local copy, tried again at the next pass |
+| `id` | string, absent when not known | for `saved`: the identifier of the version in the Drafts folder |
+| `left` | number | for `saved` and `removed`: how many older versions stay in the Drafts folder, `0` but on a server without UIDPLUS (no `UID EXPUNGE`), or one that refused to remove them |
+| `reason` | string | for `retried`: `refused` (the server answered `NO` or `BAD`) or `connection` (the connection was lost, or no answer came in time) |
+| `attempts` | number | for `retried`: how many times it failed so far |
+| `message` | string | when `left` is not `0`: why, for people |
+
+A draft is never given up: the version stays in the local copy until the server holds it. A
+draft of an account without a Drafts folder is not an event: it stays in the copy, and
+`missive status` says so.
+
 ### `lagged`
 
 The watcher read too slowly, and events were dropped for it alone.

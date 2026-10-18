@@ -36,12 +36,19 @@ pub struct Left {
 }
 
 impl Store {
-    /// Puts a message in the account's outbox; returns its number there.
-    pub fn enqueue(&self, account: i64, built: &Built, sent_copy: bool) -> rusqlite::Result<i64> {
+    /// Puts a message in the account's outbox; returns its number there. A message sent from a
+    /// draft names it (its Message-ID): the draft is removed once the server took the message.
+    pub fn enqueue(
+        &self,
+        account: i64,
+        built: &Built,
+        sent_copy: bool,
+        draft: Option<&str>,
+    ) -> rusqlite::Result<i64> {
         self.connection.query_row(
             "INSERT INTO outbox (account, sender, recipients, message_id, raw, bcc_header,
-                                 sent_copy, queued_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch())
+                                 sent_copy, queued_at, draft)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch(), ?8)
              RETURNING id",
             params![
                 account,
@@ -50,7 +57,8 @@ impl Store {
                 built.message_id,
                 built.raw,
                 built.bcc_header,
-                sent_copy
+                sent_copy,
+                draft
             ],
             |r| r.get(0),
         )
@@ -152,15 +160,25 @@ impl Store {
     }
 
     /// The server took the message: it leaves the outbox, or waits for its copy in Sent when
-    /// `copy`.
-    pub fn sent(&self, id: i64, copy: bool) -> rusqlite::Result<()> {
-        if copy {
-            self.set(id, "sent", None)
-        } else {
-            self.connection
-                .execute("DELETE FROM outbox WHERE id = ?1", [id])?;
-            Ok(())
+    /// `copy`. The draft it was sent from, if any, is to be removed, in the same transaction.
+    pub fn sent(&mut self, id: i64, copy: bool) -> rusqlite::Result<()> {
+        let transaction = self.connection.transaction()?;
+        let draft: Option<(i64, Option<String>)> = transaction
+            .query_row(
+                "SELECT account, draft FROM outbox WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((account, Some(draft))) = draft {
+            super::drafts::remove_draft(&transaction, account, &draft)?;
         }
+        if copy {
+            transaction.execute("UPDATE outbox SET state = 'sent' WHERE id = ?1", [id])?;
+        } else {
+            transaction.execute("DELETE FROM outbox WHERE id = ?1", [id])?;
+        }
+        transaction.commit()
     }
 
     fn set(&self, id: i64, state: &str, why: Option<&str>) -> rusqlite::Result<()> {
@@ -269,8 +287,8 @@ mod tests {
     #[test]
     fn messages_are_sent_in_order_and_one_that_failed_waits_no_more() {
         let (_dir, store, account) = open();
-        let one = store.enqueue(account, &built(1), true).unwrap();
-        let two = store.enqueue(account, &built(2), false).unwrap();
+        let one = store.enqueue(account, &built(1), true, None).unwrap();
+        let two = store.enqueue(account, &built(2), false, None).unwrap();
 
         let next = store.claim_next(account).unwrap().unwrap();
         assert_eq!(next.id, one);
@@ -294,13 +312,13 @@ mod tests {
     fn a_message_is_claimed_by_one_worker_only() {
         let (dir, store, account) = open();
         let other = Store::open(&dir.path().join("copy.sqlite")).unwrap();
-        let one = store.enqueue(account, &built(1), true).unwrap();
+        let one = store.enqueue(account, &built(1), true, None).unwrap();
 
         assert_eq!(store.claim_next(account).unwrap().unwrap().id, one);
         assert_eq!(other.claim_next(account).unwrap(), None);
         assert_eq!(states(&store), [(one, "claimed".to_owned())]);
         // Only the row's claim lets its end of data go.
-        let two = store.enqueue(account, &built(2), true).unwrap();
+        let two = store.enqueue(account, &built(2), true, None).unwrap();
         assert!(store.sending(two).is_err());
         store.sending(one).unwrap();
         assert_eq!(
@@ -312,8 +330,8 @@ mod tests {
     #[test]
     fn a_claimed_message_found_at_start_goes_back_to_the_queue() {
         let (_dir, store, account) = open();
-        let one = store.enqueue(account, &built(1), true).unwrap();
-        let two = store.enqueue(account, &built(2), true).unwrap();
+        let one = store.enqueue(account, &built(1), true, None).unwrap();
+        let two = store.enqueue(account, &built(2), true, None).unwrap();
         store.claim_next(account).unwrap();
         store.claim_next(account).unwrap();
         store.sending(two).unwrap();
@@ -329,8 +347,8 @@ mod tests {
     #[test]
     fn a_message_left_sending_by_a_daemon_that_stopped_becomes_uncertain() {
         let (_dir, store, account) = open();
-        let one = store.enqueue(account, &built(1), true).unwrap();
-        let two = store.enqueue(account, &built(2), true).unwrap();
+        let one = store.enqueue(account, &built(1), true, None).unwrap();
+        let two = store.enqueue(account, &built(2), true, None).unwrap();
         store.claim_next(account).unwrap();
         store.sending(one).unwrap();
 
@@ -352,9 +370,9 @@ mod tests {
 
     #[test]
     fn a_message_sent_leaves_the_outbox_once_its_copy_is_in_sent() {
-        let (_dir, store, account) = open();
-        let one = store.enqueue(account, &built(1), true).unwrap();
-        let two = store.enqueue(account, &built(2), false).unwrap();
+        let (_dir, mut store, account) = open();
+        let one = store.enqueue(account, &built(1), true, None).unwrap();
+        let two = store.enqueue(account, &built(2), false, None).unwrap();
         store.sent(one, true).unwrap();
         store.sent(two, false).unwrap();
         assert_eq!(states(&store), [(one, "sent".to_owned())]);

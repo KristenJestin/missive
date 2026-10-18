@@ -18,6 +18,10 @@
 //! again after a backoff what the server did not take, and wakes the IMAP worker, which appends
 //! the copy to Sent (see [`missive_core::outbox`]).
 //!
+//! A draft (`draft`) is built and saved in the copy the same way, and answered at once; the IMAP
+//! worker, woken, writes it to the Drafts folder when it is connected, with the queue (see
+//! [`missive_core::drafts`]).
+//!
 //! A connection that sends `subscribe` is a watcher: the daemon then writes it the events of the
 //! workers (`docs/events.md`). They travel on a bounded broadcast channel, so that a watcher that
 //! reads too slowly misses events, is told how many, and holds nothing else back.
@@ -39,7 +43,10 @@ use missive_core::actions::{self, Kind, Outcome, Wanted};
 use missive_core::compose::{self, Attachment, Draft, Mailbox};
 use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap};
 use missive_core::copy::{Copy, MessageId};
-use missive_core::events::{ActionEvent, Event, Reader, SendFailed, SendUncertain, Sent, Unread};
+use missive_core::drafts;
+use missive_core::events::{
+    ActionEvent, DraftEvent, Event, Reader, SendFailed, SendUncertain, Sent, Unread,
+};
 use missive_core::keyring::{Keyring, KeyringError};
 use missive_core::outbox::{self, Copied, Tried};
 use missive_core::protocol::{
@@ -588,6 +595,185 @@ impl Daemon {
                 permanently,
             } => self.record(name, &messages, Wanted::Delete { permanently }),
             Command::Send(send) => self.enqueue(send),
+            Command::Draft(draft) => self.draft(draft),
+        }
+    }
+
+    /// Saves a draft in the copy, and wakes the account's IMAP worker, which writes it to the
+    /// Drafts folder; with `send`, puts it in the outbox too, and wakes the SMTP worker. The
+    /// fields given replace those of the draft picked up. Answered once in the copy: whether
+    /// the server is reachable does not matter here.
+    fn draft(&self, request: protocol::SaveDraft) -> Answer {
+        let name = "draft";
+        self.reload();
+        let no_account = || {
+            Answer::error(
+                Some(name),
+                "no-such-account",
+                format!(
+                    "no account {} (missive account list shows them)",
+                    request.account
+                ),
+            )
+        };
+        let (Some(sender), Some(worker)) = (
+            locked(&self.senders).get(&request.account).cloned(),
+            locked(&self.workers).get(&request.account).cloned(),
+        ) else {
+            return no_account();
+        };
+        let account = match AccountStore::from_env().and_then(|store| store.get(&request.account)) {
+            Ok(Some(account)) => account,
+            Ok(None) => return no_account(),
+            Err(e) => {
+                return Answer::error(
+                    Some(name),
+                    "failed",
+                    format!("the account's settings cannot be read ({})", e.kind()),
+                );
+            }
+        };
+        let failed = |e: String| {
+            log!("cannot write a draft to the local copy ({e})");
+            Answer::error(
+                Some(name),
+                "failed",
+                format!("the local copy could not be written ({e})"),
+            )
+        };
+        let mut store = match Store::open(&self.store) {
+            Ok(store) => store,
+            Err(e) => return failed(e.to_string()),
+        };
+        let key = match store.account(&request.account) {
+            Ok(key) => key,
+            Err(e) => return failed(e.to_string()),
+        };
+        // Only a draft Missive wrote is replaced: another client's stays on the server as it is,
+        // and a new draft, Missive's own, is made from it (`kept`).
+        let (mut draft, message_id, kept) = match &request.draft {
+            None => (Draft::default(), None, None),
+            Some(id) => match store.find_draft(key, id) {
+                Ok(Some(stored)) => match Draft::read(&stored.raw) {
+                    Ok(draft) if compose::is_own_draft(&stored.raw) => {
+                        (draft, stored.message_id, None)
+                    }
+                    Ok(draft) => (draft, None, Some(id.clone())),
+                    Err(why) => return Answer::error(Some(name), "bad-request", why),
+                },
+                Ok(None) => {
+                    return Answer::error(
+                        Some(name),
+                        "no-such-message",
+                        format!(
+                            "{id}: no such draft in the local copy (missive list --folder drafts \
+                             shows them)"
+                        ),
+                    );
+                }
+                Err(e) => return failed(e.to_string()),
+            },
+        };
+        if let Some(id) = &message_id {
+            match store.draft_sending(key, id) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Answer::error(
+                        Some(name),
+                        "busy",
+                        "this draft is being sent; missive watch tells when it is",
+                    );
+                }
+                Err(e) => return failed(e.to_string()),
+            }
+        }
+        let changed = request.to.is_some()
+            || request.cc.is_some()
+            || request.bcc.is_some()
+            || request.subject.is_some()
+            || request.body.is_some()
+            || request.attachments.is_some();
+        let mailboxes = |list: &[String]| -> Result<Vec<Mailbox>, String> {
+            list.iter().map(|text| Mailbox::parse(text)).collect()
+        };
+        let fields = (|| {
+            if let Some(to) = &request.to {
+                draft.to = mailboxes(to)?;
+            }
+            if let Some(cc) = &request.cc {
+                draft.cc = mailboxes(cc)?;
+            }
+            if let Some(bcc) = &request.bcc {
+                draft.bcc = mailboxes(bcc)?;
+            }
+            if let Some(subject) = request.subject {
+                draft.subject = Some(subject);
+            }
+            if let Some(body) = request.body {
+                draft.body = body;
+            }
+            if let Some(attachments) = request.attachments {
+                draft.attachments = attachments
+                    .into_iter()
+                    .map(|a| Attachment {
+                        name: a.name,
+                        data: a.data,
+                    })
+                    .collect();
+            }
+            if request.send {
+                draft.check()?;
+            }
+            compose::write(&account, &draft, now(), message_id.as_deref())
+        })();
+        let built = match fields {
+            Ok(built) => built,
+            Err(why) => return Answer::error(Some(name), "bad-request", why),
+        };
+        // A draft sent as it is needs no new version.
+        let save = !request.send || (request.draft.is_some() && changed);
+        if save {
+            let saved = store.save_draft(key, &built.message_id, &built.as_draft());
+            if let Err(e) = saved {
+                return failed(e.to_string());
+            }
+            log!(
+                "account {key}: a draft is saved in the local copy ({} bytes)",
+                built.raw.len()
+            );
+            let _ = worker.send(Request::Actions);
+        }
+        if !request.send {
+            return Answer {
+                protocol: PROTOCOL,
+                answer: Some(name.to_owned()),
+                ok: true,
+                message_id: Some(built.message_id),
+                kept,
+                ..Answer::default()
+            };
+        }
+        // The draft removed once the message is sent: Missive's own only.
+        let draft = (save || (request.draft.is_some() && kept.is_none()))
+            .then_some(built.message_id.as_str());
+        let outbox = match store.enqueue(key, &built, !account.server_saves_sent, draft) {
+            Ok(outbox) => outbox,
+            Err(e) => return failed(e.to_string()),
+        };
+        log!(
+            "account {key}: message {outbox} is in the outbox ({} recipients, {} bytes)",
+            built.recipients.len(),
+            built.raw.len()
+        );
+        let _ = sender.send(());
+        Answer {
+            protocol: PROTOCOL,
+            answer: Some(name.to_owned()),
+            ok: true,
+            outbox: Some(outbox),
+            message_id: Some(built.message_id),
+            kept,
+            ..Answer::default()
         }
     }
 
@@ -645,18 +831,19 @@ impl Daemon {
                         data: a.data,
                     })
                     .collect(),
+                ..Draft::default()
             })
         })();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        let built = match draft.and_then(|draft| compose::build(&account, &draft, now)) {
+        let built = match draft.and_then(|draft| compose::build(&account, &draft, now())) {
             Ok(built) => built,
             Err(why) => return Answer::error(Some(name), "bad-request", why),
         };
         let queued = Store::open(&self.store).and_then(|store| {
             let key = store.account(&send.account)?;
-            Ok((key, store.enqueue(key, &built, !account.server_saves_sent)?))
+            Ok((
+                key,
+                store.enqueue(key, &built, !account.server_saves_sent, None)?,
+            ))
         });
         let (key, outbox) = match queued {
             Ok(queued) => queued,
@@ -741,6 +928,13 @@ impl Daemon {
             ..Answer::default()
         }
     }
+}
+
+/// Now, in seconds since the epoch.
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Queues an answer for the connection's writer. `false` when the connection is gone.
@@ -1275,6 +1469,37 @@ impl Worker {
             // A folder skipped here is told by the next pass.
             let _ = self.folder(session, folder).await?;
         }
+        let (written, result) = drafts::write(
+            session,
+            &mut self.store,
+            self.key,
+            &self.id,
+            capabilities,
+            self.options.action_timeout,
+            pass,
+        )
+        .await;
+        for outcome in &written.outcomes {
+            self.tell_draft(outcome);
+        }
+        match result {
+            Ok(()) => {}
+            Err(error) if written.timed_out => return Err(error),
+            Err(error @ SyncError::Connection(_)) => {
+                log!(
+                    "account {}: the drafts stopped ({})",
+                    self.key,
+                    kind(&error)
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        if let Some(id) = written.resync
+            && let Some(folder) = folders.iter_mut().find(|f| f.row.id == id)
+        {
+            // A folder skipped here is told by the next pass.
+            let _ = self.folder(session, folder).await?;
+        }
         if self.queue_waits && !pass {
             return Ok(());
         }
@@ -1350,6 +1575,54 @@ impl Worker {
             attempts,
             message,
         }));
+    }
+
+    /// Logs what became of a draft, and tells the watchers.
+    fn tell_draft(&mut self, outcome: &drafts::Outcome) {
+        let mut event = DraftEvent {
+            account: self.id.clone(),
+            draft: outcome.draft.clone(),
+            outcome: String::new(),
+            id: None,
+            left: None,
+            reason: None,
+            attempts: None,
+            message: None,
+        };
+        let left = match &outcome.result {
+            drafts::Result::Saved { id, left } => {
+                event.outcome = "saved".to_owned();
+                event.id.clone_from(id);
+                Some(left)
+            }
+            drafts::Result::Removed { left } => {
+                event.outcome = "removed".to_owned();
+                Some(left)
+            }
+            drafts::Result::Retried { attempts, reason } => {
+                event.outcome = "retried".to_owned();
+                event.reason = Some((*reason).to_owned());
+                event.attempts = Some(*attempts);
+                None
+            }
+        };
+        if let Some(left) = left {
+            event.left = Some(left.count);
+            event.message = left.why.map(str::to_owned);
+        }
+        log!(
+            "account {}: draft {} {}{}",
+            self.key,
+            outcome.row,
+            event.outcome,
+            match (&event.reason, &event.message) {
+                (_, Some(why)) => format!(": {why}"),
+                (Some(reason), None) =>
+                    format!(" ({reason}, {} times so far)", event.attempts.unwrap_or(0)),
+                (None, None) => String::new(),
+            }
+        );
+        self.events.send(Event::Draft(event));
     }
 
     /// Syncs one folder and logs what is worth knowing.

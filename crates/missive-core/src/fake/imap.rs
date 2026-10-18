@@ -109,6 +109,10 @@ pub(super) async fn serve(
                     let folder = state.folder(&append.folder);
                     (folder.uidvalidity, folder.add(message))
                 });
+                if rule == Some(Action::CutAfterAppend) {
+                    let _ = io.shutdown().await;
+                    return;
+                }
                 let code = if session.shared.uidplus {
                     format!("[APPENDUID {uidvalidity} {uid}] ")
                 } else {
