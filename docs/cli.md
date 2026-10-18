@@ -123,7 +123,7 @@ one refuses to start. SIGTERM or SIGINT (Ctrl-C) stops it cleanly.
 | Option | Value | Default |
 |---|---|---|
 | `--check-interval` | how often, in seconds, the folders other than the inbox are checked | 300 |
-| `--batch-size` | how many new messages are fetched, and written to the copy, at a time (and never more than 32 MiB of them, but for a single larger message) | 50 |
+| `--batch-size` | how many new messages are fetched, and written to the copy, at a time, from 1 to 100 (and never more than 32 MiB of them, but for a single larger message) | 50 |
 
 New mail in the inbox comes at once, through IDLE, which is issued again at each check (and at
 least every 25 minutes). A first sync goes inbox first, newest first: the copy is usable from its

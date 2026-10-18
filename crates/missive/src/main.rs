@@ -52,9 +52,9 @@ struct DaemonArgs {
     /// comes at once, through IDLE.
     #[arg(long, value_name = "SECONDS", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
     check_interval: u64,
-    /// How many new messages are fetched, and written to the local copy, at a time (and never
-    /// more than 32 MiB of them, but for a single larger message).
-    #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..10_000))]
+    /// How many new messages are fetched, and written to the local copy, at a time, 100 at most
+    /// (and never more than 32 MiB of them, but for a single larger message).
+    #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..=100))]
     batch_size: u64,
 }
 

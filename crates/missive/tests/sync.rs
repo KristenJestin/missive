@@ -983,6 +983,21 @@ async fn a_folder_named_with_a_quote_and_a_backslash_syncs_under_its_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_batch_size_that_would_make_a_long_command_line_is_refused() {
+    let env = Env::new().await;
+
+    let output = env.run(&["daemon", "--batch-size", "101"]).await;
+
+    failed(&output);
+    assert!(
+        stderr(&output).contains("batch-size"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!env.socket().exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_session_lost_at_every_pass_answers_the_sync_and_records_unreachable() {
     let server = mailbox().cut("EXAMINE", 0).start().await;
     let env = Env::new().await;
