@@ -10,7 +10,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -20,6 +20,11 @@ use crate::tls::pinned_client_config;
 
 /// How long a login check may take, from the first connection to the server's last answer.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest SMTP reply line read, and the most lines of one reply: RFC 5321 keeps a line to
+/// 512 bytes, and a server's replies hold a few lines. Without a bound, a hostile server could
+/// fill the memory with one endless reply.
+const MAX_REPLY_LINE: usize = 4096;
+const MAX_REPLY_LINES: usize = 100;
 
 /// Why a connection to a server failed. Its [`state`](ConnectError::state) is the account's
 /// connection state; nothing here ever holds a password.
@@ -339,11 +344,25 @@ pub(crate) async fn reply<S: AsyncRead + Unpin>(
 ) -> Result<(u16, Vec<String>)> {
     let mut lines = Vec::new();
     loop {
+        if lines.len() == MAX_REPLY_LINES {
+            return Err(ConnectError::Unreachable(format!(
+                "the SMTP server sent a reply of more than {MAX_REPLY_LINES} lines"
+            )));
+        }
         let mut line = String::new();
-        if smtp.read_line(&mut line).await? == 0 {
+        let read = (&mut *smtp)
+            .take(MAX_REPLY_LINE as u64)
+            .read_line(&mut line)
+            .await?;
+        if read == 0 {
             return Err(ConnectError::Unreachable(
                 "the SMTP server closed the connection".to_owned(),
             ));
+        }
+        if !line.ends_with('\n') && read == MAX_REPLY_LINE {
+            return Err(ConnectError::Unreachable(format!(
+                "the SMTP server sent a reply line of more than {MAX_REPLY_LINE} bytes"
+            )));
         }
         let line = line.trim_end_matches(['\r', '\n']);
         let code = line.get(..3).and_then(|code| code.parse::<u16>().ok());
@@ -388,4 +407,49 @@ async fn within<T>(timeout: Duration, check: impl Future<Output = Result<T>>) ->
                 timeout.as_secs()
             )))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_reply_line_without_end_fails_instead_of_growing() {
+        let mut endless = BufReader::new(tokio::io::repeat(b'2'));
+
+        assert!(matches!(
+            reply(&mut endless).await,
+            Err(ConnectError::Unreachable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reply_of_too_many_lines_fails_instead_of_growing() {
+        let mut lines = b"250-more\r\n".repeat(10_000);
+        lines.extend_from_slice(b"250 end\r\n");
+        let mut long = BufReader::new(&lines[..]);
+
+        assert!(matches!(
+            reply(&mut long).await,
+            Err(ConnectError::Unreachable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_multi_line_reply_is_read_whole() {
+        let mut answer =
+            BufReader::new(&b"250-fake.example.org\r\n250-AUTH PLAIN\r\n250 8BITMIME\r\n"[..]);
+
+        assert_eq!(
+            reply(&mut answer).await.unwrap(),
+            (
+                250,
+                vec![
+                    "fake.example.org".to_owned(),
+                    "AUTH PLAIN".to_owned(),
+                    "8BITMIME".to_owned()
+                ]
+            )
+        );
+    }
 }
