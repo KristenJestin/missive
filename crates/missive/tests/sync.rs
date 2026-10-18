@@ -908,6 +908,63 @@ async fn scattered_uids_are_asked_in_commands_of_a_bounded_length() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_folder_examined_without_its_exists_is_left_alone_and_the_next_one_still_syncs() {
+    // A tagged OK, but no EXISTS: the server forgot a line it must send.
+    let server = mailbox().truncate("EXAMINE \"Sent\"", 3).start().await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+
+    let output = sync_soon(&env).await;
+
+    succeeded(&output);
+    assert_eq!(stdout(&output), "alice: ready\n");
+    assert_eq!(env.uids("INBOX"), [1, 2, 3]);
+    assert!(env.uids("Sent").is_empty());
+    assert_eq!(env.uids(PRIVATE_FOLDER), [5, 9]);
+    assert_eq!(env.state("alice").as_deref(), Some("ready"));
+    assert!(
+        env.logs().contains("(sent): left as it is"),
+        "{}",
+        env.logs()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listing_shorter_than_exists_leaves_its_folder_as_it_is_and_the_next_one_still_syncs() {
+    // The inbox (3 messages) and the private folder (2) are listed short, the sent folder (1)
+    // is not; each listing ends with its tagged OK.
+    let server = mailbox()
+        .without_condstore()
+        .truncate("UID FETCH 1:* (FLAGS", 1)
+        .start()
+        .await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+
+    let output = sync_soon(&env).await;
+
+    succeeded(&output);
+    assert!(env.uids("INBOX").is_empty());
+    assert_eq!(env.uids("Sent").len(), 1);
+    assert!(env.uids(PRIVATE_FOLDER).is_empty());
+    assert_eq!(env.state("alice").as_deref(), Some("ready"));
+    assert!(
+        env.logs().contains("(inbox): left as it is"),
+        "{}",
+        env.logs()
+    );
+    // Healed, the next sync brings what was left.
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(env.uids("INBOX"), [1, 2, 3]);
+    assert_eq!(env.uids(PRIVATE_FOLDER), [5, 9]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_session_lost_at_every_pass_answers_the_sync_and_records_unreachable() {
     let server = mailbox().cut("EXAMINE", 0).start().await;
     let env = Env::new().await;

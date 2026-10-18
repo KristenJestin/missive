@@ -660,7 +660,8 @@ impl Worker {
             }
             None => {
                 log!(
-                    "account {} folder {} ({role}): the server refused to examine or list it",
+                    "account {} folder {} ({role}): left as it is: the server refused to examine or \
+                     list it, or answered something no sync can use",
                     self.key,
                     folder.row.id
                 );

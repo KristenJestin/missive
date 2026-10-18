@@ -27,10 +27,11 @@
 //! A listing is complete only when the command that gave it ended with a tagged `OK`: the answers
 //! of `LIST`, `EXAMINE`, `UID SEARCH` and `UID FETCH` are read here, not by `async-imap`, which
 //! takes the end of an answer for its success whatever its status, and a connection closed in
-//! the middle of an answer for its end. A `NO` leaves the folder as it is until the next pass; a
-//! `BAD`, a `BYE` or a closed connection is a connection error. A listing that ended with `OK`
-//! but holds fewer messages than `EXISTS` said, less those the server expunged meanwhile, is a
-//! connection error too.
+//! the middle of an answer for its end. A `NO` leaves the folder as it is until the next pass, and
+//! so does an answer a sync cannot use although the command ended with `OK` (an `EXAMINE` without
+//! UIDVALIDITY or EXISTS; a listing shorter than `EXISTS` said, less the messages the server
+//! expunged meanwhile): one folder never stops the others. A `BAD`, a `BYE` or a closed
+//! connection is a connection error.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -189,8 +190,11 @@ pub async fn folders(
 }
 
 /// Syncs one folder (see the module's documentation), fetching new messages `batch` at a time.
-/// `None` when the server refused to examine or to list it (it was deleted since it was listed,
-/// say): the copy of that folder is left as it is.
+/// `None` when the folder cannot be synced now: the server refused to examine or to list it (it
+/// was deleted since it was listed, say), or answered with something no sync can use (no
+/// UIDVALIDITY or EXISTS, a listing shorter than the folder), or its name cannot be sent. The
+/// copy of that folder is left as it is, and the other folders are synced all the same; only a
+/// `BAD` or a lost connection is an error.
 pub async fn folder(
     session: &mut ImapSession,
     store: &mut Store,
@@ -226,7 +230,9 @@ pub async fn folder(
         if ended == Ended::No {
             return Ok(None);
         }
-        complete(listing.len(), mailbox.exists, expunged)?;
+        if !complete(listing.len(), mailbox.exists, expunged) {
+            return Ok(None);
+        }
         let flags = match folder.row.highest_modseq {
             _ if local.is_empty() => Some(HashMap::new()),
             Some(since) if since == highest => Some(HashMap::new()),
@@ -248,7 +254,9 @@ pub async fn folder(
         let Some((flags, expunged)) = fetch_flags(session, "(FLAGS)").await? else {
             return Ok(None);
         };
-        complete(flags.len(), mailbox.exists, expunged)?;
+        if !complete(flags.len(), mailbox.exists, expunged) {
+            return Ok(None);
+        }
         (flags.keys().copied().collect(), flags)
     };
 
@@ -409,13 +417,16 @@ struct Examined {
     highest_modseq: Option<u64>,
 }
 
-/// `EXAMINE`: `None` when the server refused it. An answer without UIDVALIDITY or EXISTS, which
-/// every server must send, is not used.
+/// `EXAMINE`: `None` when the server refused it, or when its answer holds no UIDVALIDITY or
+/// EXISTS, which every server must send: such an answer is not used.
 async fn examine(session: &mut ImapSession, name: &str) -> Result<Option<Examined>> {
+    let Some(name) = quote(name) else {
+        return Ok(None);
+    };
     let (mut uidvalidity, mut exists, mut highest_modseq) = (None, None, None);
     let ended = run(
         session,
-        &format!("EXAMINE {}", quote(name)?),
+        &format!("EXAMINE {name}"),
         |response| match response {
             Response::Data {
                 status: Status::Ok,
@@ -433,27 +444,19 @@ async fn examine(session: &mut ImapSession, name: &str) -> Result<Option<Examine
     if ended == Ended::No {
         return Ok(None);
     }
-    match (uidvalidity, exists) {
-        (Some(uidvalidity), Some(exists)) => Ok(Some(Examined {
+    Ok(uidvalidity
+        .zip(exists)
+        .map(|(uidvalidity, exists)| Examined {
             uidvalidity,
             exists,
             highest_modseq,
-        })),
-        _ => Err(SyncError::protocol(
-            "the IMAP server examined a folder without its UIDVALIDITY or EXISTS",
-        )),
-    }
+        }))
 }
 
 /// Whether a listing of `listed` messages can be complete, when `EXAMINE` said `exists` and the
 /// server expunged `expunged` while listing them.
-fn complete(listed: usize, exists: u32, expunged: u32) -> Result<()> {
-    if listed as u64 + u64::from(expunged) < u64::from(exists) {
-        return Err(SyncError::protocol(
-            "the IMAP server listed fewer messages than the folder holds",
-        ));
-    }
-    Ok(())
+fn complete(listed: usize, exists: u32, expunged: u32) -> bool {
+    listed as u64 + u64::from(expunged) >= u64::from(exists)
 }
 
 /// The flags of the folder's messages, by UID, from `UID FETCH 1:* <query>`, with the number of
@@ -517,14 +520,12 @@ fn new_message(attributes: &[AttributeValue<'_>], sizes: &HashMap<u32, u32>) -> 
     })
 }
 
-/// A folder name as a quoted string; a name no command can carry is refused.
-fn quote(name: &str) -> Result<String> {
+/// A folder name as a quoted string; `None` for a name no command can carry.
+fn quote(name: &str) -> Option<String> {
     if name.contains(['\r', '\n']) {
-        return Err(SyncError::protocol(
-            "the IMAP server listed a folder name no command can carry",
-        ));
+        return None;
     }
-    Ok(format!(
+    Some(format!(
         "\"{}\"",
         name.replace('\\', "\\\\").replace('"', "\\\"")
     ))
@@ -670,19 +671,19 @@ mod tests {
 
     #[test]
     fn a_listing_shorter_than_exists_less_the_expunged_is_refused() {
-        assert!(complete(3, 3, 0).is_ok());
-        assert!(complete(2, 3, 1).is_ok());
+        assert!(complete(3, 3, 0));
+        assert!(complete(2, 3, 1));
         // New mail since EXAMINE makes a listing longer, never shorter.
-        assert!(complete(4, 3, 0).is_ok());
-        assert!(complete(2, 3, 0).is_err());
-        assert!(complete(0, 20000, 0).is_err());
+        assert!(complete(4, 3, 0));
+        assert!(!complete(2, 3, 0));
+        assert!(!complete(0, 20000, 0));
     }
 
     #[test]
     fn a_folder_name_is_quoted_and_escaped() {
         assert_eq!(quote("INBOX").unwrap(), "\"INBOX\"");
         assert_eq!(quote("a \"b\" \\c").unwrap(), "\"a \\\"b\\\" \\\\c\"");
-        assert!(quote("a\r\nb").is_err());
+        assert!(quote("a\r\nb").is_none());
     }
 
     #[test]
