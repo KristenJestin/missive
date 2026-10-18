@@ -92,7 +92,9 @@ content of the file). Standard output stays valid, and the exit status is still 
 ### `missive account remove <id>`
 
 Removes the account's keyring entry, then its settings and certificate. The keyring goes first:
-if it is unavailable, the account stays whole and the command can be run again.
+if it is unavailable, the account stays whole and the command can be run again. Its mail leaves
+the local copy the next time the daemon starts or reloads the configuration (a `sync` does): the
+copy only, nothing is sent to the server. Until then the reading commands skip the account.
 
 ## The event stream
 

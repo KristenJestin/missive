@@ -1968,3 +1968,112 @@ async fn a_page_older_than_an_hour_is_removed_at_the_next_open() {
     assert!(!old.exists());
     assert!(recent.exists());
 }
+
+/// What the copy holds for each account, by identifier: `(folders, messages, raw messages,
+/// index rows, queued actions)`, read straight from the file.
+fn rows_in_copy(path: &Path) -> std::collections::BTreeMap<String, [i64; 5]> {
+    let copy =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let mut statement = copy
+        .prepare(
+            "SELECT account.id,
+                (SELECT count(*) FROM folder WHERE folder.account = account.key),
+                (SELECT count(*) FROM message JOIN folder ON folder.id = message.folder
+                  WHERE folder.account = account.key),
+                (SELECT count(*) FROM message_raw
+                   JOIN message ON message.id = message_raw.message
+                   JOIN folder ON folder.id = message.folder
+                  WHERE folder.account = account.key),
+                (SELECT count(*) FROM message_search
+                   JOIN message ON message.id = message_search.rowid
+                   JOIN folder ON folder.id = message.folder
+                  WHERE folder.account = account.key),
+                (SELECT count(*) FROM action WHERE action.account = account.key)
+               FROM account",
+        )
+        .unwrap();
+    statement
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?],
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn whole_account_in_copy(rows: &std::collections::BTreeMap<String, [i64; 5]>, id: &str) -> bool {
+    rows.get(id)
+        .is_some_and(|[folders, messages, raws, indexed, _]| {
+            *folders > 0 && *messages > 0 && messages == raws && messages == indexed
+        })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_account_leaves_the_copy_when_the_daemon_starts_and_the_other_stays() {
+    let env = Env::filled_with(vec![("alice", alice()), ("bob", bob())]).await;
+    let before = rows_in_copy(&env.copy_path());
+    assert!(whole_account_in_copy(&before, "alice"));
+    assert!(whole_account_in_copy(&before, "bob"));
+    AccountStore::new(env.path("config").join("missive"))
+        .remove("alice")
+        .unwrap();
+    // Without a daemon the copy is not touched (the read commands skip the account meanwhile).
+    assert_eq!(rows_in_copy(&env.copy_path()), before);
+
+    let mut daemon = env.daemon(&[]).await;
+    eventually(10, "the removed account leaving the copy", || {
+        !rows_in_copy(&env.copy_path()).contains_key("alice")
+    })
+    .await;
+    daemon.stop().await;
+
+    let after = rows_in_copy(&env.copy_path());
+    assert_eq!(after.keys().collect::<Vec<_>>(), ["bob"]);
+    assert_eq!(after["bob"], before["bob"]);
+    let status = json(&env.read(&["status", "--json"]).await);
+    assert_eq!(status["accounts"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_removed_while_the_daemon_runs_leaves_the_copy_at_the_next_reload() {
+    let env = Env::filled_with(vec![("alice", alice()), ("bob", bob())]).await;
+    let before = rows_in_copy(&env.copy_path());
+    let mut daemon = env.daemon(&[]).await;
+    assert!(rows_in_copy(&env.copy_path()).contains_key("alice"));
+
+    AccountStore::new(env.path("config").join("missive"))
+        .remove("alice")
+        .unwrap();
+    // `sync` is one of the requests that reload the configuration.
+    env.sync().await;
+    eventually(10, "the removed account leaving the copy", || {
+        !rows_in_copy(&env.copy_path()).contains_key("alice")
+    })
+    .await;
+    daemon.stop().await;
+
+    assert_eq!(rows_in_copy(&env.copy_path())["bob"], before["bob"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_whose_settings_cannot_be_read_keeps_its_rows() {
+    let env = Env::filled_with(vec![("alice", alice()), ("bob", bob())]).await;
+    let before = rows_in_copy(&env.copy_path());
+    std::fs::write(
+        env.path("config")
+            .join("missive/accounts/alice/account.toml"),
+        "not = [valid",
+    )
+    .unwrap();
+
+    let mut daemon = env.daemon(&[]).await;
+    // bob's server is gone, so this ends in an error; the reload it makes is what counts.
+    env.sync().await;
+    daemon.stop().await;
+
+    assert_eq!(rows_in_copy(&env.copy_path()), before);
+}
