@@ -59,7 +59,9 @@ impl fmt::Display for KeyringError {
             KeyringError::NoDefaultCollection => {
                 f.write_str("the keyring has no default collection to keep the password in")
             }
-            KeyringError::Dismissed => f.write_str("the keyring was not unlocked"),
+            KeyringError::Dismissed => f.write_str(
+                "the keyring stayed locked: its unlock prompt was dismissed (unlock it, then try again)",
+            ),
             KeyringError::Service(reason) => write!(f, "the keyring answered an error: {reason}"),
         }
     }

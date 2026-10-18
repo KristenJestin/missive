@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
-use missive_core::fake::{FakeKeyring, FakeServer};
+use missive_core::fake::{FakeKeyring, FakeServer, PromptAnswer};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -23,8 +23,11 @@ struct Setup {
 
 impl Setup {
     async fn new() -> Self {
+        Self::with_keyring(FakeKeyring::start().await).await
+    }
+
+    async fn with_keyring(keyring: FakeKeyring) -> Self {
         let server = FakeServer::builder().user(USER, PASSWORD).start().await;
-        let keyring = FakeKeyring::start().await;
         let home = tempfile::tempdir().unwrap();
         for folder in ["config", "data", "runtime"] {
             std::fs::create_dir(home.path().join(folder)).unwrap();
@@ -306,7 +309,8 @@ async fn the_password_never_appears_in_the_config_folder_a_log_an_error_or_an_ou
             .await,
         setup.add(&[], PASSWORD).await,
         setup.add(&["--certificate", certificate], PASSWORD).await,
-        // A second add of the same account fails after reading the password.
+        // A second add of the same account fails before it reads the password; the scan below
+        // still covers its output.
         setup.add(&["--certificate", certificate], PASSWORD).await,
     ];
     outputs.push(setup.run(&["account", "list"]).await);
@@ -329,6 +333,40 @@ async fn the_password_never_appears_in_the_config_folder_a_log_an_error_or_an_ou
     }
     // Where it does belong.
     assert_eq!(setup.keyring.items()[0].secret, PASSWORD.as_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_keyring_whose_prompt_is_accepted_still_saves_the_account_and_the_password() {
+    let setup = Setup::with_keyring(FakeKeyring::start_locked(PromptAnswer::Accept).await).await;
+
+    let output = setup.add_with_certificate().await;
+
+    succeeded(&output);
+    let items = setup.keyring.items();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].secret, PASSWORD.as_bytes());
+    assert!(
+        setup
+            .config()
+            .join("missive/accounts")
+            .join(USER)
+            .join("account.toml")
+            .is_file()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_keyring_whose_prompt_is_dismissed_saves_nothing_and_says_it_stayed_locked() {
+    let setup = Setup::with_keyring(FakeKeyring::start_locked(PromptAnswer::Dismiss).await).await;
+
+    let output = setup.add_with_certificate().await;
+
+    failed(&output);
+    let stderr = stderr(&output);
+    assert!(stderr.contains("keyring stayed locked"), "{stderr}");
+    assert!(!stderr.contains("unreachable"), "{stderr}");
+    assert!(!stderr.contains("auth-refused"), "{stderr}");
+    setup.nothing_saved();
 }
 
 #[tokio::test(flavor = "multi_thread")]

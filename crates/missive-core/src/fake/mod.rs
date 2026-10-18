@@ -45,7 +45,7 @@ mod imap;
 mod keyring;
 mod smtp;
 
-pub use keyring::{FakeItem, FakeKeyring};
+pub use keyring::{FakeItem, FakeKeyring, PromptAnswer};
 
 use std::future::Future;
 use std::net::SocketAddr;
