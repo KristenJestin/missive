@@ -205,7 +205,7 @@ answered `250` to its end of data.
 ### `send-failed`
 
 The server refused a message for good (a `5xx` answer): it stays in the outbox as `failed`, and
-is never sent again.
+is never sent again unless the user asks for it (`missive outbox resend`).
 
 ```json
 {"protocol": 1, "event": "send-failed", "account": "alice", "outbox": 3,
@@ -229,14 +229,32 @@ its tries and its last error).
 The connection was lost after a message's end of data and before the server's answer, or no
 answer came within 10 minutes, or the daemon was killed while it was sending: the server may have
 taken it. It stays in the outbox as `uncertain`, and is never sent again by itself, since a
-message delivered twice is worse than a question. A daemon that finds a message it was sending
-when it stopped tells this event when it starts, before any watcher can be subscribed: `status`
-shows it.
+message delivered twice is worse than a question: only `missive outbox resend <n> --yes` does.
+A daemon that finds a message it was sending when it stopped tells this event when it starts,
+before any watcher can be subscribed: `status` shows it.
 
 ```json
 {"protocol": 1, "event": "send-uncertain", "account": "alice", "outbox": 3,
  "message_id": "9c1f…@example.org",
  "message": "the connection was lost before the server answered (…): the message may have been sent, so it is not sent again"}
+```
+
+| Field | Type | |
+|---|---|---|
+| `account`, `outbox`, `message_id` | | as for `sent` |
+| `message` | string | for people |
+
+### `sent-copy-failed`
+
+The copy of a message the server took will never be in the account's Sent folder: appending it
+failed five times, or the server says there is no such folder, or the folder's name cannot be
+written in an IMAP command, or the account turned out to have no Sent folder. The message was
+sent all the same; it leaves the outbox.
+
+```json
+{"protocol": 1, "event": "sent-copy-failed", "account": "alice", "outbox": 3,
+ "message_id": "9c1f…@example.org",
+ "message": "the message was sent, but its copy is not in Sent: appending it failed too many times"}
 ```
 
 | Field | Type | |

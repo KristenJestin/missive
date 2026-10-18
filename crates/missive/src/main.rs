@@ -3,6 +3,7 @@ mod compose;
 mod daemon;
 mod mailto;
 mod open;
+mod outbox;
 mod read;
 mod watch;
 
@@ -15,6 +16,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use missive_core::account::{
     Account, AccountStore, Listing, Password, Security, Server, read_certificate, valid_id,
 };
+use missive_core::compose::Mailbox;
 use missive_core::connect::{ConnectError, check_imap, check_smtp, client_config};
 use missive_core::keyring::Keyring;
 use missive_core::protocol::{Answer, Command as Request, PROTOCOL};
@@ -95,6 +97,9 @@ enum Command {
     /// with --send sent (through the outbox, at once, and as soon as the server can be reached).
     /// --draft picks a draft up again. Starts the daemon when none runs.
     Compose(compose::ComposeArgs),
+    /// List the messages of the outbox, or resend or discard one the server refused (failed) or
+    /// that may have been sent (uncertain). Listing reads the local copy only.
+    Outbox(outbox::OutboxArgs),
     /// Compose from a mailto: link, as the system's default handler for them: saved as a draft
     /// (see docs/cli.md). Starts the daemon when none runs.
     Mailto(mailto::MailtoArgs),
@@ -128,10 +133,14 @@ enum AccountCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove an account: its settings, its certificate and its keyring entry.
+    /// Remove an account: its settings, its certificate and its keyring entry. Refused while
+    /// its outbox holds messages not sent, unless --force.
     Remove {
         /// The account's identifier, as `account list` shows it.
         id: String,
+        /// Remove it even though its outbox holds messages not sent: they are dropped with it.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -209,7 +218,7 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Account(AccountCommand::Add(args)) => add(args).await,
         Command::Account(AccountCommand::List { json }) => list(json),
-        Command::Account(AccountCommand::Remove { id }) => remove(&id).await,
+        Command::Account(AccountCommand::Remove { id, force }) => remove(&id, force).await,
         Command::Sync { account } => sync(account).await,
         Command::Watch => watch::run().await.map_err(Failure),
         Command::Daemon(args) => daemon::run(daemon::Options {
@@ -244,6 +253,7 @@ async fn main() -> ExitCode {
         Command::Delete(args) => acted(act::delete(args).await),
         Command::Compose(args) => acted(compose::run(args).await),
         Command::Mailto(args) => acted(mailto::run(args).await),
+        Command::Outbox(args) => acted(outbox::run(args).await),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -286,6 +296,15 @@ async fn add(args: AddArgs) -> Result<()> {
     )?;
     let user = ask.value("User name", "--user", args.user, Some(address.clone()))?;
     ask.done()?;
+    // It goes into `MAIL FROM:<…>` as it is: checked as a recipient's address is.
+    if !Mailbox::parse(&address)
+        .is_ok_and(|mailbox| mailbox.name.is_none() && mailbox.address == address)
+    {
+        return Err(Failure(format!(
+            "{address:?} is not an address Missive can send from (name@example.org, ASCII \
+             only, without a name or angle brackets) (--address)"
+        )));
+    }
     let id = args.id.unwrap_or_else(|| address.clone());
     if !valid_id(&id) {
         return Err(Failure(format!(
@@ -405,18 +424,43 @@ fn describe(server: &Server) -> String {
     )
 }
 
-async fn remove(id: &str) -> Result<()> {
+async fn remove(id: &str, force: bool) -> Result<()> {
     let store = AccountStore::from_env()?;
     if !valid_id(id) || !store.exists(id) {
         return Err(Failure(format!(
             "no account {id} (missive account list shows them)"
         )));
     }
+    if !force {
+        let unsent = unsent(id)?;
+        if unsent > 0 {
+            let messages = if unsent == 1 { "message" } else { "messages" };
+            return Err(Failure(format!(
+                "the outbox of {id} holds {unsent} {messages} not sent, which removing the \
+                 account drops (missive outbox lists them): resend or discard them first, or \
+                 remove it all the same with --force"
+            )));
+        }
+    }
     // The keyring first: if it is unavailable, the account stays whole and can be removed later.
     Keyring::open().await?.delete(id).await?;
     store.remove(id)?;
     println!("Removed the account {id}.");
     Ok(())
+}
+
+/// How many messages of the account's outbox are not sent: all but those whose copy is left to
+/// append to Sent. Read from the local copy, as `status` reads it.
+fn unsent(id: &str) -> Result<usize> {
+    let path = missive_core::store::Store::default_path()?;
+    let Some(copy) = missive_core::copy::Copy::open(&path)? else {
+        return Ok(0);
+    };
+    Ok(copy
+        .outbox(id)?
+        .iter()
+        .filter(|message| message.state != "sent")
+        .count())
 }
 
 async fn sync(account: Option<String>) -> Result<()> {

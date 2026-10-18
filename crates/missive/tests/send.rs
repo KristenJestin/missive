@@ -1008,3 +1008,241 @@ async fn no_password_body_subject_or_address_appears_in_the_logs_of_sending() {
         }
     }
 }
+
+/// `missive outbox --json`, read.
+async fn listed(env: &Env) -> serde_json::Value {
+    let output = env.run(&["outbox", "--json"]).await;
+    succeeded(&output);
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// The bodies the server took, in order.
+fn bodies(server: &FakeServer) -> Vec<String> {
+    server
+        .smtp_messages()
+        .iter()
+        .map(|m| {
+            let data = String::from_utf8_lossy(&m.data).into_owned();
+            data.split("\r\n\r\n")
+                .nth(1)
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_outbox_lists_a_failed_and_an_uncertain_message() {
+    let server = mailbox()
+        .smtp_answer("RCPT", "550 5.1.1 no such user")
+        .start()
+        .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = env.watch().await;
+    succeeded(&env.compose(&["--body", BODY]).await);
+    watcher.next("send-failed").await;
+    server.heal();
+    server.smtp_cut_after_data();
+    succeeded(&env.compose(&["--body", BODY]).await);
+    watcher.next("send-uncertain").await;
+
+    let listed = listed(&env).await;
+    let messages = listed.as_array().unwrap();
+    assert_eq!(messages.len(), 2, "{listed}");
+    assert_eq!(messages[0]["account"], "alice");
+    assert_eq!(messages[0]["state"], "failed");
+    assert!(messages[0]["outbox"].is_i64(), "{listed}");
+    assert!(messages[0]["message_id"].is_string(), "{listed}");
+    assert!(
+        messages[0]["last_error"].as_str().unwrap().contains("550"),
+        "{listed}"
+    );
+    assert_eq!(messages[1]["state"], "uncertain");
+    let text = env.run(&["outbox"]).await;
+    succeeded(&text);
+    let text = stdout(&text);
+    assert!(
+        text.contains("failed") && text.contains("uncertain"),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_message_is_resent_and_arrives_once() {
+    let server = mailbox()
+        .smtp_answer("RCPT", "550 5.1.1 no such user")
+        .start()
+        .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = env.watch().await;
+    let output = env.compose(&["--json", "--body", BODY]).await;
+    let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    watcher.next("send-failed").await;
+    server.heal();
+
+    let id = queued["outbox"].to_string();
+    succeeded(&env.run(&["outbox", "resend", &id]).await);
+
+    let sent = watcher.next("sent").await;
+    assert_eq!(sent["outbox"], queued["outbox"]);
+    took(&server, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uncertain_message_is_resent_only_with_yes() {
+    let server = mailbox().start().await;
+    server.smtp_cut_after_data();
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = env.watch().await;
+    let output = env.compose(&["--json", "--body", BODY]).await;
+    let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    watcher.next("send-uncertain").await;
+    server.heal();
+    let id = queued["outbox"].to_string();
+
+    let refused = env.run(&["outbox", "resend", &id]).await;
+    failed(&refused);
+    assert!(stderr(&refused).contains("--yes"), "{}", stderr(&refused));
+    took(&server, 1).await;
+    assert_eq!(env.outbox()[0].1, "uncertain");
+
+    succeeded(&env.run(&["outbox", "resend", &id, "--yes"]).await);
+    watcher.next("sent").await;
+    took(&server, 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_message_is_discarded_and_never_sent() {
+    let server = mailbox()
+        .smtp_answer("RCPT", "550 5.1.1 no such user")
+        .start()
+        .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = env.watch().await;
+    let output = env.compose(&["--json", "--body", BODY]).await;
+    let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    watcher.next("send-failed").await;
+    server.heal();
+
+    let id = queued["outbox"].to_string();
+    succeeded(&env.run(&["outbox", "discard", &id]).await);
+
+    assert!(env.outbox().is_empty(), "{:?}", env.outbox());
+    assert_eq!(listed(&env).await, serde_json::json!([]));
+    // A new message goes; the discarded one is gone for good.
+    succeeded(&env.compose(&["--body", "after"]).await);
+    watcher.next("sent").await;
+    took(&server, 1).await;
+    assert_eq!(bodies(&server), ["after"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_failed_or_uncertain_message_can_be_resent_or_discarded() {
+    let (_server, _relay, env) = smtp_down().await;
+    let _daemon = env.daemon().await;
+    env.ready().await;
+    let output = env.compose(&["--json", "--body", BODY]).await;
+    let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = queued["outbox"].to_string();
+
+    for action in [&["resend", &id, "--yes"][..], &["discard", &id]] {
+        let refused = env.run(&[&["outbox"][..], action].concat()).await;
+        failed(&refused);
+        // Queued, or claimed by a try that cannot reach the server.
+        assert!(
+            stderr(&refused).contains("only a failed or uncertain message"),
+            "{}",
+            stderr(&refused)
+        );
+        let unknown = env.run(&["outbox", action[0], "999"]).await;
+        failed(&unknown);
+        assert!(stderr(&unknown).contains("999"), "{}", stderr(&unknown));
+    }
+    assert!(
+        matches!(env.outbox()[0].1.as_str(), "queued" | "claimed"),
+        "{:?}",
+        env.outbox()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_waiting_for_a_retry_does_not_hold_back_the_others() {
+    let server = mailbox()
+        .smtp_answer("RCPT TO:<slow@example.com>", "451 4.3.0 try again later")
+        .start()
+        .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = env.watch().await;
+    succeeded(
+        &env.compose(&["--cc", "slow@example.com", "--body", "first"])
+            .await,
+    );
+    eventually(20, "a refused try", || {
+        env.outbox()
+            .first()
+            .is_some_and(|(_, _, attempts)| *attempts >= 1)
+    })
+    .await;
+
+    succeeded(&env.compose(&["--body", "second"]).await);
+
+    watcher.next("sent").await;
+    assert_eq!(bodies(&server), ["second"]);
+    assert_eq!(env.outbox()[0].1, "queued");
+    server.heal();
+    eventually(30, "the first message sent", || {
+        server.smtp_messages().len() == 2
+    })
+    .await;
+    assert_eq!(bodies(&server), ["second", "first"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_killed_during_the_sent_append_does_not_append_it_twice() {
+    let server = mailbox().start().await;
+    let (env, mut daemon) = started(&Setup::of(&server)).await;
+    server.stall_after_append();
+    succeeded(&env.compose(&["--body", BODY]).await);
+    eventually(20, "the copy taken by the server", || {
+        server.uids("Sent").len() == 1
+    })
+    .await;
+    daemon.kill().await;
+    server.heal();
+
+    let _restarted = env.daemon().await;
+
+    eventually(20, "the outbox empty", || env.outbox().is_empty()).await;
+    assert_eq!(server.uids("Sent").len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sent_copy_refused_five_times_is_given_up_with_an_event() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = env.watch().await;
+    server.refuse("APPEND");
+    let output = env.compose(&["--json", "--body", BODY]).await;
+    let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    watcher.next("sent").await;
+
+    // Each pass tries the copy again.
+    for _ in 0..10 {
+        if env.outbox().is_empty() {
+            break;
+        }
+        env.run(&["sync"]).await;
+    }
+
+    let given_up = watcher.next("sent-copy-failed").await;
+    assert_eq!(given_up["account"], "alice");
+    assert_eq!(given_up["outbox"], queued["outbox"]);
+    assert_eq!(given_up["message_id"], queued["message_id"]);
+    assert!(
+        given_up["message"].as_str().unwrap().contains("too many"),
+        "{given_up}"
+    );
+    assert!(env.outbox().is_empty());
+    assert!(server.uids("Sent").is_empty());
+}

@@ -5,7 +5,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
+use missive_core::compose::Built;
 use missive_core::fake::{FakeKeyring, FakeServer, PromptAnswer};
+use missive_core::store::Store;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -77,7 +79,12 @@ impl Setup {
             .spawn()
             .unwrap();
         let mut input = child.stdin.take().unwrap();
-        input.write_all(stdin.as_bytes()).await.unwrap();
+        // A process that exits before reading it all (a refusal, under load) closed the pipe:
+        // its output says what it did.
+        match input.write_all(stdin.as_bytes()).await {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            written => written.unwrap(),
+        }
         drop(input);
         child.wait_with_output().await.unwrap()
     }
@@ -98,13 +105,25 @@ impl Setup {
         extra: &[&str],
         password: &str,
     ) -> Output {
+        self.add_as(USER, imap_port, smtp_port, extra, password)
+            .await
+    }
+
+    async fn add_as(
+        &self,
+        address: &str,
+        imap_port: &str,
+        smtp_port: &str,
+        extra: &[&str],
+        password: &str,
+    ) -> Output {
         let mut args = vec![
             "account",
             "add",
             "--name",
             "Alice Example",
             "--address",
-            USER,
+            address,
             "--imap-host",
             "127.0.0.1",
             "--imap-port",
@@ -761,4 +780,96 @@ async fn without_a_terminal_the_password_comes_only_from_password_stdin() {
         stderr(&output)
     );
     setup.nothing_saved();
+}
+
+/// Puts in the local copy, for the account `alice@example.org`, a message queued, one the server
+/// refused and one sent whose copy is still to be appended to Sent.
+fn with_an_outbox(setup: &Setup) {
+    let folder = setup.home.path().join("data/missive");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut store = Store::open(&folder.join("copy.sqlite")).unwrap();
+    let key = store.account(USER).unwrap();
+    let built = |n: u32| Built {
+        sender: USER.to_owned(),
+        recipients: vec!["bob@example.com".to_owned()],
+        message_id: format!("{n}@example.org"),
+        raw: format!("Subject: {n}\r\n\r\nHello\r\n").into_bytes(),
+        bcc_header: None,
+    };
+    store.enqueue(key, &built(1), true, None).unwrap();
+    let refused = store.enqueue(key, &built(2), true, None).unwrap();
+    store
+        .send_failed(refused, "the server answered 550")
+        .unwrap();
+    let sent = store.enqueue(key, &built(3), true, None).unwrap();
+    store.sent(sent, true).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_with_unsent_messages_is_refused_without_force_and_says_how_many() {
+    let setup = Setup::new().await;
+    succeeded(&setup.add_with_certificate().await);
+    with_an_outbox(&setup);
+
+    let output = setup.run(&["account", "remove", USER]).await;
+
+    failed(&output);
+    let said = stderr(&output);
+    assert!(said.contains("2 messages"), "{said}");
+    assert!(said.contains("--force"), "{said}");
+    assert_eq!(setup.keyring.items().len(), 1);
+    let list = setup.run(&["account", "list", "--json"]).await;
+    assert!(stdout(&list).contains(USER), "{}", stdout(&list));
+
+    succeeded(&setup.run(&["account", "remove", USER, "--force"]).await);
+    assert!(setup.keyring.items().is_empty());
+    let list = setup.run(&["account", "list", "--json"]).await;
+    assert_eq!(stdout(&list).trim(), "[]");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_address_missive_cannot_send_from_is_refused_before_any_login() {
+    let setup = Setup::new().await;
+    let imap_port = setup.server.imap_starttls_addr().port().to_string();
+    let smtp_port = setup.server.smtp_tls_addr().port().to_string();
+
+    for address in [
+        "alice@example.org> SIZE=1",
+        "Alice <alice@example.org>",
+        "alice example.org",
+        "alice@exämple.org",
+        "alice@example.org\r\nRCPT TO:<eve@example.com>",
+    ] {
+        let output = setup
+            .add_as(
+                address,
+                &imap_port,
+                &smtp_port,
+                &["--id", "alice", "--user", USER],
+                PASSWORD,
+            )
+            .await;
+
+        failed(&output);
+        assert!(stderr(&output).contains("address"), "{}", stderr(&output));
+        setup.nothing_saved();
+    }
+    assert!(
+        setup.server.imap_log().is_empty(),
+        "{:?}",
+        setup.server.imap_log()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_that_exits_before_reading_its_standard_input_does_not_fail_the_helper() {
+    let setup = Setup::new().await;
+    // More than a pipe holds: the write meets a process that is gone.
+    let input = "x".repeat(4 << 20);
+
+    let output = setup
+        .run_with_stdin(setup.command(&["account", "list", "--json"]), &input)
+        .await;
+
+    succeeded(&output);
 }

@@ -15,8 +15,8 @@
 //! A message to send (`send`) is built and written to the copy's outbox by the connection that
 //! asked, and answered at once. Each account has a second worker for it, apart from the IMAP one
 //! so that mail goes out while the IMAP server is down: it submits the outbox in order, tries
-//! again after a backoff what the server did not take, and wakes the IMAP worker, which appends
-//! the copy to Sent (see [`missive_core::outbox`]).
+//! again what the server did not take after a wait of that message's own, and wakes the IMAP
+//! worker, which appends the copy to Sent (see [`missive_core::outbox`]).
 //!
 //! A draft (`draft`) is built and saved in the copy the same way, and answered at once; the IMAP
 //! worker, woken, writes it to the Drafts folder when it is connected, with the queue (see
@@ -46,14 +46,14 @@ use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap}
 use missive_core::copy::{Copy, MessageId};
 use missive_core::drafts;
 use missive_core::events::{
-    ActionEvent, DraftEvent, Event, Reader, SendFailed, SendUncertain, Sent, Unread,
+    ActionEvent, DraftEvent, Event, Reader, SendFailed, SendUncertain, Sent, SentCopyFailed, Unread,
 };
 use missive_core::keyring::{Keyring, KeyringError};
 use missive_core::outbox::{self, Copied, Tried};
 use missive_core::protocol::{
     self, AccountState, Answer, Command, PROTOCOL, pid_path, read_request, runtime_dir, socket_path,
 };
-use missive_core::store::{SkippedFolder, Store};
+use missive_core::store::{Retaken, SkippedFolder, Store};
 use missive_core::sync::{self, Capabilities, Changes, Folder, Skip, SyncError};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -597,6 +597,73 @@ impl Daemon {
             } => self.record(name, &messages, Wanted::Delete { permanently }),
             Command::Send(send) => self.enqueue(send),
             Command::Draft(draft) => self.draft(draft),
+            Command::Resend { outbox, yes } => self.retake(name, outbox, yes),
+            Command::Discard { outbox } => self.retake(name, outbox, false),
+        }
+    }
+
+    /// Puts a `failed` or `uncertain` message of the outbox back in the queue and wakes its
+    /// account's SMTP worker (`resend`), or removes it (`discard`). Only the user asks for either;
+    /// an `uncertain` message is resent only with `yes`, since it may have arrived already.
+    fn retake(&self, name: &str, outbox: i64, yes: bool) -> Answer {
+        let resend = name == "resend";
+        self.reload();
+        let retaken = Store::open(&self.store).and_then(|store| {
+            if resend {
+                store.resend(outbox, yes)
+            } else {
+                store.discard(outbox)
+            }
+        });
+        let done = if resend { "resent" } else { "discarded" };
+        let account = match retaken {
+            Ok(Retaken::Done(account)) => account,
+            Ok(Retaken::Unknown) => {
+                return Answer::error(
+                    Some(name),
+                    "no-such-message",
+                    format!("no message {outbox} in the outbox (missive outbox lists them)"),
+                );
+            }
+            Ok(Retaken::Uncertain) => {
+                return Answer::error(
+                    Some(name),
+                    "uncertain",
+                    format!(
+                        "message {outbox} is uncertain: the server may have taken it already, so \
+                         it is resent only when asked with yes"
+                    ),
+                );
+            }
+            Ok(Retaken::Not(state)) => {
+                return Answer::error(
+                    Some(name),
+                    "not-failed",
+                    format!(
+                        "message {outbox} is {state}: only a failed or uncertain message can be \
+                         {done}"
+                    ),
+                );
+            }
+            Err(e) => {
+                log!("cannot write the outbox ({e})");
+                return Answer::error(
+                    Some(name),
+                    "failed",
+                    format!("the local copy could not be written ({e})"),
+                );
+            }
+        };
+        log!("message {outbox} of the outbox {done}, as asked");
+        if resend && let Some(sender) = locked(&self.senders).get(&account) {
+            let _ = sender.send(());
+        }
+        Answer {
+            protocol: PROTOCOL,
+            answer: Some(name.to_owned()),
+            ok: true,
+            outbox: Some(outbox),
+            ..Answer::default()
         }
     }
 
@@ -1458,10 +1525,24 @@ impl Worker {
                      ({attempts} times so far)",
                     self.key
                 ),
-                Copied::GivenUp { id, why } => log!(
-                    "account {}: the copy of message {id} is not in Sent: {why}",
-                    self.key
-                ),
+                Copied::GivenUp {
+                    id,
+                    message_id,
+                    why,
+                } => {
+                    log!(
+                        "account {}: the copy of message {id} is not in Sent: {why}",
+                        self.key
+                    );
+                    self.events.send(Event::SentCopyFailed(SentCopyFailed {
+                        account: self.id.clone(),
+                        outbox: *id,
+                        message_id: message_id.clone(),
+                        message: format!(
+                            "the message was sent, but its copy is not in Sent: {why}"
+                        ),
+                    }));
+                }
             }
         }
         match copied {
@@ -1840,9 +1921,19 @@ impl SmtpWorker {
                     Err(TryRecvError::Disconnected) => return,
                 }
             }
-            match self.store.has_queued(self.key) {
-                Ok(true) => {}
-                Ok(false) => {
+            // Each message waits for its own time: one the server refuses for now holds back no
+            // other, and a new message goes at once.
+            match self.store.next_due(self.key) {
+                Ok(Some(due)) => {
+                    let early = due - outbox::now();
+                    if early > 0 {
+                        if !self.wait(Some(Duration::from_millis(early as u64))).await {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                Ok(None) => {
                     if !self.wait(None).await {
                         return;
                     }
@@ -1891,25 +1982,24 @@ impl SmtpWorker {
                     continue;
                 }
             };
-            let again = match &tried {
-                Tried::Again { .. } => true,
+            // A login that failed fails for every message: the worker waits too, so as not to log
+            // in once per message.
+            let login_failed = match &tried {
                 Tried::Login { error, .. } => {
                     if *error == ConnectError::AuthRefused {
                         password = None;
                     }
                     true
                 }
-                Tried::Sent { .. } | Tried::Failed { .. } | Tried::Uncertain { .. } => false,
+                Tried::Again { .. } => false,
+                Tried::Sent { .. } | Tried::Failed { .. } | Tried::Uncertain { .. } => {
+                    backoff = Backoff::default();
+                    false
+                }
             };
             self.tell(tried);
-            if again {
-                // The next try waits for its time, whatever is written meanwhile, as a worker
-                // that cannot connect does.
-                if !self.wait(Some(backoff.next())).await {
-                    return;
-                }
-            } else {
-                backoff = Backoff::default();
+            if login_failed && !self.wait(Some(backoff.next())).await {
+                return;
             }
         }
     }
@@ -1927,8 +2017,8 @@ impl SmtpWorker {
         })
     }
 
-    /// Waits for `timeout`, or with none for a message written to the outbox. `false` when the
-    /// daemon stops or the account was removed.
+    /// Waits for `timeout`, or for a message written to (or put back in) the outbox. `false`
+    /// when the daemon stops or the account was removed.
     async fn wait(&mut self, timeout: Option<Duration>) -> bool {
         let sleep = async {
             match timeout {
@@ -1936,17 +2026,10 @@ impl SmtpWorker {
                 None => std::future::pending().await,
             }
         };
-        tokio::pin!(sleep);
-        loop {
-            tokio::select! {
-                woken = self.wake.recv() => match woken {
-                    Some(()) if timeout.is_none() => return true,
-                    Some(()) => {}
-                    None => return false,
-                },
-                _ = &mut sleep => return true,
-                _ = stopped(&mut self.stop) => return false,
-            }
+        tokio::select! {
+            woken = self.wake.recv() => woken.is_some(),
+            _ = sleep => true,
+            _ = stopped(&mut self.stop) => false,
         }
     }
 

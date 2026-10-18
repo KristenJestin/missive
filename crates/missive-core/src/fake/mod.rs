@@ -42,7 +42,8 @@
 //! of an answer, ends an answer short but with its `OK` ([`FakeServer::truncate`]), refuses
 //! one message ([`FakeServer::refuse_uid`]), answers nothing ([`Builder::stall`]), `BAD`
 //! ([`Builder::bad`]) or a bare `BAD` ([`Builder::bare_bad`]), or takes an appended message and
-//! drops the client before answering ([`FakeServer::cut_after_append`]).
+//! drops the client before answering ([`FakeServer::cut_after_append`]) or answers nothing
+//! ([`FakeServer::stall_after_append`]).
 //!
 //! The SMTP side serves `EHLO`/`HELO`, `STARTTLS`, `AUTH PLAIN` and `AUTH LOGIN` (offered only
 //! over TLS; [`Builder::smtp_login_only`] drops `PLAIN`), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP`
@@ -50,7 +51,8 @@
 //! answer a chosen reply to `AUTH`, `MAIL`, `RCPT`, `DATA` or the end of data
 //! ([`FakeServer::smtp_answer`]), or take a message and drop the connection before answering its
 //! end of data ([`FakeServer::smtp_cut_after_data`]), or wait before answering a command
-//! ([`FakeServer::smtp_delay`]), until [`FakeServer::heal`].
+//! ([`FakeServer::smtp_delay`]), until [`FakeServer::heal`]. The end of data is `CRLF . CRLF`
+//! only, as on a real server.
 //!
 //! Both sides listen twice: once in clear with STARTTLS (no login before TLS), once with implicit
 //! TLS. The certificate is self-signed for `localhost` and `127.0.0.1` and marked as a CA
@@ -631,8 +633,17 @@ impl FakeServer {
             .push(Rule::new("APPEND", Action::CutAfterAppend));
     }
 
-    /// Waits `delay` before answering every SMTP command that starts with `command`, like a slow
-    /// server. Until [`FakeServer::heal`].
+    /// Takes the message of every `APPEND`, as a server does, then answers nothing, the
+    /// connection left open: the client cannot know it was appended. Until [`FakeServer::heal`].
+    pub fn stall_after_append(&self) {
+        self.shared
+            .state()
+            .rules
+            .push(Rule::new("APPEND", Action::StallAfterAppend));
+    }
+
+    /// Waits `delay` before answering every SMTP command that starts with `command`, or with
+    /// `"."` every end of data, like a slow server. Until [`FakeServer::heal`].
     pub fn smtp_delay(&self, command: &str, delay: Duration) {
         self.shared
             .state()
@@ -792,6 +803,8 @@ enum Action {
     Truncate(usize),
     /// Takes the message of an `APPEND`, then closes the connection without answering it.
     CutAfterAppend,
+    /// Takes the message of an `APPEND`, then answers nothing.
+    StallAfterAppend,
 }
 
 impl State {

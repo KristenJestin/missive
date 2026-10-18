@@ -113,6 +113,9 @@ pub(super) async fn serve(
                     let _ = io.shutdown().await;
                     return;
                 }
+                if rule == Some(Action::StallAfterAppend) {
+                    continue;
+                }
                 let code = if session.shared.uidplus {
                     format!("[APPENDUID {uidvalidity} {uid}] ")
                 } else {

@@ -23,7 +23,7 @@ fails.
 |---|---|---|
 | `--id` | the identifier | the address |
 | `--name` | the display name, as in `Alice Example <alice@example.org>` | asked |
-| `--address` | the address | asked |
+| `--address` | the address, plain (`name@example.org`, ASCII, no name or angle brackets): what the SMTP server gets in `MAIL FROM`, so it is checked as a recipient's is, before any login | asked |
 | `--imap-host`, `--smtp-host` | the server | asked |
 | `--imap-security`, `--smtp-security` | `tls` or `starttls` | `tls` |
 | `--imap-port` | the port | 993 with `tls`, 143 with `starttls` |
@@ -92,12 +92,16 @@ An account whose `account.toml` cannot be read or is invalid does not stop the o
 left out, and one line on standard error names its folder and the kind of error (never the
 content of the file). Standard output stays valid, and the exit status is still success.
 
-### `missive account remove <id>`
+### `missive account remove <id> [--force]`
 
-Removes the account's keyring entry, then its settings and certificate. The keyring goes first:
-if it is unavailable, the account stays whole and the command can be run again. Its mail leaves
-the local copy the next time the daemon starts or reloads the configuration (a `sync` does): the
-copy only, nothing is sent to the server. Until then the reading commands skip the account.
+Removes the account's keyring entry, then its settings and certificate. While the account's
+outbox holds messages not sent (`queued`, `claimed`, `sending`, `failed` or `uncertain`; see
+`missive outbox`), it is refused, saying how many, since they would leave with its rows: resend
+or discard them first, or give `--force`. A message whose copy is still to be appended to Sent
+was sent, and does not count. The keyring goes first: if it is unavailable, the account stays
+whole and the command can be run again. Its mail leaves the local copy the next time the daemon
+starts or reloads the configuration (a `sync` does): the copy only, nothing is sent to the
+server. Until then the reading commands skip the account.
 Removing the last account leaves its rows in the copy until another account is configured: a
 configuration folder that is missing or empty is more likely a wrong or unmounted folder than a
 choice, and must not wipe the copy.
@@ -792,16 +796,44 @@ A message stays in the outbox until its server took it, in one of these states:
 
 | State | |
 |---|---|
-| `queued` | to send. A try that fails before the end of its data (a `4xx` answer, the server unreachable, the login or the certificate refused) leaves it here: the server took nothing, and it is tried again later, waiting longer each time (1 second, then twice as long, up to 5 minutes) |
+| `queued` | to send. A try that fails before the end of its data (a `4xx` answer, the server unreachable, the login or the certificate refused) leaves it here: the server took nothing, and it is tried again later, waiting longer each time (1 second, then twice as long, up to 5 minutes). Each message waits for its own time |
 | `claimed` | the daemon is sending it, and has not yet written its end of data: the server cannot have taken it. A daemon killed then puts it back in `queued` when it starts again |
 | `sending` | its end of data is being written |
 | `sent` | the server took it (its `250` to the end of data); only its copy in Sent is left to append. Without one to append, the message leaves the outbox at once |
-| `failed` | the server refused it for good (`5xx` to `MAIL FROM`, a `RCPT TO`, `DATA` or the end of data). It stays, shown by `status`, and is never sent again |
-| `uncertain` | the connection was lost after its end of data and before the server's answer (or the daemon was killed then): the server may have taken it. It stays, shown by `status`, and is never sent again by itself: a message delivered twice is worse than a question |
+| `failed` | the server refused it for good (`5xx` to `MAIL FROM`, a `RCPT TO`, `DATA` or the end of data). It stays, shown by `status` and `missive outbox`, and is sent again only by `missive outbox resend` |
+| `uncertain` | the connection was lost after its end of data and before the server's answer (or the daemon was killed then): the server may have taken it. It stays, shown by `status` and `missive outbox`, and is never sent again by itself: a message delivered twice is worse than a question. Only `missive outbox resend <n> --yes` sends it again |
 
-Messages are sent one at a time, in the order they were written; a message that waits for a new
-try holds back those after it. `missive watch` tells when a message is `sent`, `send-failed` or
-`send-uncertain` (`docs/events.md`).
+Messages are sent one at a time, in the order they were written, each when its time has come: a
+message that waits for a new try holds back none of the others. `missive watch` tells when a
+message is `sent`, `send-failed` or `send-uncertain` (`docs/events.md`).
+
+#### `missive outbox [--json]`, `missive outbox resend <n> [--yes]`, `missive outbox discard <n>`
+
+`missive outbox` lists every message of the outbox, of every account, oldest first, one per line:
+its number, its account, its state, when it was written and its last error. It reads the local
+copy only. With `--json`, standard output is one JSON array, on one line:
+
+```json
+[{"account": "alice", "outbox": 3, "state": "failed", "message_id": "9c1f…@example.org",
+  "queued_at": 1790000000, "attempts": 0,
+  "last_error": "the server answered 550 to RCPT TO"}]
+```
+
+| Field | Type | |
+|---|---|---|
+| `account` | string | the account's identifier |
+| `outbox` | number | the message's number in the outbox, as `compose --json` printed it |
+| `state` | string | as in the table above |
+| `message_id` | string | its `Message-ID`, without angle brackets |
+| `queued_at` | number | when it was written, in seconds since the epoch |
+| `attempts` | number | the tries that failed before the end of its data |
+| `last_error` | string or `null` | for people |
+
+`missive outbox resend <n>` puts a `failed` message back in the queue, to send at once (it is sent
+once, as any other). An `uncertain` message may have arrived already: resending it needs `--yes`,
+and its recipients may then get it twice. `missive outbox discard <n>` removes a `failed` or
+`uncertain` message for good. Both go through the daemon (starting it when none runs), are
+refused for a message in another state, and exit with 3 when no message has that number.
 
 #### The copy in Sent
 
@@ -811,8 +843,9 @@ with the `sent` role) over IMAP, flagged `\Seen`, unless the account was added w
 recipients, in a `Bcc:` header: it is the user's own record, as in every mail client; what the
 recipients got never names them. A server that saves sent mail itself keeps what it was sent,
 without them. An account without a Sent folder gets no copy (the `sent` event says so): Missive
-never creates a folder. Appending is tried again when it fails, up to five times; an append whose
-answer was lost is looked for in Sent by its `Message-ID` before it is tried again.
+never creates a folder. Appending is tried again when it fails, up to five times, then given up
+with a `sent-copy-failed` event; every try after the first (an append whose answer was lost, or
+one a killed daemon left) first looks for the message in Sent by its `Message-ID`.
 
 ### `missive mailto <uri> [--account <id>] [--json]`
 
