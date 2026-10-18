@@ -51,6 +51,21 @@ pub enum Command {
     /// Answered at once; the daemon then writes `event` lines on the same connection, the present
     /// first (see `docs/events.md`).
     Subscribe,
+    /// Marks messages `read`, `unread`, `flagged` or `unflagged`; answered once recorded.
+    Mark {
+        messages: Vec<String>,
+        #[serde(rename = "as")]
+        mark_as: String,
+    },
+    /// Moves messages to a folder, named by its role or its name; answered once recorded.
+    Move { messages: Vec<String>, to: String },
+    /// Moves messages to the trash, or with `permanently` deletes them for good from it;
+    /// answered once recorded.
+    Delete {
+        messages: Vec<String>,
+        #[serde(default)]
+        permanently: bool,
+    },
 }
 
 impl Command {
@@ -58,6 +73,9 @@ impl Command {
         match self {
             Command::Sync { .. } => "sync",
             Command::Subscribe => "subscribe",
+            Command::Mark { .. } => "mark",
+            Command::Move { .. } => "move",
+            Command::Delete { .. } => "delete",
         }
     }
 }
@@ -71,8 +89,11 @@ pub struct Answer {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounts: Option<Vec<AccountState>>,
+    /// The messages an action was recorded for, by identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<String>>,
     /// When not `ok`: `bad-request`, `unsupported-protocol`, `unknown-request`,
-    /// `no-such-account` or `failed`.
+    /// `no-such-account`, `failed`, or why an action was refused (`docs/protocol.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// When not `ok`: what went wrong, for people.
@@ -101,6 +122,8 @@ impl Answer {
 }
 
 /// Reads a request line. An unreadable request gets the answer to send back.
+// Once per request line: the size of an answer on the error path costs nothing worth boxing.
+#[allow(clippy::result_large_err)]
 pub fn read_request(line: &str) -> Result<Request, Answer> {
     let value: serde_json::Value = serde_json::from_str(line)
         .map_err(|_| Answer::error(None, "bad-request", "the request is not JSON"))?;
@@ -126,7 +149,10 @@ pub fn read_request(line: &str) -> Result<Request, Answer> {
             ));
         }
     }
-    let known = matches!(name, Some("sync" | "subscribe"));
+    let known = matches!(
+        name,
+        Some("sync" | "subscribe" | "mark" | "move" | "delete")
+    );
     serde_json::from_value(value).map_err(|_| {
         if known || name.is_none() {
             Answer::error(name, "bad-request", "the request is not well formed")
@@ -183,6 +209,47 @@ mod tests {
                 .error
                 .unwrap(),
             "unsupported-protocol"
+        );
+    }
+
+    #[test]
+    fn action_requests_read_as_documented() {
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"mark","messages":["a/1/2/3"],"as":"read"}"#),
+            Ok(Request {
+                protocol: 1,
+                command: Command::Mark {
+                    messages: vec!["a/1/2/3".to_owned()],
+                    mark_as: "read".to_owned()
+                }
+            })
+        );
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"move","messages":[],"to":"archive"}"#),
+            Ok(Request {
+                protocol: 1,
+                command: Command::Move {
+                    messages: Vec::new(),
+                    to: "archive".to_owned()
+                }
+            })
+        );
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"delete","messages":["a/1/2/3"]}"#),
+            Ok(Request {
+                protocol: 1,
+                command: Command::Delete {
+                    messages: vec!["a/1/2/3".to_owned()],
+                    permanently: false
+                }
+            })
+        );
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"move","messages":["a/1/2/3"]}"#)
+                .unwrap_err()
+                .error
+                .unwrap(),
+            "bad-request"
         );
     }
 

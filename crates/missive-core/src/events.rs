@@ -37,6 +37,8 @@ pub enum Event {
         removed: usize,
         flags: usize,
     },
+    /// An action was applied on the server, is tried again later, or was refused.
+    Action(ActionEvent),
     /// The watcher read too slowly: this many events were dropped for it.
     Lagged { missed: u64 },
     /// There is no daemon to listen to. Said by `missive watch`, never by the daemon.
@@ -72,6 +74,27 @@ pub struct NewMessage {
     pub message: String,
     pub sender: Option<Sender>,
     pub subject: Option<String>,
+}
+
+/// What became of an action at the server (`docs/events.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionEvent {
+    pub account: String,
+    /// `read`, `unread`, `flagged`, `unflagged`, `move`, `delete` or `delete-permanently`.
+    pub action: String,
+    /// `applied`, `retried` or `refused`.
+    pub outcome: String,
+    /// The identifiers of the messages, as they were when the action was asked.
+    pub messages: Vec<String>,
+    /// For `retried` and `refused`: why, for programs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// For `retried`: how many times the server refused it so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// For `refused`: why, for people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +273,36 @@ mod tests {
         assert_eq!(
             Event::Lagged { missed: 3 }.line(),
             r#"{"protocol":1,"event":"lagged","missed":3}"#
+        );
+    }
+
+    #[test]
+    fn an_action_event_says_its_outcome_and_only_the_fields_it_has() {
+        let applied = Event::Action(ActionEvent {
+            account: "alice".to_owned(),
+            action: "read".to_owned(),
+            outcome: "applied".to_owned(),
+            messages: vec!["alice/4/17/99".to_owned()],
+            reason: None,
+            attempts: None,
+            message: None,
+        });
+        assert_eq!(
+            applied.line(),
+            r#"{"protocol":1,"event":"action","account":"alice","action":"read","outcome":"applied","messages":["alice/4/17/99"]}"#
+        );
+        let retried = Event::Action(ActionEvent {
+            account: "alice".to_owned(),
+            action: "move".to_owned(),
+            outcome: "retried".to_owned(),
+            messages: vec!["alice/4/17/99".to_owned()],
+            reason: Some("refused".to_owned()),
+            attempts: Some(2),
+            message: None,
+        });
+        assert_eq!(
+            retried.line(),
+            r#"{"protocol":1,"event":"action","account":"alice","action":"move","outcome":"retried","messages":["alice/4/17/99"],"reason":"refused","attempts":2}"#
         );
     }
 

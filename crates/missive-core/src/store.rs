@@ -6,7 +6,7 @@
 //! is ever held across a wait on the network: a process killed at any point leaves a copy that is
 //! whole as of its last commit.
 //!
-//! The schema, version 3 (`PRAGMA user_version`). Version 1 is the copy itself:
+//! The schema, version 4 (`PRAGMA user_version`). Version 1 is the copy itself:
 //!
 //! ```sql
 #![doc = include_str!("store/schema-1.sql")]
@@ -26,6 +26,13 @@
 #![doc = include_str!("store/schema-3.sql")]
 //! ```
 //!
+//! Version 4 adds the queue of the actions the user asked for on the server
+//! ([`crate::actions`]), and where a message waiting for a move is shown:
+//!
+//! ```sql
+#![doc = include_str!("store/schema-4.sql")]
+//! ```
+//!
 //! The index is contentless: it keeps the words and where they are, not the text, so a message
 //! costs its words and their places beside its raw message, and no text is stored twice. The text it is built from is read by `mail-parser`: the text parts of a message, and,
 //! for a message with only HTML, that HTML reduced to its text (markup, styles and scripts
@@ -42,14 +49,19 @@ use serde::Serialize;
 
 /// The schema version this build writes. A copy written by a later version is refused rather
 /// than misread.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Each step brings the schema from the version before it: `MIGRATIONS[0]` from nothing to 1.
 const MIGRATIONS: &[&str] = &[
     include_str!("store/schema-1.sql"),
     include_str!("store/schema-2.sql"),
     include_str!("store/schema-3.sql"),
+    include_str!("store/schema-4.sql"),
 ];
+
+mod queue;
+
+pub use queue::{Action, ActionFolder};
 
 /// The local copy, opened for writing.
 pub struct Store {
@@ -189,7 +201,8 @@ impl Store {
 
     /// Applies what a complete listing of the folder said, in one transaction: the messages it no
     /// longer holds, the flags that changed, and the HIGHESTMODSEQ those flags are up to date
-    /// with (`None` without CONDSTORE).
+    /// with (`None` without CONDSTORE). A flag action that waits for the server stays on top of
+    /// the flags the server gave: read in the same transaction, it cannot be missed.
     pub fn apply_listing(
         &mut self,
         folder: i64,
@@ -204,10 +217,11 @@ impl Store {
             for uid in removed {
                 remove.execute(params![folder, uid])?;
             }
+            let pending = queue::pending_flags(&transaction, folder)?;
             let mut update = transaction
                 .prepare_cached("UPDATE message SET flags = ?3 WHERE folder = ?1 AND uid = ?2")?;
             for (uid, flags) in flags {
-                update.execute(params![folder, uid, flags])?;
+                update.execute(params![folder, uid, queue::overlay(flags, *uid, &pending)])?;
             }
         }
         transaction.execute(
@@ -217,11 +231,14 @@ impl Store {
         transaction.commit()
     }
 
-    /// Writes a batch of new messages, in one transaction.
+    /// Writes a batch of new messages, in one transaction, but those whose permanent delete
+    /// waits for the server: they left the copy when it was asked.
     pub fn insert(&mut self, folder: i64, messages: &[NewMessage]) -> rusqlite::Result<()> {
         let transaction = self.connection.transaction()?;
         for message in messages {
-            insert(&transaction, folder, message)?;
+            if !queue::deleting(&transaction, folder, message.uid)? {
+                insert(&transaction, folder, message)?;
+            }
         }
         transaction.commit()
     }

@@ -32,13 +32,18 @@
 //! UIDVALIDITY or EXISTS; a listing shorter than `EXISTS` said, less the messages the server
 //! expunged meanwhile): one folder never stops the others. A `BAD`, a `BYE` or a closed
 //! connection is a connection error.
+//!
+//! What changes the server is not here but in [`crate::actions`], which reads its answers through
+//! the same path ([`run_done`]) and selects a folder read-write only to apply an action.
 
 use std::collections::{BTreeSet, HashMap};
 
+use async_imap::imap_proto::rfc4315::UidSetMember;
 use async_imap::imap_proto::{
     AttributeValue, MailboxDatum, NameAttribute, RequestId, Response, ResponseCode, Status,
 };
 use async_imap::types::Flag;
+use serde::{Deserialize, Serialize};
 
 use crate::connect::{ConnectError, ImapSession, imap_error};
 use crate::store::{FolderRow, NewMessage, Store};
@@ -124,6 +129,10 @@ impl std::ops::AddAssign for Changes {
 pub struct Capabilities {
     pub condstore: bool,
     pub idle: bool,
+    /// `UID MOVE` (RFC 6851).
+    pub moves: bool,
+    /// `COPYUID` and `UID EXPUNGE` (RFC 4315).
+    pub uidplus: bool,
 }
 
 /// Reads the server's capabilities, and asks it to send HIGHESTMODSEQ and MODSEQ from now on
@@ -137,6 +146,8 @@ pub async fn prepare(session: &mut ImapSession) -> Result<Capabilities> {
     Ok(Capabilities {
         condstore,
         idle: capabilities.has_str("IDLE"),
+        moves: capabilities.has_str("MOVE"),
+        uidplus: capabilities.has_str("UIDPLUS"),
     })
 }
 
@@ -382,8 +393,45 @@ enum Ended {
 async fn run(
     session: &mut ImapSession,
     command: &str,
-    mut each: impl FnMut(&Response<'_>),
+    each: impl FnMut(&Response<'_>),
 ) -> Result<Ended> {
+    match run_done(session, command, each).await? {
+        Done::Ok(_) => Ok(Ended::Ok),
+        Done::No { .. } => Ok(Ended::No),
+        Done::Bad => Err(SyncError::protocol(
+            "the IMAP server refused a command as malformed",
+        )),
+    }
+}
+
+/// The new UIDs a copy or a move gave the messages in the target (`COPYUID`, RFC 4315).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyUid {
+    /// The target's UIDVALIDITY.
+    pub uidvalidity: u32,
+    /// `(uid in the source, uid in the target)`.
+    pub pairs: Vec<(u32, u32)>,
+}
+
+/// How a command ended, as the tagged answer said.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Done {
+    /// With the `COPYUID` of the tagged answer, when it had one.
+    Ok(Option<CopyUid>),
+    /// With whether the server said the folder named does not exist (`TRYCREATE`).
+    No {
+        try_create: bool,
+    },
+    Bad,
+}
+
+/// [`run`], with the whole tagged answer: a `BAD` is returned, not an error. Only a connection
+/// closed before the tagged answer is one.
+pub(crate) async fn run_done(
+    session: &mut ImapSession,
+    command: &str,
+    mut each: impl FnMut(&Response<'_>),
+) -> Result<Done> {
     let tag = session.run_command(command).await?;
     loop {
         let Some(response) = session
@@ -395,19 +443,65 @@ async fn run(
         };
         match response.parsed() {
             Response::Done {
-                tag: done, status, ..
+                tag: done,
+                status,
+                outcome,
             } if *done == tag => {
-                return match status {
-                    Status::Ok => Ok(Ended::Ok),
-                    Status::No => Ok(Ended::No),
-                    _ => Err(SyncError::protocol(
-                        "the IMAP server refused a command as malformed",
-                    )),
-                };
+                return Ok(match status {
+                    Status::Ok => Done::Ok(outcome.code.as_ref().and_then(copy_uid_code)),
+                    Status::No => Done::No {
+                        try_create: matches!(outcome.code, Some(ResponseCode::TryCreate)),
+                    },
+                    _ => Done::Bad,
+                });
             }
             parsed => each(parsed),
         }
     }
+}
+
+/// The `COPYUID` of an untagged `OK`, which a `UID MOVE` sends before its expunges.
+pub(crate) fn copy_uid(response: &Response<'_>) -> Option<CopyUid> {
+    match response {
+        Response::Data {
+            status: Status::Ok,
+            outcome,
+        } => outcome.code.as_ref().and_then(copy_uid_code),
+        _ => None,
+    }
+}
+
+/// The most UIDs a `COPYUID` is read for: more than any action names, and a server that writes a
+/// huge range is not followed.
+const COPYUID_MAX: usize = 100_000;
+
+fn copy_uid_code(code: &ResponseCode<'_>) -> Option<CopyUid> {
+    let ResponseCode::CopyUid(uidvalidity, from, to) = code else {
+        return None;
+    };
+    let expand = |set: &[UidSetMember]| -> Option<Vec<u32>> {
+        let mut uids = Vec::new();
+        for member in set {
+            match member {
+                UidSetMember::Uid(uid) => uids.push(*uid),
+                UidSetMember::UidRange(range) => {
+                    let (low, high) = (*range.start(), *range.end());
+                    let (low, high) = (low.min(high), low.max(high));
+                    if uids.len() + (high - low) as usize >= COPYUID_MAX {
+                        return None;
+                    }
+                    uids.extend(low..=high);
+                }
+            }
+        }
+        Some(uids)
+    };
+    let (from, to) = (expand(from)?, expand(to)?);
+    // Two sets of different lengths pair nothing for sure.
+    (from.len() == to.len()).then(|| CopyUid {
+        uidvalidity: *uidvalidity,
+        pairs: from.into_iter().zip(to).collect(),
+    })
 }
 
 /// Reads the next response on the connection and hands it to `each`, as [`run`] does; a
@@ -521,13 +615,48 @@ struct Examined {
 /// `EXAMINE`: `None` when the server refused it, or when its answer holds no UIDVALIDITY or
 /// EXISTS, which every server must send: such an answer is not used.
 async fn examine(session: &mut ImapSession, name: &str) -> Result<Option<Examined>> {
+    open(session, name, "EXAMINE").await
+}
+
+/// `SELECT`, read-write, to apply an action: the folder's UIDVALIDITY, or `None` as for
+/// [`examine`]. A `BAD` is an error.
+pub(crate) async fn select(session: &mut ImapSession, name: &str) -> Result<Option<u32>> {
+    Ok(open(session, name, "SELECT")
+        .await?
+        .map(|examined| examined.uidvalidity))
+}
+
+/// [`examine`], for its UIDVALIDITY.
+pub(crate) async fn examine_uidvalidity(
+    session: &mut ImapSession,
+    name: &str,
+) -> Result<Option<u32>> {
+    Ok(examine(session, name)
+        .await?
+        .map(|examined| examined.uidvalidity))
+}
+
+/// `UID SEARCH <criteria>` in the selected folder: the UIDs found, `None` when the server
+/// refused it.
+pub(crate) async fn search(session: &mut ImapSession, criteria: &str) -> Result<Option<Vec<u32>>> {
+    let mut found = Vec::new();
+    let ended = run(session, &format!("UID SEARCH {criteria}"), |response| {
+        if let Response::MailboxData(MailboxDatum::Search(uids)) = response {
+            found.extend(uids);
+        }
+    })
+    .await?;
+    Ok((ended == Ended::Ok).then_some(found))
+}
+
+async fn open(session: &mut ImapSession, name: &str, command: &str) -> Result<Option<Examined>> {
     let Some(name) = quote(name) else {
         return Ok(None);
     };
     let (mut uidvalidity, mut exists, mut highest_modseq) = (None, None, None);
     let ended = run(
         session,
-        &format!("EXAMINE {name}"),
+        &format!("{command} {name}"),
         |response| match response {
             Response::Data {
                 status: Status::Ok,
@@ -585,7 +714,7 @@ async fn fetch_flags(
     Ok((ended == Ended::Ok).then_some((found, expunged)))
 }
 
-fn uid(attributes: &[AttributeValue<'_>]) -> Option<u32> {
+pub(crate) fn uid(attributes: &[AttributeValue<'_>]) -> Option<u32> {
     attributes.iter().find_map(|a| match a {
         AttributeValue::Uid(uid) => Some(*uid),
         _ => None,
@@ -637,7 +766,7 @@ fn unescape(name: &str) -> String {
 }
 
 /// A folder name as a quoted string; `None` for a name no command can carry.
-fn quote(name: &str) -> Option<String> {
+pub(crate) fn quote(name: &str) -> Option<String> {
     if name.contains(['\r', '\n']) {
         return None;
     }
@@ -692,7 +821,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 /// A message's flags as the copy keeps them: IMAP spelling, sorted, `\Recent` left out (it
 /// belongs to one session, not to the message).
-fn flags(attributes: &[AttributeValue<'_>]) -> String {
+pub(crate) fn flags(attributes: &[AttributeValue<'_>]) -> String {
     let mut flags: Vec<String> = attributes
         .iter()
         .filter_map(|a| match a {
@@ -742,7 +871,7 @@ fn uid_runs(uids: &[u32]) -> Vec<String> {
 }
 
 /// A UID set for a command: runs of consecutive UIDs as ranges, `2,5:9`.
-fn uid_set(uids: &[u32]) -> String {
+pub(crate) fn uid_set(uids: &[u32]) -> String {
     uid_runs(uids).join(",")
 }
 
