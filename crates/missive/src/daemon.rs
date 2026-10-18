@@ -6,6 +6,10 @@
 //! the inbox (`IDLE`, re-issued at least every 25 minutes, under the 29 the RFC allows) until new
 //! mail, a request, or the periodic check of the other folders.
 //!
+//! A connection that sends `subscribe` is a watcher: the daemon then writes it the events of the
+//! workers (`docs/events.md`). They travel on a bounded broadcast channel, so that a watcher that
+//! reads too slowly misses events, is told how many, and holds nothing else back.
+//!
 //! The log (standard error) says what happened in counts, durations, folder roles and error
 //! kinds. It names an account by its number in the copy and a folder by its id there, never by
 //! a name: an account's identifier is often its address, and a folder's name is the user's own.
@@ -21,6 +25,7 @@ use std::time::{Duration, Instant};
 use async_imap::extensions::idle::IdleResponse;
 use missive_core::account::{Account, AccountStore, Password};
 use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap};
+use missive_core::events::{Event, Reader, Unread};
 use missive_core::keyring::{Keyring, KeyringError};
 use missive_core::protocol::{
     AccountState, Answer, Command, PROTOCOL, pid_path, read_request, runtime_dir, socket_path,
@@ -29,9 +34,11 @@ use missive_core::store::Store;
 use missive_core::sync::{self, Changes, Folder, SyncError};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 /// IDLE is re-issued after this long at most: RFC 2177 lets a server drop a client idle for 30
@@ -44,6 +51,12 @@ const IDLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_GRACE: Duration = Duration::from_secs(3);
 /// The longest wait between two connections to an unreachable server.
 const BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
+/// How many events a watcher may be behind by before it misses some: a few minutes of a busy
+/// mailbox, and little memory (an event is a few hundred bytes).
+const EVENT_BUFFER: usize = 256;
+/// How many lines wait for a connection's socket: a watcher whose socket is full holds these and
+/// nothing else of the daemon's.
+const LINE_QUEUE: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -96,6 +109,7 @@ pub async fn run(options: Options) -> Result<(), String> {
     let (stop, stopping) = watch::channel(false);
     let daemon = Arc::new(Daemon {
         options,
+        events: Arc::new(Events::new(&store)),
         store,
         stopping,
         workers: Mutex::new(BTreeMap::new()),
@@ -172,8 +186,47 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// What the daemon tells its watchers.
+struct Events {
+    sender: broadcast::Sender<Event>,
+    /// The unread counts last told, so that only a change is told.
+    unread: Mutex<Unread>,
+}
+
+impl Events {
+    fn new(store: &Path) -> Events {
+        let unread = Reader::open(store)
+            .and_then(|reader| reader.unread())
+            .unwrap_or_default();
+        Events {
+            sender: broadcast::channel(EVENT_BUFFER).0,
+            unread: Mutex::new(unread),
+        }
+    }
+
+    /// Without a watcher there is nobody to tell, which is not an error.
+    fn send(&self, event: Event) {
+        let _ = self.sender.send(event);
+    }
+
+    /// Tells the unread counts when they are not the ones last told. The lock is held while
+    /// sending, so that two workers' events come in the order of their counts.
+    fn unread(&self, reader: &Reader) {
+        let unread = match reader.unread() {
+            Ok(unread) => unread,
+            Err(e) => return log!("cannot count the unread messages ({e})"),
+        };
+        let mut told = locked(&self.unread);
+        if *told != unread {
+            told.clone_from(&unread);
+            self.send(Event::Unread(unread));
+        }
+    }
+}
+
 struct Daemon {
     options: Options,
+    events: Arc<Events>,
     store: PathBuf,
     stopping: watch::Receiver<bool>,
     /// Where to send each account's sync requests, by identifier.
@@ -227,6 +280,13 @@ impl Daemon {
                 );
                 None
             });
+            let reader = match Reader::open(&self.store) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    log!("cannot open the local copy for an account ({e})");
+                    continue;
+                }
+            };
             let (requests, receiver) = mpsc::unbounded_channel();
             workers.insert(id.clone(), requests);
             let worker = Worker {
@@ -240,27 +300,96 @@ impl Daemon {
                 stop: self.stopping.clone(),
                 waiting: Vec::new(),
                 idle_refused: false,
+                completed: reader.completed(key).unwrap_or(false),
+                reader,
+                events: self.events.clone(),
+                told: None,
             };
             locked(&self.tasks).spawn(worker.run());
         }
         workers.len()
     }
 
-    /// Answers the requests of one connection, in order, until it closes.
+    /// Answers the requests of one connection, in order, until it closes. What is written to the
+    /// connection goes through a queue and its own task: a watcher's events and the answers to its
+    /// requests share a socket, and a socket that is full stops that task, not this one's reading.
     async fn serve(self: Arc<Self>, stream: UnixStream) {
-        let (read, mut write) = stream.into_split();
-        let mut lines = BufReader::new(read).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let (read, write) = stream.into_split();
+        let (lines, queue) = mpsc::channel(LINE_QUEUE);
+        tokio::spawn(write_lines(write, queue));
+        let mut lines_in = BufReader::new(read).lines();
+        let mut forwarder = None;
+        while let Ok(Some(line)) = lines_in.next_line().await {
             let answer = match read_request(&line) {
+                Ok(request) if request.command == Command::Subscribe => {
+                    if forwarder.is_some() {
+                        Answer::error(
+                            Some("subscribe"),
+                            "failed",
+                            "this connection is already subscribed",
+                        )
+                    } else {
+                        // Subscribed before the present is read: what changes meanwhile is
+                        // told twice at worst, never missed.
+                        let events = self.events.sender.subscribe();
+                        let present = self.present();
+                        log!(
+                            "a watcher subscribed ({} subscribed now)",
+                            self.events.sender.receiver_count()
+                        );
+                        let answer = Answer {
+                            protocol: PROTOCOL,
+                            answer: Some("subscribe".to_owned()),
+                            ok: true,
+                            ..Answer::default()
+                        };
+                        if !send(&lines, &answer).await {
+                            break;
+                        }
+                        forwarder = Some(tokio::spawn(forward(present, events, lines.clone())));
+                        continue;
+                    }
+                }
                 Ok(request) => self.answer(request.command).await,
                 Err(answer) => answer,
             };
-            let mut line = serde_json::to_string(&answer).expect("an answer serializes");
-            line.push('\n');
-            if write.write_all(line.as_bytes()).await.is_err() {
-                return;
+            if !send(&lines, &answer).await {
+                break;
             }
         }
+        if let Some(forwarder) = forwarder {
+            forwarder.abort();
+            let _ = forwarder.await;
+            log!(
+                "a watcher left ({} subscribed now)",
+                self.events.sender.receiver_count()
+            );
+        }
+    }
+
+    /// What a watcher starts with: each account's state, then the unread counts.
+    fn present(&self) -> Vec<Event> {
+        let reader = match Reader::open(&self.store) {
+            Ok(reader) => reader,
+            Err(e) => {
+                log!("cannot open the local copy for a watcher ({e})");
+                return Vec::new();
+            }
+        };
+        let mut present = Vec::new();
+        match reader.states() {
+            Ok(states) => present.extend(
+                states
+                    .into_iter()
+                    .map(|(account, state)| Event::State { account, state }),
+            ),
+            Err(e) => log!("cannot read the accounts' states for a watcher ({e})"),
+        }
+        match reader.unread() {
+            Ok(unread) => present.push(Event::Unread(unread)),
+            Err(e) => log!("cannot count the unread messages for a watcher ({e})"),
+        }
+        present
     }
 
     async fn answer(&self, command: Command) -> Answer {
@@ -308,6 +437,51 @@ impl Daemon {
                     ..Answer::default()
                 }
             }
+            Command::Subscribe => unreachable!("`serve` answers a subscription itself"),
+        }
+    }
+}
+
+/// Queues an answer for the connection's writer. `false` when the connection is gone.
+async fn send(lines: &mpsc::Sender<String>, answer: &Answer) -> bool {
+    let mut line = serde_json::to_string(answer).expect("an answer serializes");
+    line.push('\n');
+    lines.send(line).await.is_ok()
+}
+
+/// Writes the lines of a connection until it fails or no one has more to say.
+async fn write_lines(mut write: OwnedWriteHalf, mut queue: mpsc::Receiver<String>) {
+    while let Some(line) = queue.recv().await {
+        if write.write_all(line.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Queues `present`, then each event as it comes, for one watcher. The queue is full when the
+/// watcher's socket is: this then waits for room, and the events pile up in the channel, which
+/// drops the oldest ones past [`EVENT_BUFFER`]: the watcher is told how many when it reads again.
+async fn forward(
+    present: Vec<Event>,
+    mut events: broadcast::Receiver<Event>,
+    lines: mpsc::Sender<String>,
+) {
+    for event in present {
+        if lines.send(event.line() + "\n").await.is_err() {
+            return;
+        }
+    }
+    loop {
+        let event = match events.recv().await {
+            Ok(event) => event,
+            Err(RecvError::Lagged(missed)) => {
+                log!("a watcher missed {missed} events and was told so");
+                Event::Lagged { missed }
+            }
+            Err(RecvError::Closed) => return,
+        };
+        if lines.send(event.line() + "\n").await.is_err() {
+            return;
         }
     }
 }
@@ -376,6 +550,13 @@ struct Worker {
     waiting: Vec<Waiter>,
     /// Whether the server refused IDLE: the inbox is then checked with the other folders.
     idle_refused: bool,
+    /// Whether a pass over every folder of the account ever ended: until then what a sync brings
+    /// is the account's mail so far, not mail that arrives.
+    completed: bool,
+    reader: Reader,
+    events: Arc<Events>,
+    /// The state last told to the watchers.
+    told: Option<String>,
 }
 
 impl Worker {
@@ -490,9 +671,21 @@ impl Worker {
         }
     }
 
-    fn state(&self, state: &str) {
+    fn state(&mut self, state: &str) {
         if let Err(e) = self.store.set_state(self.key, state, false) {
             log!("account {}: cannot record its state ({e})", self.key);
+        }
+        self.tell(state);
+    }
+
+    /// Tells the watchers the state when it is not the one they know.
+    fn tell(&mut self, state: &str) {
+        if self.told.as_deref() != Some(state) {
+            self.told = Some(state.to_owned());
+            self.events.send(Event::State {
+                account: self.id.clone(),
+                state: state.to_owned(),
+            });
         }
     }
 
@@ -579,6 +772,9 @@ impl Worker {
         loop {
             // Every folder.
             self.take_requests();
+            self.events.send(Event::SyncStarted {
+                account: self.id.clone(),
+            });
             self.state("syncing");
             let started = Instant::now();
             let mut folders = check!(sync::folders(&mut session, &mut self.store, self.key).await);
@@ -592,6 +788,15 @@ impl Worker {
             if let Err(e) = self.store.set_state(self.key, "ready", true) {
                 log!("account {}: cannot record its state ({e})", self.key);
             }
+            self.completed = true;
+            self.tell("ready");
+            self.events.send(Event::SyncEnded {
+                account: self.id.clone(),
+                folders: folders.len(),
+                new: changes.new,
+                removed: changes.removed,
+                flags: changes.flags,
+            });
             log!(
                 "account {}: ready, {} folders synced in {:.2} s ({} new, {} removed, {} flag \
                  changes, {} rebuilt)",
@@ -655,11 +860,18 @@ impl Worker {
         session: &mut ImapSession,
         folder: &mut Folder,
     ) -> Result<Changes, SyncError> {
+        // What arrives is announced one message at a time only in a folder that was synced before:
+        // the first sync of an account, of a folder that is new, or of one the server renumbered,
+        // brings mail the user already has.
+        let last_uid = (self.completed && folder.row.uidvalidity.is_some())
+            .then(|| self.reader.last_uid(folder.row.id).ok())
+            .flatten();
         let changes =
             sync::folder(session, &mut self.store, folder, self.options.batch_size).await?;
         let role = folder.role.unwrap_or("no role");
         match changes {
             Some(changes) => {
+                self.publish(folder, &changes, last_uid).await;
                 if changes.rebuilt > 0 {
                     log!(
                         "account {} folder {} ({role}): its UIDVALIDITY changed, so it was rebuilt",
@@ -688,6 +900,34 @@ impl Worker {
                 Ok(Changes::default())
             }
         }
+    }
+
+    /// Tells the watchers what a folder's sync changed.
+    async fn publish(&mut self, folder: &Folder, changes: &Changes, last_uid: Option<u32>) {
+        if changes.new == 0 && changes.removed == 0 && changes.flags == 0 && changes.rebuilt == 0 {
+            return;
+        }
+        if let Some(last_uid) = last_uid
+            && changes.new > 0
+            && changes.rebuilt == 0
+        {
+            match self
+                .reader
+                .arrived(&self.id, folder.role, folder.row.id, last_uid)
+            {
+                Ok(messages) => {
+                    for message in messages {
+                        self.events.send(Event::NewMessage(message));
+                        // The daemon runs on one thread: without this, a burst of mail would
+                        // fill the channel before any watcher, however quick, could take its
+                        // events out of it.
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Err(e) => log!("account {}: cannot read the new messages ({e})", self.key),
+            }
+        }
+        self.events.unread(&self.reader);
     }
 
     /// Idles in the selected folder for at most `timeout` in all, and says what ended it.
