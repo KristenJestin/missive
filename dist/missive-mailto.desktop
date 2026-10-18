@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Missive
+Comment=Write a message to a mailto: link
+# Only a handler for mailto: links: the menus do not list it. install.sh gives Exec the full
+# path of the installed program.
+Exec=missive mailto %u
+Terminal=false
+NoDisplay=true
+Categories=Network;Email;
+MimeType=x-scheme-handler/mailto;

@@ -1094,3 +1094,75 @@ async fn no_body_subject_or_address_appears_in_the_logs_of_drafts() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mailto_saves_a_draft_from_the_link_and_says_where_to_find_it() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+
+    let link = format!(
+        "mailto:{RECIPIENT},second@example.com?cc={COPIED}&bcc={HIDDEN}&subject=Caf%C3%A9%20link\
+         &body=Line%20one%0D%0ALine%20two&in-reply-to=%3Casked@example.com%3E\
+         &from=evil@example.net&attach=/etc/passwd&reply-to=evil@example.net"
+    );
+    let text = env.run(&["mailto", &link]).await;
+    succeeded(&text);
+    let said = stdout(&text);
+    assert_eq!(said.lines().count(), 1, "{said}");
+    assert!(said.contains("@example.org"), "{said}");
+    assert!(said.contains("missive list --folder drafts"), "{said}");
+
+    let json = env
+        .run(&["mailto", "--json", "mailto:?subject=Second"])
+        .await;
+    succeeded(&json);
+    let saved: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(saved.as_object().unwrap().len(), 1, "{saved}");
+
+    drafts_on_server(&server, &["Café link", "Second"]).await;
+    let uid = server.uids("Drafts")[0];
+    let raw = server.raw("Drafts", uid).unwrap();
+    let parsed = MessageParser::default().parse(&raw).unwrap();
+    let addresses = |address: Option<&mail_parser::Address>| -> Vec<String> {
+        address
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.address().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(addresses(parsed.to()), [RECIPIENT, "second@example.com"]);
+    assert_eq!(addresses(parsed.cc()), [COPIED]);
+    assert_eq!(addresses(parsed.bcc()), [HIDDEN]);
+    assert_eq!(addresses(parsed.from()), [USER]);
+    assert_eq!(
+        parsed.body_text(0).unwrap().trim_end(),
+        "Line one\r\nLine two"
+    );
+    assert_eq!(thread(&raw).0, ["asked@example.com"]);
+    // The link chose neither the sender nor a file, and set no other header.
+    assert_eq!(parsed.attachment_count(), 0);
+    assert!(parsed.header("Reply-To").is_none());
+    assert!(!String::from_utf8_lossy(&raw).contains("evil@example.net"));
+    assert!(!String::from_utf8_lossy(&raw).contains("passwd"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mailto_refuses_a_link_that_would_inject_a_header_and_saves_nothing() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+
+    for link in [
+        "mailto:a@example.com?subject=Hi%0D%0ABcc:evil@example.net",
+        "mailto:a@example.com?subject=100%",
+        "https://example.com",
+    ] {
+        let output = env.run(&["mailto", link]).await;
+        failed(&output);
+        assert!(stderr(&output).contains("mailto"), "{}", stderr(&output));
+        assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    }
+    assert!(env.drafts().await.is_empty());
+    drafts_on_server(&server, &[]).await;
+}

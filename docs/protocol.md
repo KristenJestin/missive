@@ -156,6 +156,7 @@ Saves a draft: a new one, or a new version of the draft `draft` names. With `sen
 | `account` | string | the account's identifier |
 | `draft` | string, absent for a new draft | the draft to pick up again: its identifier (its `Message-ID`), or the identifier of a message of the account's Drafts folder, as `list` prints it |
 | `to`, `cc`, `bcc`, `subject`, `body`, `attachments` | as for `send`, each absent to keep the draft's own | the fields that replace the draft's; for a new draft, those absent are empty. No recipient is needed |
+| `in_reply_to` | string, absent to keep the draft's own | the `Message-ID`, without angle brackets, of the message the draft answers |
 | `send` | boolean, `false` when absent | send the draft, as it is once changed (at least one recipient then); it is removed from the Drafts folder once the server took the message |
 
 The daemon saves the draft in the local copy (and, with `send`, puts the message in the outbox),
