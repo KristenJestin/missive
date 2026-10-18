@@ -93,6 +93,25 @@ content of the file). Standard output stays valid, and the exit status is still 
 Removes the account's keyring entry, then its settings and certificate. The keyring goes first:
 if it is unavailable, the account stays whole and the command can be run again.
 
+## The event stream
+
+### `missive watch`
+
+Prints what the daemon does, one JSON object per line on standard output, until it is stopped:
+new messages, unread counts, connection states, syncs. The lines and their fields are those of
+`docs/events.md`; each line is flushed as it is written, so a program reading the pipe sees it at
+once. Diagnostics go to standard error.
+
+`watch` never starts the daemon. Without one it prints `{"protocol":1,"event":"gone"}` and waits,
+looking for the daemon's socket once a second; when a daemon appears it subscribes, and the
+stream goes on (starting, as every subscription does, with the present state). When the daemon
+stops, `watch` says `gone` again and goes back to waiting. Several `watch` may run at once.
+
+SIGTERM or SIGINT (Ctrl-C) stops it, and so does the closing of standard output (a program that
+stops reading, as `missive watch | head -1` does): neither is an error, and the exit status is
+success. The status is 1 when the daemon refuses the subscription (it speaks another protocol
+version, say) or the socket cannot be reached for another reason than the daemon's absence.
+
 ## The local copy
 
 Missive keeps a copy of each account in `$XDG_DATA_HOME/missive/copy.sqlite` (or
