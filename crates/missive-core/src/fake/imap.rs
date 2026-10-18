@@ -1,12 +1,13 @@
-//! The IMAP side of the fake server: a line-based parser, no literals.
+//! The IMAP side of the fake server: a line-based parser, with no literal but the message of an
+//! `APPEND`.
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
-use super::{Action, FolderState, Io, Shared, StoredMessage};
+use super::{Action, FolderState, Io, Message, Shared, StoredMessage};
 
 const SYSTEM_FLAGS: &str = "(\\Answered \\Flagged \\Deleted \\Seen \\Draft)";
 
@@ -88,6 +89,33 @@ pub(super) async fn serve(
                     return;
                 }
             }
+            Flow::Append(append) => {
+                session.send("+ ready for the message");
+                if flush(&mut io, &mut session.out).await.is_err() {
+                    return;
+                }
+                let mut raw = vec![0; append.size];
+                let mut end = Vec::new();
+                if io.read_exact(&mut raw).await.is_err()
+                    || io.read_until(b'\n', &mut end).await.is_err()
+                {
+                    return;
+                }
+                let mut message = Message::new(raw);
+                for flag in append.flags {
+                    message = message.flag(&flag);
+                }
+                let (uidvalidity, uid) = session.shared.change(|state| {
+                    let folder = state.folder(&append.folder);
+                    (folder.uidvalidity, folder.add(message))
+                });
+                let code = if session.shared.uidplus {
+                    format!("[APPENDUID {uidvalidity} {uid}] ")
+                } else {
+                    String::new()
+                };
+                session.send(format!("{} OK {code}APPEND completed", append.tag));
+            }
         }
     }
 }
@@ -139,6 +167,15 @@ enum Flow {
     Close,
     StartTls,
     Idle(String),
+    /// An `APPEND` whose message is to be read: its `+` is to be sent.
+    Append(Append),
+}
+
+struct Append {
+    tag: String,
+    folder: String,
+    flags: Vec<String>,
+    size: usize,
 }
 
 struct Session {
@@ -202,6 +239,9 @@ impl Session {
         }
         let name = name.to_ascii_uppercase();
         self.log(&name, rest);
+        if !uid && name == "APPEND" {
+            return self.append(tag, args);
+        }
 
         let Some(args) = tokens(args) else {
             self.send(format!("{tag} BAD unparsable arguments"));
@@ -270,6 +310,40 @@ impl Session {
             Ok(()) => self.send(format!("{tag} OK {name} completed")),
             Err(answer) => self.send(format!("{tag} {answer}")),
         }
+        Flow::Continue
+    }
+
+    /// `APPEND <folder> [(<flags>)] {<size>}`: the message itself is read by [`serve`], after the
+    /// `+`. No internal date is taken.
+    fn append(&mut self, tag: String, args: &str) -> Flow {
+        let parsed = args
+            .strip_suffix('}')
+            .and_then(|rest| rest.rsplit_once('{'))
+            .and_then(|(rest, size)| Some((tokens(rest)?, size.parse::<usize>().ok()?)));
+        let answer = match parsed {
+            _ if self.user.is_none() => "BAD log in first".to_owned(),
+            Some((args, size)) => match &args[..] {
+                [folder] | [folder, Token::List(_)] => {
+                    let name = folder.string().unwrap_or_default();
+                    let flags = match &args[..] {
+                        [_, Token::List(flags)] => flags.iter().filter_map(Token::string).collect(),
+                        _ => Vec::new(),
+                    };
+                    if self.shared.state().find(&name).is_some() {
+                        return Flow::Append(Append {
+                            tag,
+                            folder: name,
+                            flags,
+                            size,
+                        });
+                    }
+                    "NO [TRYCREATE] no such folder".to_owned()
+                }
+                _ => "BAD APPEND <folder> [(<flags>)] {<size>}".to_owned(),
+            },
+            None => "BAD APPEND <folder> [(<flags>)] {<size>}".to_owned(),
+        };
+        self.send(format!("{tag} {answer}"));
         Flow::Continue
     }
 

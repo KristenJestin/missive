@@ -132,6 +132,7 @@ impl Env {
                 port: server.smtp_tls_addr().port(),
                 security: Security::Tls,
             },
+            server_saves_sent: false,
         };
         AccountStore::new(self.path("config").join("missive"))
             .save(id, &account, Some(&server.certificate_der()))

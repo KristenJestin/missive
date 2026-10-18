@@ -59,6 +59,7 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `in-trash` | a `delete` without `permanently` of a message already in the trash |
 | `not-in-trash` | a `delete` with `permanently` of a message outside the trash, in an account that has one |
 | `busy` | a message whose move waits for the server: it takes no other action until then |
+| `bad-request` (`send`) | also: the message cannot be sent as written (`message` says why: no recipient, an address that is not one…) |
 | `failed` | the daemon could not do it: it is stopping, an account's sync could not write the local copy (`message` names the account), the local copy could not be written, or the connection is already subscribed |
 
 ## Requests
@@ -110,6 +111,36 @@ unreachable. The answer gives the identifiers recorded, each once, in the order 
 A request that cannot apply to one of its messages records nothing, and is answered with one of
 the errors above. The daemon then applies the queue on the server, in order, when the account is
 connected; the `action` events (`docs/events.md`) tell what became of each action.
+
+### `send`
+
+Writes a message into the account's outbox, to be sent as soon as its SMTP server can be
+reached:
+
+```json
+{"protocol": 1, "request": "send", "account": "alice", "to": ["Zoé <zoe@example.com>"],
+ "cc": [], "bcc": ["carl@example.net"], "subject": "Les comptes", "body": "Bonjour,\r\n…",
+ "attachments": [{"name": "comptes.pdf", "data": "JVBERi0xLjQK…"}]}
+```
+
+| Field | | |
+|---|---|---|
+| `account` | string | the account's identifier |
+| `to`, `cc`, `bcc` | arrays of strings, empty when absent | `name@example.org` or `Name <name@example.org>`; at least one recipient in all |
+| `subject` | string, absent for none | |
+| `body` | string, empty when absent | the text |
+| `attachments` | array, empty when absent | each a file's `name` (no folder) and its content, `data`, in base64 |
+
+The daemon builds the message (see `missive compose` in `docs/cli.md`), writes it to the outbox
+in the local copy, and answers: nothing waits for the server.
+
+```json
+{"protocol": 1, "answer": "send", "ok": true, "outbox": 3, "message_id": "9c1f…@example.org"}
+```
+
+`outbox` is the message's number in the outbox, which the `sent`, `send-failed` and
+`send-uncertain` events (`docs/events.md`) name it by; `message_id` is its `Message-ID`, without
+angle brackets.
 
 ### `subscribe`
 

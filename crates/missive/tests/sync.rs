@@ -138,6 +138,7 @@ impl Env {
                 port: server.smtp_tls_addr().port(),
                 security: Security::Tls,
             },
+            server_saves_sent: false,
         };
         AccountStore::new(self.path("config").join("missive"))
             .save(id, &account, Some(&server.certificate_der()))
@@ -1786,7 +1787,7 @@ async fn the_copy_is_in_wal_mode_with_a_schema_version() {
         .unwrap();
 
     assert_eq!(mode, "wal");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     // The search index is a virtual table with its shadow tables.
     assert_eq!(
         env.table_names(),
@@ -1801,6 +1802,7 @@ async fn the_copy_is_in_wal_mode_with_a_schema_version() {
             "message_search_data",
             "message_search_docsize",
             "message_search_idx",
+            "outbox",
         ]
         .into_iter()
         .map(str::to_owned)

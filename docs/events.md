@@ -185,6 +185,65 @@ An action on messages of several folders is one action per folder, each with its
   `UID EXPUNGE` the server refused takes its `\Deleted` flag back on the server, so that another
   client's `EXPUNGE` does not remove the message later.
 
+### `sent`
+
+The server took a message of the outbox (`missive compose --send`, or `send` on the socket): it
+answered `250` to its end of data.
+
+```json
+{"protocol": 1, "event": "sent", "account": "alice", "outbox": 3,
+ "message_id": "9c1f…@example.org", "sent_copy": "append"}
+```
+
+| Field | Type | |
+|---|---|---|
+| `account` | string | the account's identifier |
+| `outbox` | number | its number in the outbox, as `compose --json` printed it |
+| `message_id` | string | its `Message-ID`, without angle brackets |
+| `sent_copy` | string | `append`: Missive appends its copy to the Sent folder now; `server`: the account says its server keeps the copy itself; `none`: the account has no Sent folder, so there is no copy (Missive never creates one) |
+
+### `send-failed`
+
+The server refused a message for good (a `5xx` answer): it stays in the outbox as `failed`, and
+is never sent again.
+
+```json
+{"protocol": 1, "event": "send-failed", "account": "alice", "outbox": 3,
+ "message_id": "9c1f…@example.org", "code": 550, "step": "RCPT TO",
+ "message": "the server refused the message for good (it answered 550 to RCPT TO): it is not sent again"}
+```
+
+| Field | Type | |
+|---|---|---|
+| `account`, `outbox`, `message_id` | | as for `sent` |
+| `code` | number | the server's reply code |
+| `step` | string | what it answered: `MAIL FROM`, `RCPT TO` (one recipient refused is the whole message refused), `DATA` or `end of data` |
+| `message` | string | for people |
+
+A refusal that may not last (`4xx`), a server that cannot be reached, a login or a certificate
+refused, are not events: the message stays `queued`, tried again later (`missive status` shows
+its tries and its last error).
+
+### `send-uncertain`
+
+The connection was lost after a message's end of data and before the server's answer, or no
+answer came within 10 minutes, or the daemon was killed while it was sending: the server may have
+taken it. It stays in the outbox as `uncertain`, and is never sent again by itself, since a
+message delivered twice is worse than a question. A daemon that finds a message it was sending
+when it stopped tells this event when it starts, before any watcher can be subscribed: `status`
+shows it.
+
+```json
+{"protocol": 1, "event": "send-uncertain", "account": "alice", "outbox": 3,
+ "message_id": "9c1f…@example.org",
+ "message": "the connection was lost before the server answered (…): the message may have been sent, so it is not sent again"}
+```
+
+| Field | Type | |
+|---|---|---|
+| `account`, `outbox`, `message_id` | | as for `sent` |
+| `message` | string | for people |
+
 ### `lagged`
 
 The watcher read too slowly, and events were dropped for it alone.

@@ -44,6 +44,7 @@ use async_imap::imap_proto::{
 };
 use async_imap::types::Flag;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 
 use crate::connect::{ConnectError, ImapSession, imap_error};
 use crate::store::{FolderRow, NewMessage, Store};
@@ -450,9 +451,68 @@ pub(crate) enum Done {
 pub(crate) async fn run_done(
     session: &mut ImapSession,
     command: &str,
-    mut each: impl FnMut(&Response<'_>),
+    each: impl FnMut(&Response<'_>),
 ) -> Result<Done> {
     let tag = session.run_command(command).await?;
+    tagged(session, &tag, each).await
+}
+
+/// `APPEND <name> (<flags>) {<size>}`, then the message once the server asked for it (its `+`),
+/// read as [`run_done`] reads: done only with its tagged `OK`. A tagged answer in place of the
+/// `+` (a `NO`, say) ends it, the message unsent. `name` is quoted already.
+pub(crate) async fn append(
+    session: &mut ImapSession,
+    name: &str,
+    flags: &str,
+    raw: &[u8],
+) -> Result<Done> {
+    let tag = session
+        .run_command(format!("APPEND {name} ({flags}) {{{}}}", raw.len()))
+        .await?;
+    let mut early = None;
+    loop {
+        let go_on = read(session, |response| match response {
+            Response::Continue { .. } => true,
+            Response::Done {
+                tag: done,
+                status,
+                outcome,
+            } if *done == tag => {
+                early = Some(match status {
+                    Status::Ok => Done::Ok(None),
+                    Status::No => Done::No {
+                        try_create: matches!(outcome.code, Some(ResponseCode::TryCreate)),
+                    },
+                    _ => Done::Bad,
+                });
+                true
+            }
+            _ => false,
+        })
+        .await?;
+        if go_on {
+            break;
+        }
+    }
+    if let Some(done) = early {
+        return Ok(done);
+    }
+    let stream = session.get_mut();
+    let written = async {
+        stream.write_all(raw).await?;
+        stream.write_all(b"\r\n").await?;
+        stream.flush().await
+    };
+    written.await.map_err(async_imap::error::Error::Io)?;
+    tagged(session, &tag, |_| {}).await
+}
+
+/// Reads until the tagged answer of `tag`, handing each other response to `each`.
+async fn tagged(
+    session: &mut ImapSession,
+    tag: &RequestId,
+    mut each: impl FnMut(&Response<'_>),
+) -> Result<Done> {
     loop {
         let Some(response) = session
             .read_response()
@@ -466,7 +526,7 @@ pub(crate) async fn run_done(
                 tag: done,
                 status,
                 outcome,
-            } if *done == tag => {
+            } if done == tag => {
                 return Ok(match status {
                     Status::Ok => Done::Ok(outcome.code.as_ref().and_then(copy_uid_code)),
                     Status::No => Done::No {
