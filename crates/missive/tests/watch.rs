@@ -387,6 +387,11 @@ impl Raw {
     }
 }
 
+fn json(output: &Output) -> Value {
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 const SUBSCRIBE: &str = r#"{"protocol":1,"request":"subscribe"}"#;
 
 /// Waits until `condition` holds, for at most `seconds`.
@@ -459,6 +464,50 @@ async fn a_message_delivered_to_the_inbox_gives_one_new_message_event_and_one_un
     assert_eq!(watcher.expect("unread").await, alice_unread(3, 5));
     // One of each: the delivery did not make the daemon say anything else.
     watcher.quiet(1500).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_total_leaves_out_junk_and_trash_in_the_event_and_in_missive_unread() {
+    let server = mailbox()
+        .folder(
+            Folder::new("Spam")
+                .special_use(SpecialUse::Junk)
+                .message(message(8))
+                .message(message(9)),
+        )
+        .folder(
+            Folder::new("Bin")
+                .special_use(SpecialUse::Trash)
+                .message(message(10)),
+        )
+        .start()
+        .await;
+    let env = Env::new().await;
+    let _daemon = idling(&server, &env).await;
+    let mut watcher = env.watch();
+
+    let (_, event) = watcher.snapshot(1).await;
+    let command = json(&env.run(&["unread", "--json"]).await);
+
+    // 2 in the inbox and 2 in a folder of the user's own; the 3 of junk and trash are listed
+    // per folder and left out of every total.
+    assert_eq!(event["total"], 4);
+    assert_eq!(event["accounts"][0]["total"], 4);
+    assert_eq!(event["accounts"][0]["roles"]["junk"], 2);
+    assert_eq!(event["accounts"][0]["roles"]["trash"], 1);
+    assert_eq!(command["total"], 4);
+    assert_eq!(command["accounts"][0]["unread"], 4);
+    let listed = |role: &str| -> u64 {
+        command["accounts"][0]["folders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|folder| folder["role"] == role)
+            .unwrap()["unread"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!((listed("junk"), listed("trash")), (2, 1));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -20,6 +20,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::SCHEMA_VERSION;
 
+/// Roles whose unread messages are left out of every total: nobody wants a badge for spam.
+const NOT_COUNTED: [&str; 2] = ["trash", "junk"];
+
+/// The identifier of a message: see the module's documentation. One function, for the hits of a
+/// search and for the events alike.
+pub fn message_id(account: &str, folder: i64, uidvalidity: u32, uid: u32) -> String {
+    format!("{account}/{folder}/{uidvalidity}/{uid}")
+}
+
 /// The first schema version that has the search index.
 const SEARCH_VERSION: i64 = 2;
 
@@ -92,6 +101,18 @@ pub struct FolderUnread {
     pub account: String,
     pub folder: FolderRef,
     pub unread: u64,
+}
+
+impl FolderUnread {
+    /// Whether the folder's unread messages add up in a total (an account's, or all of them):
+    /// all but the junk and trash folders'. The folder still lists its own count.
+    pub fn counted(&self) -> bool {
+        !self
+            .folder
+            .role
+            .as_deref()
+            .is_some_and(|role| NOT_COUNTED.contains(&role))
+    }
 }
 
 /// A name and an address, as a header gave them.
@@ -181,7 +202,8 @@ impl Copy {
     }
 
     /// The unread messages of every folder of every account: those without `\Seen`, and not
-    /// marked `\Deleted` (they wait for an expunge). A flag is matched as a whole word.
+    /// marked `\Deleted` (they wait for an expunge). A flag is matched as a whole word. The
+    /// counts of [`FolderUnread::counted`] folders are the ones that add up in a total.
     /// By account, then folder: the inbox first, the other roles, then the user's own folders by
     /// name.
     pub fn unread(&self) -> Result<Vec<FolderUnread>> {
@@ -256,7 +278,7 @@ impl Copy {
                 };
                 let flags: String = r.get(10)?;
                 Ok(Hit {
-                    id: format!("{account}/{}/{}/{uid}", folder.id, uidvalidity.unwrap_or(0)),
+                    id: message_id(&account, folder.id, uidvalidity.unwrap_or(0), uid),
                     account,
                     folder,
                     uidvalidity,

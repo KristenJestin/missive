@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use async_imap::extensions::idle::IdleResponse;
 use missive_core::account::{Account, AccountStore, Password};
 use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap};
+use missive_core::copy::Copy;
 use missive_core::events::{Event, Reader, Unread};
 use missive_core::keyring::{Keyring, KeyringError};
 use missive_core::protocol::{
@@ -186,6 +187,18 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The local copy opened read only, the way `missive unread` reads it: the events count the
+/// unread messages with the same query. `None` (logged) when it cannot be opened.
+fn open_copy(store: &Path) -> Option<Copy> {
+    match Copy::open(store) {
+        Ok(copy) => copy,
+        Err(e) => {
+            log!("cannot open the local copy to count the unread messages ({e})");
+            None
+        }
+    }
+}
+
 /// What the daemon tells its watchers.
 struct Events {
     sender: broadcast::Sender<Event>,
@@ -195,8 +208,8 @@ struct Events {
 
 impl Events {
     fn new(store: &Path) -> Events {
-        let unread = Reader::open(store)
-            .and_then(|reader| reader.unread())
+        let unread = open_copy(store)
+            .and_then(|copy| Unread::of(&copy).ok())
             .unwrap_or_default();
         Events {
             sender: broadcast::channel(EVENT_BUFFER).0,
@@ -211,8 +224,8 @@ impl Events {
 
     /// Tells the unread counts when they are not the ones last told. The lock is held while
     /// sending, so that two workers' events come in the order of their counts.
-    fn unread(&self, reader: &Reader) {
-        let unread = match reader.unread() {
+    fn unread(&self, copy: &Copy) {
+        let unread = match Unread::of(copy) {
             Ok(unread) => unread,
             Err(e) => return log!("cannot count the unread messages ({e})"),
         };
@@ -287,6 +300,9 @@ impl Daemon {
                     continue;
                 }
             };
+            let Some(copy) = open_copy(&self.store) else {
+                continue;
+            };
             let (requests, receiver) = mpsc::unbounded_channel();
             workers.insert(id.clone(), requests);
             let worker = Worker {
@@ -302,6 +318,7 @@ impl Daemon {
                 idle_refused: false,
                 completed: reader.completed(key).unwrap_or(false),
                 reader,
+                copy,
                 events: self.events.clone(),
                 told: None,
             };
@@ -385,9 +402,10 @@ impl Daemon {
             ),
             Err(e) => log!("cannot read the accounts' states for a watcher ({e})"),
         }
-        match reader.unread() {
-            Ok(unread) => present.push(Event::Unread(unread)),
-            Err(e) => log!("cannot count the unread messages for a watcher ({e})"),
+        match open_copy(&self.store).map(|copy| Unread::of(&copy)) {
+            Some(Ok(unread)) => present.push(Event::Unread(unread)),
+            Some(Err(e)) => log!("cannot count the unread messages for a watcher ({e})"),
+            None => {}
         }
         present
     }
@@ -554,6 +572,8 @@ struct Worker {
     /// is the account's mail so far, not mail that arrives.
     completed: bool,
     reader: Reader,
+    /// The same copy, for the unread counts: see [`open_copy`].
+    copy: Copy,
     events: Arc<Events>,
     /// The state last told to the watchers.
     told: Option<String>,
@@ -927,7 +947,7 @@ impl Worker {
                 Err(e) => log!("account {}: cannot read the new messages ({e})", self.key),
             }
         }
-        self.events.unread(&self.reader);
+        self.events.unread(&self.copy);
     }
 
     /// Idles in the selected folder for at most `timeout` in all, and says what ended it.

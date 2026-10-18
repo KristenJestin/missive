@@ -216,9 +216,10 @@ The unread messages: those without the `\Seen` flag (the flag is matched as a wh
 case), and not marked `\Deleted`, which wait for an expunge and are counted as neither read nor
 unread. By account, then by folder: the inbox first, then the other roles (drafts, sent,
 archive, junk, trash), then the folders without a role, by name. Every folder of an account is
-listed, even with no unread message. The `total` and an account's `unread` add up every folder,
-the junk and trash folders included: a program that wants the inbox reads the folder whose `role`
-is `inbox`.
+listed, even with no unread message. The `total` and an account's `unread` add up every folder
+but the junk and trash ones, which are listed with their own count and left out of the sums:
+nobody wants a badge for spam. The `unread` event of `missive watch` counts the same way. A
+program that wants the inbox alone reads the folder whose `role` is `inbox`.
 
 ```json
 {
@@ -239,8 +240,9 @@ is `inbox`.
 
 | Field | Type | |
 |---|---|---|
-| `total` | number | the unread messages of all the accounts shown |
-| `accounts[].id`, `unread` | string, number | |
+| `total` | number | the unread messages of all the accounts shown, but those in a junk or trash folder |
+| `accounts[].id` | string | |
+| `accounts[].unread` | number | as `total`, for this account |
 | `folders[].id` | number | the folder's number in the copy, which a message's identifier names it by |
 | `folders[].name` | string | the folder's name on the server (as IMAP spells it: modified UTF-7) |
 | `folders[].role` | string or `null` | `inbox`, `sent`, `drafts`, `trash`, `junk` or `archive`; `null` for a folder of the user's own |

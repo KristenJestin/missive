@@ -1,8 +1,8 @@
 //! What the daemon tells its watchers (`docs/events.md` is the documentation of record), and the
 //! small queries on the local copy that tell it what to say.
 //!
-//! The queries live here, apart from [`crate::store`], for the events only: the unread counts they
-//! read are the ones `missive unread` gives, and the two should come from one query.
+//! The queries live here, apart from [`crate::store`], for the events only. The unread counts are
+//! not one of them: they come from [`Copy::unread`], the query `missive unread` answers with.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,10 +11,8 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 
+use crate::copy::{Copy, CopyError, message_id};
 use crate::protocol::PROTOCOL;
-
-/// Roles whose unread messages are left out of a total: nobody wants a badge for spam.
-const NOT_COUNTED: [&str; 2] = ["trash", "junk"];
 
 /// The name an unread count gives the folders that have no role.
 const NO_ROLE: &str = "other";
@@ -70,7 +68,7 @@ pub struct NewMessage {
     pub account: String,
     /// The folder's role, `None` for a folder of the user's own.
     pub folder: Option<String>,
-    /// See [`message_id`].
+    /// See [`crate::copy`].
     pub message: String,
     pub sender: Option<Sender>,
     pub subject: Option<String>,
@@ -85,9 +83,38 @@ pub struct Sender {
 /// The unread counts of the whole copy.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unread {
-    /// Everything that is unread but in the folders of [`NOT_COUNTED`] roles.
+    /// Everything that is unread but in the junk and trash folders, as in `missive unread`.
     pub total: u64,
     pub accounts: Vec<AccountUnread>,
+}
+
+impl Unread {
+    /// The counts of the copy, from the query `missive unread` uses. An account the daemon has
+    /// not listed the folders of yet is there with a zero and no role.
+    pub fn of(copy: &Copy) -> Result<Unread, CopyError> {
+        let mut unread = Unread::default();
+        for account in copy.accounts()? {
+            unread.accounts.push(AccountUnread {
+                id: account.id,
+                total: 0,
+                roles: BTreeMap::new(),
+            });
+        }
+        for folder in copy.unread()? {
+            let Some(account) = unread.accounts.iter_mut().find(|a| a.id == folder.account) else {
+                continue;
+            };
+            if folder.counted() {
+                account.total += folder.unread;
+                unread.total += folder.unread;
+            }
+            *account
+                .roles
+                .entry(folder.folder.role.unwrap_or_else(|| NO_ROLE.to_owned()))
+                .or_default() += folder.unread;
+        }
+        Ok(unread)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,13 +125,6 @@ pub struct AccountUnread {
     /// Unread messages by the role of their folder (`other` for the user's own folders), for each
     /// role the account has a folder of.
     pub roles: BTreeMap<String, u64>,
-}
-
-/// The identifier of a message in events: stable for as long as the folder keeps its UIDVALIDITY,
-/// which is as long as the server keeps the message's UID. One function, so that it is easy to
-/// change when `missive open` and `search` settle on theirs.
-pub fn message_id(account: &str, folder: i64, uidvalidity: u32, uid: u32) -> String {
-    format!("{account}/{folder}/{uidvalidity}/{uid}")
 }
 
 /// A read-only connection to the local copy, as `status` or `search` open it: the daemon writes
@@ -165,7 +185,12 @@ impl Reader {
                 Ok(NewMessage {
                     account: account.to_owned(),
                     folder: role.map(str::to_owned),
-                    message: message_id(account, folder, r.get(0)?, r.get(1)?),
+                    message: message_id(
+                        account,
+                        folder,
+                        r.get::<_, Option<u32>>(0)?.unwrap_or(0),
+                        r.get(1)?,
+                    ),
                     sender: serde_json::from_str::<Vec<Sender>>(&sender)
                         .ok()
                         .and_then(|senders| senders.into_iter().next()),
@@ -173,49 +198,6 @@ impl Reader {
                 })
             })?
             .collect()
-    }
-
-    /// The unread messages: those with no `\Seen` flag, and not marked `\Deleted`.
-    pub fn unread(&self) -> rusqlite::Result<Unread> {
-        let mut statement = self.0.prepare(
-            "SELECT account.id, folder.id, folder.role, count(message.id) FROM account \
-             LEFT JOIN folder ON folder.account = account.key \
-             LEFT JOIN message ON message.folder = folder.id \
-               AND instr(' ' || lower(message.flags) || ' ', ' \\seen ') = 0 \
-               AND instr(' ' || lower(message.flags) || ' ', ' \\deleted ') = 0 \
-             GROUP BY account.id, folder.id ORDER BY account.id",
-        )?;
-        let mut unread = Unread::default();
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            if unread.accounts.last().is_none_or(|last| last.id != id) {
-                unread.accounts.push(AccountUnread {
-                    id,
-                    total: 0,
-                    roles: BTreeMap::new(),
-                });
-            }
-            let account = unread.accounts.last_mut().expect("pushed above");
-            // An account the daemon has not listed the folders of yet has no folder row.
-            if row.get::<_, Option<i64>>(1)?.is_none() {
-                continue;
-            }
-            let role: Option<String> = row.get(2)?;
-            let count = row.get::<_, i64>(3)? as u64;
-            if !role
-                .as_deref()
-                .is_some_and(|role| NOT_COUNTED.contains(&role))
-            {
-                account.total += count;
-                unread.total += count;
-            }
-            *account
-                .roles
-                .entry(role.unwrap_or_else(|| NO_ROLE.to_owned()))
-                .or_default() += count;
-        }
-        Ok(unread)
     }
 }
 
@@ -237,12 +219,13 @@ mod tests {
         }
     }
 
-    fn copy() -> (tempfile::TempDir, Store, Reader) {
+    fn copy() -> (tempfile::TempDir, Store, Reader, Copy) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("copy.sqlite");
         let store = Store::open(&path).unwrap();
         let reader = Reader::open(&path).unwrap();
-        (dir, store, reader)
+        let copy = Copy::open(&path).unwrap().unwrap();
+        (dir, store, reader, copy)
     }
 
     #[test]
@@ -287,7 +270,7 @@ mod tests {
 
     #[test]
     fn unread_is_every_message_without_seen_or_deleted_by_account_and_role() {
-        let (_dir, mut store, reader) = copy();
+        let (_dir, mut store, _reader, copy) = copy();
         let alice = store.account("alice").unwrap();
         let bob = store.account("bob").unwrap();
         let inbox = store.folder(alice, "INBOX", Some("inbox")).unwrap().id;
@@ -311,7 +294,7 @@ mod tests {
             .unwrap();
         store.insert(own, &[message(1, "$Label1")]).unwrap();
 
-        let unread = reader.unread().unwrap();
+        let unread = Unread::of(&copy).unwrap();
 
         assert_eq!(unread.total, 3);
         assert_eq!(unread.accounts.len(), 2);
@@ -335,9 +318,9 @@ mod tests {
 
     #[test]
     fn an_account_without_a_folder_yet_has_no_role_in_its_counts() {
-        let (_dir, store, reader) = copy();
+        let (_dir, store, _reader, copy) = copy();
         store.account("alice").unwrap();
-        let unread = reader.unread().unwrap();
+        let unread = Unread::of(&copy).unwrap();
         assert_eq!(unread.accounts.len(), 1);
         assert!(unread.accounts[0].roles.is_empty());
         assert_eq!(unread.total, 0);
@@ -345,7 +328,7 @@ mod tests {
 
     #[test]
     fn what_arrived_is_what_is_above_the_highest_uid_known_before() {
-        let (_dir, mut store, reader) = copy();
+        let (_dir, mut store, reader, _copy) = copy();
         let alice = store.account("alice").unwrap();
         let inbox = store.folder(alice, "INBOX", Some("inbox")).unwrap().id;
         store.rebuild(inbox, 17).unwrap();
@@ -376,7 +359,7 @@ mod tests {
 
     #[test]
     fn an_account_has_completed_a_sync_once_its_last_sync_is_recorded() {
-        let (_dir, store, reader) = copy();
+        let (_dir, store, reader, _copy) = copy();
         let alice = store.account("alice").unwrap();
         assert!(!reader.completed(alice).unwrap());
         store.set_state(alice, "syncing", false).unwrap();

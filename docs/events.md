@@ -60,13 +60,14 @@ computer asleep), the mail that came meanwhile is announced by the first sync th
 
 **The identifier** is `<account>/<folder>/<uidvalidity>/<uid>`: the account's identifier, the
 folder's number in the local copy, the folder's UIDVALIDITY and the message's UID. A program
-treats it as an opaque string. (It will be the one `missive open` takes once that exists; until
-then it is a stable name for the message and nothing more.)
+treats it as an opaque string. It is the `id` that `missive search` gives a message, built by the
+same function: a program can match an event to a search hit.
 
 ### `unread`
 
 The unread counts changed. A message is unread when it has no `\Seen` flag and is not marked
-`\Deleted`.
+`\Deleted`. The counts come from the query behind `missive unread`, and `total` means the same
+thing in both: every folder but the junk and trash ones.
 
 ```json
 {"protocol": 1, "event": "unread", "total": 5,
@@ -78,7 +79,7 @@ The unread counts changed. A message is unread when it has no `\Seen` flag and i
 | Field | Type | |
 |---|---|---|
 | `total` | number | the unread messages of every account, but those in a `trash` or `junk` folder |
-| `accounts` | array | every account of the copy, by identifier |
+| `accounts` | array | every account of the copy, by identifier; one that has no folder yet is there with a total of 0 and no role, as `missive unread` shows it |
 | `accounts[].id` | string | |
 | `accounts[].total` | number | as `total`, for this account |
 | `accounts[].roles` | object | the unread messages by folder role, for each role the account has a folder of; `other` stands for the folders of the user's own. A count of 0 is there, so that a role that dropped to 0 is told |
