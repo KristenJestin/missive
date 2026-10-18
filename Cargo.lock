@@ -4841,6 +4841,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "zbus",
 ]
 
 [[package]]

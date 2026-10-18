@@ -1,7 +1,9 @@
 //! What the window shows, without the window: the accounts and their folders, the messages of
 //! the selected folder, and the message open in the reader. It reads the local copy, opened read
 //! only as `missive list` and `show` open it, and follows the daemon's events to know what to read
-//! again. It never writes anything: opening a message does not mark it read.
+//! again. It never writes the copy: what the user does to mail (mark, move, delete) becomes a
+//! request to the daemon, which the window hands over (see `view.rs`), and the daemon changes the
+//! copy and the server.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,7 +12,8 @@ use std::time::Duration;
 use missive_core::account::{AccountStore, Listing};
 use missive_core::body;
 use missive_core::copy::{Copy, FolderRef, List, Listed, NotFound, Person};
-use missive_core::events::Event;
+use missive_core::events::{ActionEvent, Event};
+use missive_core::protocol::{Answer, Command};
 use missive_core::store::Store;
 use missive_render::message;
 use missive_render::reduce::{Theme, reduce};
@@ -24,6 +27,10 @@ const REDUCE_WIDTH: u32 = 800;
 
 /// How long a message may take to reduce before its text is shown instead.
 const BUDGET: Duration = Duration::from_secs(2);
+
+/// How long a message is shown before it is marked read: moving down the list does not mark every
+/// message it passes.
+pub const READ_AFTER: Duration = Duration::from_secs(2);
 
 /// Where the window reads from.
 pub struct Sources {
@@ -89,6 +96,10 @@ pub enum Reader {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Opened {
     pub id: String,
+    /// The folder the message is in.
+    pub folder: FolderRef,
+    pub unread: bool,
+    pub flagged: bool,
     pub subject: Option<String>,
     pub from: Vec<Person>,
     pub to: Vec<Person>,
@@ -113,6 +124,22 @@ pub enum Body {
     Text(String),
     /// The message has no readable body.
     None,
+}
+
+/// The wait before the open message is marked read, to start with [`Model::take_read_timer`]
+/// and end with [`Model::read_timer_elapsed`].
+#[derive(Debug)]
+pub struct ReadTimer {
+    /// Which showing of a message it is for: another message, or the reader closed, ends it.
+    shown: u64,
+    pub after: Duration,
+}
+
+/// The folders a message can be moved to, with the one the keyboard is on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Picker {
+    pub folders: Vec<FolderRef>,
+    pub cursor: usize,
 }
 
 /// A message to reduce off the window's thread: [`Reduction::run`] takes up to its budget.
@@ -171,6 +198,20 @@ pub struct Model {
     /// How many times a message was read for the reader: the last one is the one shown.
     openings: u64,
     reduction: Option<Reduction>,
+    /// How many times a message was opened: the last one is the one a read timer is for.
+    shown: u64,
+    /// The showing whose read timer runs, until it ends or the user marks the message unread.
+    reading: Option<u64>,
+    /// A read timer for the window to start.
+    read_timer: Option<ReadTimer>,
+    /// What to ask the daemon, in order.
+    requests: std::collections::VecDeque<Command>,
+    /// The folder picker of "Move to…", when it is open.
+    pub picker: Option<Picker>,
+    /// The message to delete for good once the user confirms it.
+    pub confirm: Option<String>,
+    /// What went wrong with an action, for people, until the next action.
+    pub notice: Option<String>,
 }
 
 impl Model {
@@ -191,6 +232,13 @@ impl Model {
             dark: false,
             openings: 0,
             reduction: None,
+            shown: 0,
+            reading: None,
+            read_timer: None,
+            requests: Default::default(),
+            picker: None,
+            confirm: None,
+            notice: None,
         };
         model.refresh();
         model
@@ -221,8 +269,14 @@ impl Model {
         };
         if let Reader::Open(opened) = &self.reader {
             let id = opened.id.clone();
-            if !self.still_there(&id) {
-                self.reader = Reader::Gone;
+            match self.flags_of(&id) {
+                Some((unread, flagged)) => {
+                    if let Reader::Open(opened) = &mut self.reader {
+                        opened.unread = unread;
+                        opened.flagged = flagged;
+                    }
+                }
+                None => self.reader = Reader::Gone,
             }
         }
     }
@@ -245,10 +299,16 @@ impl Model {
             | Event::Sent(_)
             | Event::SendFailed(_)
             | Event::SendUncertain(_) => self.daemon = Daemon::Running,
+            Event::Action(action) => {
+                if action.outcome == "refused" {
+                    self.notice = Some(refused(action));
+                }
+                self.daemon = Daemon::Running;
+                self.refresh();
+            }
             Event::NewMessage(_)
             | Event::Unread(_)
             | Event::SyncEnded { .. }
-            | Event::Action(_)
             // A draft saved or removed changes the Drafts folder.
             | Event::Draft(_)
             | Event::Lagged { .. } => {
@@ -292,18 +352,265 @@ impl Model {
         }
     }
 
-    /// Opens a message of the list, and puts the cursor on it.
+    /// Opens a message of the list, and puts the cursor on it. An unread message asks for a
+    /// read timer: it is marked read once shown for [`READ_AFTER`].
     pub fn open(&mut self, id: &str) {
         if let Some(at) = self.messages.iter().position(|m| m.hit.id == id) {
             self.cursor = Some(at);
         }
+        self.dismiss();
         self.reader = self.read(id);
+        self.shown += 1;
+        self.reading = None;
+        self.read_timer = None;
+        if matches!(&self.reader, Reader::Open(opened) if opened.unread) {
+            self.reading = Some(self.shown);
+            self.read_timer = Some(ReadTimer {
+                shown: self.shown,
+                after: READ_AFTER,
+            });
+        }
     }
 
-    /// Closes the reader.
+    /// Closes the reader, a picker or a confirmation open on it first.
     pub fn back(&mut self) {
+        if self.picker.is_some() || self.confirm.is_some() {
+            return self.dismiss();
+        }
         self.reader = Reader::Empty;
         self.reduction = None;
+        self.reading = None;
+    }
+
+    /// The read timer the open message asks for, to start once.
+    pub fn take_read_timer(&mut self) -> Option<ReadTimer> {
+        self.read_timer.take()
+    }
+
+    /// The message was shown for [`READ_AFTER`]: it is marked read, unless the user moved on or
+    /// marked it unread in the meantime. Offline too: the daemon queues it.
+    pub fn read_timer_elapsed(&mut self, timer: ReadTimer) {
+        if self.reading != Some(timer.shown) {
+            return;
+        }
+        self.reading = None;
+        if let Reader::Open(opened) = &self.reader
+            && opened.unread
+        {
+            let id = opened.id.clone();
+            self.ask(Command::Mark {
+                messages: vec![id],
+                mark_as: "read".to_owned(),
+            });
+        }
+    }
+
+    /// The next request for the daemon, in the order they were asked.
+    pub fn take_request(&mut self) -> Option<Command> {
+        self.requests.pop_front()
+    }
+
+    /// The daemon's answer to a request, or why it could not be asked: the copy shows what the
+    /// daemon recorded.
+    pub fn answered(&mut self, answer: Result<Answer, String>) {
+        match answer {
+            Ok(answer) if answer.ok => {}
+            Ok(answer) => {
+                let error = answer.error.unwrap_or_default();
+                self.notice = Some(match answer.message {
+                    Some(message) => format!("Refused ({error}): {message}"),
+                    None => format!("Refused ({error})."),
+                });
+            }
+            Err(e) => self.notice = Some(format!("The daemon could not be asked: {e}")),
+        }
+        self.refresh();
+    }
+
+    /// `U`: marks the open message unread; its read timer stops either way.
+    pub fn mark_unread(&mut self) {
+        if self.modal() {
+            return;
+        }
+        self.reading = None;
+        if let Reader::Open(opened) = &self.reader
+            && !opened.unread
+        {
+            let id = opened.id.clone();
+            self.ask(Command::Mark {
+                messages: vec![id],
+                mark_as: "unread".to_owned(),
+            });
+        }
+    }
+
+    /// `S`: flags the open message, or takes its flag off.
+    pub fn toggle_flag(&mut self) {
+        if self.modal() {
+            return;
+        }
+        if let Reader::Open(opened) = &self.reader {
+            let mark_as = if opened.flagged {
+                "unflagged"
+            } else {
+                "flagged"
+            };
+            let id = opened.id.clone();
+            self.ask(Command::Mark {
+                messages: vec![id],
+                mark_as: mark_as.to_owned(),
+            });
+        }
+    }
+
+    /// Whether the open message can be archived: its account has a folder of the role `archive`,
+    /// and the message is not in it.
+    pub fn can_archive(&self) -> bool {
+        let Reader::Open(opened) = &self.reader else {
+            return false;
+        };
+        self.folders_of(&opened.id)
+            .iter()
+            .any(|f| f.role.as_deref() == Some("archive") && f.id != opened.folder.id)
+    }
+
+    /// `A`: moves the open message to the account's archive.
+    pub fn archive(&mut self) {
+        if !self.modal() && self.can_archive() {
+            self.move_open("archive".to_owned());
+        }
+    }
+
+    /// `M`: opens the folder picker for the open message: every folder of its account but its
+    /// own.
+    pub fn pick_folder(&mut self) {
+        if self.modal() {
+            return;
+        }
+        if let Reader::Open(opened) = &self.reader {
+            let folders: Vec<FolderRef> = self
+                .folders_of(&opened.id)
+                .into_iter()
+                .filter(|f| f.id != opened.folder.id)
+                .collect();
+            if !folders.is_empty() {
+                self.picker = Some(Picker { folders, cursor: 0 });
+            }
+        }
+    }
+
+    /// Moves the picker's cursor by `by` folders, staying in the list.
+    pub fn picker_move(&mut self, by: isize) {
+        if let Some(picker) = &mut self.picker {
+            picker.cursor = picker
+                .cursor
+                .saturating_add_signed(by)
+                .min(picker.folders.len() - 1);
+        }
+    }
+
+    /// Moves the open message to the folder under the picker's cursor.
+    pub fn choose_folder(&mut self) {
+        if let Some(picker) = self.picker.take()
+            && let Some(folder) = picker.folders.get(picker.cursor)
+        {
+            // A role is looked for first by the daemon: a folder that has one is named by it.
+            let to = folder.role.clone().unwrap_or_else(|| folder.name.clone());
+            self.move_open(to);
+        }
+    }
+
+    /// Moves the open message to the folder at `at` of the picker.
+    pub fn choose_folder_at(&mut self, at: usize) {
+        if let Some(picker) = &mut self.picker {
+            picker.cursor = at.min(picker.folders.len() - 1);
+        }
+        self.choose_folder();
+    }
+
+    /// `Delete`: moves the open message to the trash. In the trash, or in an account that has
+    /// none, it is deleted for good, and only once the user confirms it.
+    pub fn delete(&mut self) {
+        if self.modal() {
+            return;
+        }
+        let Reader::Open(opened) = &self.reader else {
+            return;
+        };
+        let id = opened.id.clone();
+        if self.deletes_for_good() {
+            self.confirm = Some(id);
+            return;
+        }
+        self.leave(Command::Delete {
+            messages: vec![id],
+            permanently: false,
+        });
+    }
+
+    /// Whether `Delete` deletes the open message for good: it is in the trash, or its account
+    /// has none.
+    pub fn deletes_for_good(&self) -> bool {
+        let Reader::Open(opened) = &self.reader else {
+            return false;
+        };
+        opened.folder.role.as_deref() == Some("trash")
+            || !self
+                .folders_of(&opened.id)
+                .iter()
+                .any(|f| f.role.as_deref() == Some("trash"))
+    }
+
+    /// The user confirmed deleting a message for good.
+    pub fn confirm_delete(&mut self) {
+        if let Some(id) = self.confirm.take() {
+            self.leave(Command::Delete {
+                messages: vec![id],
+                permanently: true,
+            });
+        }
+    }
+
+    /// Closes the folder picker or the confirmation, doing nothing.
+    pub fn dismiss(&mut self) {
+        self.picker = None;
+        self.confirm = None;
+    }
+
+    /// Whether a picker or a confirmation waits for the user.
+    pub fn modal(&self) -> bool {
+        self.picker.is_some() || self.confirm.is_some()
+    }
+
+    fn ask(&mut self, command: Command) {
+        self.notice = None;
+        self.requests.push_back(command);
+    }
+
+    fn move_open(&mut self, to: String) {
+        if let Reader::Open(opened) = &self.reader {
+            let id = opened.id.clone();
+            self.leave(Command::Move {
+                messages: vec![id],
+                to,
+            });
+        }
+    }
+
+    /// Asks for a request that takes the open message away: the reader closes.
+    fn leave(&mut self, command: Command) {
+        self.ask(command);
+        self.back();
+    }
+
+    /// The folders of the account a message is of.
+    fn folders_of(&self, id: &str) -> Vec<FolderRef> {
+        let account = id.split('/').next().unwrap_or_default();
+        self.accounts
+            .iter()
+            .find(|a| a.id == account)
+            .map(|a| a.folders.iter().map(|f| f.folder.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// The reduction the open message waits for, to run off the window's thread.
@@ -446,8 +753,15 @@ impl Model {
         }
     }
 
-    fn still_there(&mut self, id: &str) -> bool {
-        matches!(self.copy(), Ok(Some(copy)) if matches!(copy.message(id), Ok(Ok(_))))
+    /// Whether a message is unread and flagged, `None` when it is no longer in the copy.
+    fn flags_of(&mut self, id: &str) -> Option<(bool, bool)> {
+        match self.copy() {
+            Ok(Some(copy)) => match copy.message(id) {
+                Ok(Ok(stored)) => Some((stored.hit.unread, stored.flagged)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn read(&mut self, id: &str) -> Reader {
@@ -475,6 +789,9 @@ impl Model {
         });
         Reader::Open(Box::new(Opened {
             id: stored.hit.id,
+            folder: stored.hit.folder,
+            unread: stored.hit.unread,
+            flagged: stored.flagged,
             subject: stored.hit.subject,
             from: stored.hit.from,
             to: stored.hit.to,
@@ -485,4 +802,21 @@ impl Model {
             raw: stored.raw,
         }))
     }
+}
+
+/// A notice for an action the server refused, with the reason's kind.
+fn refused(action: &ActionEvent) -> String {
+    let what = match action.action.as_str() {
+        "read" => "Marking read",
+        "unread" => "Marking unread",
+        "flagged" => "Flagging",
+        "unflagged" => "Taking the flag off",
+        "answered" => "Marking answered",
+        "move" => "Moving",
+        "delete" => "Moving to the trash",
+        "delete-permanently" => "Deleting for good",
+        _ => "An action",
+    };
+    let reason = action.reason.as_deref().unwrap_or("refused");
+    format!("{what} was refused by the server ({reason}); the message is back as it was.")
 }
