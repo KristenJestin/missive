@@ -6,7 +6,7 @@ use std::fs::{File, TryLockError};
 
 use clap::{Args, ValueEnum};
 use missive_core::account::{AccountStore, Listing};
-use missive_core::copy::{Copy, FolderRef, FolderUnread, Hit, Search};
+use missive_core::copy::{Copy, FolderRef, Hit, Search};
 use missive_core::protocol::pid_path;
 use missive_core::store::Store;
 use serde::Serialize;
@@ -215,18 +215,17 @@ pub fn unread(json: bool) -> Result<()> {
     let accounts: Vec<AccountUnread> = configured
         .into_iter()
         .map(|id| {
-            let folders: Vec<FolderCount> = folders
-                .iter()
-                .filter(|FolderUnread { account, .. }| *account == id)
-                .map(|f| FolderCount {
-                    folder: f.folder.clone(),
-                    unread: f.unread,
-                })
-                .collect();
+            let of_account = || folders.iter().filter(|f| f.account == id);
             AccountUnread {
-                unread: folders.iter().map(|f| f.unread).sum(),
+                // As in the `unread` event: the junk and trash folders are listed, not added up.
+                unread: of_account().filter(|f| f.counted()).map(|f| f.unread).sum(),
+                folders: of_account()
+                    .map(|f| FolderCount {
+                        folder: f.folder.clone(),
+                        unread: f.unread,
+                    })
+                    .collect(),
                 id,
-                folders,
             }
         })
         .collect();

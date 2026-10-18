@@ -93,6 +93,26 @@ content of the file). Standard output stays valid, and the exit status is still 
 Removes the account's keyring entry, then its settings and certificate. The keyring goes first:
 if it is unavailable, the account stays whole and the command can be run again.
 
+## The event stream
+
+### `missive watch`
+
+Prints what the daemon does, one JSON object per line on standard output, until it is stopped:
+new messages, unread counts, connection states, syncs. The lines and their fields are those of
+`docs/events.md`; each line is flushed as it is written, so a program reading the pipe sees it at
+once. Diagnostics go to standard error.
+
+`watch` never starts the daemon. Without one it prints `{"protocol":1,"event":"gone"}` and waits,
+looking for the daemon's socket once a second; when a daemon appears it subscribes, and the
+stream goes on (starting, as every subscription does, with the present state). When the daemon
+stops, `watch` says `gone` again and goes back to waiting. Several `watch` may run at once.
+
+SIGTERM or SIGINT (Ctrl-C) stops it, and so does the closing of standard output (a program that
+stops reading, as `missive watch | head -1` does), noticed at once and not at the next line it
+would write: neither is an error, and the exit status is success. (Standard output sent to a
+regular file has no reader to lose: the stream goes on.) The status is 1 when the daemon refuses the subscription (it speaks another protocol
+version, say) or the socket cannot be reached for another reason than the daemon's absence.
+
 ## The local copy
 
 Missive keeps a copy of each account in `$XDG_DATA_HOME/missive/copy.sqlite` (or
@@ -197,9 +217,10 @@ The unread messages: those without the `\Seen` flag (the flag is matched as a wh
 case), and not marked `\Deleted`, which wait for an expunge and are counted as neither read nor
 unread. By account, then by folder: the inbox first, then the other roles (drafts, sent,
 archive, junk, trash), then the folders without a role, by name. Every folder of an account is
-listed, even with no unread message. The `total` and an account's `unread` add up every folder,
-the junk and trash folders included: a program that wants the inbox reads the folder whose `role`
-is `inbox`.
+listed, even with no unread message. The `total` and an account's `unread` add up every folder
+but the junk and trash ones, which are listed with their own count and left out of the sums:
+nobody wants a badge for spam. The `unread` event of `missive watch` counts the same way. A
+program that wants the inbox alone reads the folder whose `role` is `inbox`.
 
 ```json
 {
@@ -220,8 +241,9 @@ is `inbox`.
 
 | Field | Type | |
 |---|---|---|
-| `total` | number | the unread messages of all the accounts shown |
-| `accounts[].id`, `unread` | string, number | |
+| `total` | number | the unread messages of all the accounts shown, but those in a junk or trash folder |
+| `accounts[].id` | string | |
+| `accounts[].unread` | number | as `total`, for this account |
 | `folders[].id` | number | the folder's number in the copy, which a message's identifier names it by |
 | `folders[].name` | string | the folder's name on the server (as IMAP spells it: modified UTF-7) |
 | `folders[].role` | string or `null` | `inbox`, `sent`, `drafts`, `trash`, `junk` or `archive`; `null` for a folder of the user's own |

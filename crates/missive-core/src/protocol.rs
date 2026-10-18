@@ -48,12 +48,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
     },
+    /// Answered at once; the daemon then writes `event` lines on the same connection, the present
+    /// first (see `docs/events.md`).
+    Subscribe,
 }
 
 impl Command {
     pub fn name(&self) -> &'static str {
         match self {
             Command::Sync { .. } => "sync",
+            Command::Subscribe => "subscribe",
         }
     }
 }
@@ -122,7 +126,7 @@ pub fn read_request(line: &str) -> Result<Request, Answer> {
             ));
         }
     }
-    let known = matches!(name, Some("sync"));
+    let known = matches!(name, Some("sync" | "subscribe"));
     serde_json::from_value(value).map_err(|_| {
         if known || name.is_none() {
             Answer::error(name, "bad-request", "the request is not well formed")
@@ -157,6 +161,28 @@ mod tests {
                     account: Some("alice".to_owned())
                 }
             })
+        );
+    }
+
+    #[test]
+    fn a_subscribe_request_reads_and_writes_as_one_line() {
+        let line = r#"{"protocol":1,"request":"subscribe"}"#;
+        let request = Request {
+            protocol: 1,
+            command: Command::Subscribe,
+        };
+        assert_eq!(read_request(line), Ok(request.clone()));
+        assert_eq!(serde_json::to_string(&request).unwrap(), line);
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"subscribe","account":3}"#),
+            Ok(request)
+        );
+        assert_eq!(
+            read_request(r#"{"protocol":2,"request":"subscribe"}"#)
+                .unwrap_err()
+                .error
+                .unwrap(),
+            "unsupported-protocol"
         );
     }
 

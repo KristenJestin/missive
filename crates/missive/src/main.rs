@@ -1,5 +1,6 @@
 mod daemon;
 mod read;
+mod watch;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -42,6 +43,10 @@ enum Command {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Print the daemon's events, one JSON object per line, until stopped: new messages, unread
+    /// counts, connection states, syncs (see docs/events.md). Never starts the daemon: without
+    /// one it says `gone` and waits for it.
+    Watch,
     /// Run the daemon in the foreground: it keeps the local copy of every account up to date.
     /// SIGTERM or SIGINT stops it.
     Daemon(DaemonArgs),
@@ -167,6 +172,7 @@ async fn main() -> ExitCode {
         Command::Account(AccountCommand::List { json }) => list(json),
         Command::Account(AccountCommand::Remove { id }) => remove(&id).await,
         Command::Sync { account } => sync(account).await,
+        Command::Watch => watch::run().await.map_err(Failure),
         Command::Daemon(args) => daemon::run(daemon::Options {
             check_interval: Duration::from_secs(args.check_interval),
             batch_size: args.batch_size as usize,
