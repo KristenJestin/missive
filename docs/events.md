@@ -144,11 +144,11 @@ The watcher read too slowly, and events were dropped for it alone.
 {"protocol": 1, "event": "lagged", "missed": 12}
 ```
 
-`missed` is how many. The daemon keeps 256 events behind each watcher (on top of the socket's own
-buffer) and never waits for a watcher, so that one that stops reading slows neither the daemon
-nor the others. The connection goes on; the events after this line are in order. A program that
-cannot afford to miss one (it keeps a count of its own, say) takes `lagged` as the sign to read
-the present again by subscribing anew.
+`missed` is how many. Behind each watcher the daemon keeps what the socket holds, 16 lines in the
+connection's own queue, then 256 events (see `docs/protocol.md`); it never waits for a watcher, so
+that one that stops reading slows neither the daemon nor the others. The connection goes on; the
+events after this line are in order. A program that cannot afford to miss one (it keeps a count of
+its own, say) takes `lagged` as the sign to read the present again by subscribing anew.
 
 ### `gone`
 

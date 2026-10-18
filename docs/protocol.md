@@ -102,8 +102,9 @@ client that only closes its writing side after the request (`echo '{…subscribe
 UNIX-CONNECT:…` does) is still listening, and keeps receiving events. Events are not kept for a
 client that is not there: one that connects later starts from the present.
 
-A watcher that reads more slowly than the daemon writes is never waited for. The daemon keeps at
-most 256 events behind a watcher on top of what the socket holds; past that the oldest are dropped
-for that watcher alone, and the next line it reads is `{"protocol": 1, "event": "lagged",
-"missed": <how many>}`. Its connection is not closed: it may read on, or send `subscribe` on a new
-connection to start again from the present.
+A watcher that reads more slowly than the daemon writes is never waited for. Behind a watcher the
+daemon keeps what the socket holds, then 16 lines in the connection's own queue (answers and
+events alike, written by a task of that connection), then at most 256 events in the channel all
+the watchers share; past that the oldest are dropped for that watcher alone, and the next line it
+reads is `{"protocol": 1, "event": "lagged", "missed": <how many>}`. Its connection is not
+closed: it may read on, or send `subscribe` on a new connection to start again from the present.
