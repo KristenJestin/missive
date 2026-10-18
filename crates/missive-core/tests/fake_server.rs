@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_imap::extensions::idle::IdleResponse;
-use async_imap::imap_proto::{Response, Status};
+use async_imap::imap_proto::{RequestId, Response, Status};
 use async_imap::types::{Flag, NameAttribute, UnsolicitedResponse};
 use async_imap::{Client, Session};
 use futures_util::TryStreamExt;
@@ -537,6 +537,65 @@ async fn a_cut_set_by_the_builder_applies_to_every_connection() {
         ));
         assert!(session.read_response().await.unwrap().is_none());
     }
+}
+
+/// Reads answers up to the tagged one: the untagged ones, and whether the command ended `OK`
+/// (else `NO`).
+async fn answers_until_done(session: &mut Imap, id: &RequestId) -> (Vec<String>, bool) {
+    let mut untagged = Vec::new();
+    loop {
+        let answer = session.read_response().await.unwrap().unwrap();
+        match answer.parsed() {
+            Response::Done { tag, status, .. } if tag == id => {
+                return (untagged, *status == Status::Ok);
+            }
+            other => untagged.push(format!("{other:?}")),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_message_refused_by_uid_is_left_out_of_every_fetch_that_holds_it_and_the_fetch_ends_no() {
+    let server = three_messages().await;
+    let mut session = login(imap_tls(server.imap_tls_addr(), pinned(&server)).await).await;
+    session.examine("INBOX").await.unwrap();
+    server.refuse_uid(2);
+
+    // The others come, as with Dovecot's imap_fetch_failure = no-after; then the NO.
+    let id = session.run_command("UID FETCH 1:3 (FLAGS)").await.unwrap();
+    let (untagged, status) = answers_until_done(&mut session, &id).await;
+    assert!(!status);
+    assert_eq!(untagged.len(), 2, "{untagged:?}");
+    assert!(untagged[0].contains("Uid(1)") && untagged[1].contains("Uid(3)"));
+    // A set that does not hold it is answered as usual, and so is a sequence number.
+    let id = session.run_command("UID FETCH 1,3 (FLAGS)").await.unwrap();
+    assert!(answers_until_done(&mut session, &id).await.1);
+    let id = session.run_command("UID FETCH 2 (FLAGS)").await.unwrap();
+    let (untagged, status) = answers_until_done(&mut session, &id).await;
+    assert_eq!((untagged.len(), status), (0, false));
+
+    server.heal();
+    let id = session.run_command("UID FETCH 1:3 (FLAGS)").await.unwrap();
+    let (untagged, status) = answers_until_done(&mut session, &id).await;
+    assert_eq!((untagged.len(), status), (3, true));
+}
+
+#[tokio::test]
+async fn a_truncated_answer_keeps_its_first_lines_and_still_ends_with_its_tagged_ok() {
+    let server = three_messages().await;
+    let mut session = login(imap_tls(server.imap_tls_addr(), pinned(&server)).await).await;
+    server.truncate("examine", 3);
+
+    let id = session.run_command("EXAMINE \"INBOX\"").await.unwrap();
+    let (untagged, status) = answers_until_done(&mut session, &id).await;
+
+    // FLAGS, PERMANENTFLAGS, UIDVALIDITY, and no EXISTS: yet the command is said done.
+    assert!(status);
+    assert_eq!(untagged.len(), 3, "{untagged:?}");
+    assert!(!untagged.iter().any(|a| a.contains("Exists")));
+    server.heal();
+    let id = session.run_command("EXAMINE \"INBOX\"").await.unwrap();
+    assert!(answers_until_done(&mut session, &id).await.0.len() > 3);
 }
 
 #[tokio::test]

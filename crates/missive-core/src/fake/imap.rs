@@ -52,6 +52,9 @@ pub(super) async fn serve(
         if !session.shared.fetch_delay.is_zero() && is_fetch(text) {
             tokio::time::sleep(session.shared.fetch_delay).await;
         }
+        if let Some(Action::Truncate(lines)) = rule {
+            truncate(&mut session.out, lines);
+        }
         if let Some(Action::Cut(lines)) = rule {
             cut(&mut session.out, lines);
             session.send("* BYE the test cut this answer short");
@@ -105,6 +108,18 @@ fn cut(out: &mut Vec<u8>, lines: usize) {
         }
     }
     out.truncate(kept);
+}
+
+/// Keeps the first `lines` lines of an answer and its last line, the tagged one.
+fn truncate(out: &mut Vec<u8>, lines: usize) {
+    let body = out.len().saturating_sub(2);
+    let tagged = out[..body]
+        .windows(2)
+        .rposition(|w| w == b"\r\n")
+        .map_or(0, |end| end + 2);
+    let tagged = out.split_off(tagged);
+    cut(out, lines);
+    out.extend_from_slice(&tagged);
 }
 
 async fn flush(io: &mut BufReader<Box<dyn Io>>, out: &mut Vec<u8>) -> std::io::Result<()> {
@@ -486,12 +501,18 @@ impl Session {
         };
         let marks_seen = !selected.read_only && items.iter().any(Item::marks_seen);
         let mut state = self.shared.state();
+        let refused_uids = state.refused_uids.clone();
         let folder = state.folder(&selected.folder);
         let mut answer = Vec::new();
         let mut changed = false;
+        let mut refused = false;
         for (index, entry) in selected.view.iter_mut().enumerate() {
             let sequence = index as u32 + 1;
             if !set.contains(if uid { entry.uid } else { sequence }, max) {
+                continue;
+            }
+            if uid && refused_uids.contains(&entry.uid) {
+                refused = true;
                 continue;
             }
             // A message expunged meanwhile is only told at the next NOOP; it has no data now.
@@ -528,6 +549,9 @@ impl Session {
             self.changes.borrow_and_update();
         }
         self.out.extend_from_slice(&answer);
+        if refused {
+            return Err("NO [UNAVAILABLE] the test refused a message of this set".to_owned());
+        }
         Ok(())
     }
 

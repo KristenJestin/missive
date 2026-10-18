@@ -34,8 +34,9 @@
 //!
 //! A server can also misbehave on purpose, from the start ([`Builder::refuse`], [`Builder::cut`])
 //! or from a point of the test on ([`FakeServer::refuse`], [`FakeServer::cut`], until
-//! [`FakeServer::heal`]): it answers `NO` to a chosen command, or drops the client in the middle
-//! of an answer.
+//! [`FakeServer::heal`]): it answers `NO` to a chosen command, drops the client in the middle
+//! of an answer, ends an answer short but with its `OK` ([`FakeServer::truncate`]), or refuses
+//! one message ([`FakeServer::refuse_uid`]).
 //!
 //! The SMTP side serves `EHLO`/`HELO`, `STARTTLS`, `AUTH PLAIN` and `AUTH LOGIN` (offered only
 //! over TLS; [`Builder::smtp_login_only`] drops `PLAIN`), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP`
@@ -195,6 +196,7 @@ pub struct Builder {
     fetch_delay: Duration,
     idle_keepalive: Duration,
     rules: Vec<Rule>,
+    refused_uids: Vec<u32>,
 }
 
 impl Builder {
@@ -257,6 +259,18 @@ impl Builder {
         self
     }
 
+    /// Starts as [`FakeServer::truncate`] would leave it.
+    pub fn truncate(mut self, command: &str, lines: usize) -> Self {
+        self.rules.push(Rule::new(command, Action::Truncate(lines)));
+        self
+    }
+
+    /// Starts as [`FakeServer::refuse_uid`] would leave it.
+    pub fn refuse_uid(mut self, uid: u32) -> Self {
+        self.refused_uids.push(uid);
+        self
+    }
+
     /// Generates the certificate and starts listening on four free localhost ports.
     pub async fn start(self) -> FakeServer {
         let mut folders = Vec::new();
@@ -301,6 +315,7 @@ impl Builder {
                 imap_log: Vec::new(),
                 smtp_messages: Vec::new(),
                 rules: self.rules,
+                refused_uids: self.refused_uids,
             }),
             changes: watch::channel(()).0,
             condstore: !self.without_condstore,
@@ -468,10 +483,32 @@ impl FakeServer {
             .push(Rule::new(command, Action::Cut(lines)));
     }
 
-    /// Forgets every [`refuse`](FakeServer::refuse) and [`cut`](FakeServer::cut): the server
+    /// Answers every IMAP command that starts with `command` with the first `lines` lines of its
+    /// answer only, but still ends it with its tagged `OK`: a server that forgot part of what it
+    /// should say and said it was done, as `server.truncate("EXAMINE", 3)` leaves out `EXISTS`.
+    /// Lines are counted as for [`cut`](FakeServer::cut).
+    pub fn truncate(&self, command: &str, lines: usize) {
+        self.shared
+            .state()
+            .rules
+            .push(Rule::new(command, Action::Truncate(lines)));
+    }
+
+    /// Refuses one message: every `UID FETCH` whose set holds `uid` is answered with the other
+    /// messages of the set, the one refused left out, and then `NO`, as Dovecot does with
+    /// `imap_fetch_failure = no-after` for a message it cannot read. Whatever the items asked,
+    /// sizes included; a `FETCH` by sequence number is not affected.
+    pub fn refuse_uid(&self, uid: u32) {
+        self.shared.state().refused_uids.push(uid);
+    }
+
+    /// Forgets every [`refuse`](FakeServer::refuse), [`cut`](FakeServer::cut),
+    /// [`truncate`](FakeServer::truncate) and [`refuse_uid`](FakeServer::refuse_uid): the server
     /// behaves again.
     pub fn heal(&self) {
-        self.shared.state().rules.clear();
+        let mut state = self.shared.state();
+        state.rules.clear();
+        state.refused_uids.clear();
     }
 
     /// Every message the SMTP side accepted, in order.
@@ -543,6 +580,7 @@ struct State {
     imap_log: Vec<String>,
     smtp_messages: Vec<SmtpMessage>,
     rules: Vec<Rule>,
+    refused_uids: Vec<u32>,
 }
 
 /// A misbehaviour a test asked for: what to do with the commands that start with `command`.
@@ -566,6 +604,7 @@ impl Rule {
 enum Action {
     Refuse,
     Cut(usize),
+    Truncate(usize),
 }
 
 impl State {
