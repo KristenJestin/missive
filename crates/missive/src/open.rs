@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::AsFd;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
@@ -43,20 +43,12 @@ pub async fn run(args: OpenArgs) -> Result<(), ShowError> {
     // Without the window, the original is the only view: `--original` changes nothing yet.
     let OpenArgs { id, original: _ } = args;
     let stored = read::message(&id)?;
-    let folder = runtime_dir()
-        .map_err(|_| {
-            ShowError::Failed(
-                "XDG_RUNTIME_DIR is not set, so there is no private folder for the page".to_owned(),
-            )
-        })?
-        .join("original");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&folder)
-        .map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
-    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("cannot make {} private: {e}", folder.display()))?;
+    let missive = runtime_dir().map_err(|_| {
+        ShowError::Failed(
+            "XDG_RUNTIME_DIR is not set, so there is no private folder for the page".to_owned(),
+        )
+    })?;
+    let folder = private_folder(&missive)?;
     remove_old(&folder);
 
     // Created anew (O_EXCL) under a random name, readable by the user only.
@@ -69,15 +61,48 @@ pub async fn run(args: OpenArgs) -> Result<(), ShowError> {
     file.write_all(original::page(&stored.raw).as_bytes())?;
     let (_, path) = file.keep()?;
 
-    let opened = matches!(
-        tokio::time::timeout(PORTAL_CALL, portal(&path)).await,
-        Ok(Ok(true))
-    );
-    if !opened {
+    // Only a portal that is absent, errors or says it failed leaves the page to `xdg-open`. One
+    // that is slow is asking the user (an application chooser): opening the page a second time
+    // beside it would be worse than waiting.
+    let fall_back = match tokio::time::timeout(PORTAL_CALL, portal(&path)).await {
+        Ok(Ok(opened)) => !opened,
+        Ok(Err(_)) => true,
+        Err(_) => false,
+    };
+    if fall_back {
         xdg_open(&path)?;
     }
     println!("{}", path.display());
     Ok(())
+}
+
+/// `original` in Missive's runtime folder, created if need be, and both checked: a folder
+/// that is not Missive's own (another user's, writable by others, or a symlink that sends the
+/// page somewhere else) would let someone else read or swap a page that is about to be opened in
+/// the user's browser.
+fn private_folder(missive: &Path) -> Result<PathBuf, String> {
+    let original = missive.join("original");
+    for folder in [missive, original.as_path()] {
+        match std::fs::DirBuilder::new().mode(0o700).create(folder) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("cannot create {}: {e}", folder.display())),
+        }
+        // Never through a symlink.
+        let meta = std::fs::symlink_metadata(folder)
+            .map_err(|e| format!("cannot inspect {}: {e}", folder.display()))?;
+        if !meta.is_dir()
+            || meta.uid() != rustix::process::geteuid().as_raw()
+            || meta.mode() & 0o022 != 0
+        {
+            return Err(format!(
+                "{} is not private to you (it must be a folder of yours that others cannot \
+                 write in): refusing to put a page there",
+                folder.display()
+            ));
+        }
+    }
+    Ok(original)
 }
 
 /// Removes the pages older than [`KEPT`]: there is no daemon in the way, each `open` cleans up

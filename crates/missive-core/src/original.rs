@@ -12,7 +12,9 @@
 //! - the stylesheets (`<style>`) and `style` attributes go through [`sheet`] and
 //!   [`declarations`]: only `@media` rules and plain rules stay, with the properties of
 //!   [`PROPERTIES`] and the functions of [`FUNCTIONS`]; `url()` only for a `data:` image;
-//! - a Content-Security-Policy comes first in the page, as a second line of defence.
+//! - a Content-Security-Policy comes first in the page, as a second line of defence; it does not
+//!   stop a browser from resolving the host names of the links ahead of a click, so DNS prefetch
+//!   is turned off beside it.
 //!
 //! A message with only text becomes a plain-text page: escaped, never interpreted.
 
@@ -54,6 +56,7 @@ pub fn page(raw: &[u8]) -> String {
     format!(
         "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\
          <meta http-equiv=\"Content-Security-Policy\" content=\"{POLICY}\">\
+         <meta http-equiv=\"x-dns-prefetch-control\" content=\"off\">\
          <style>{style}</style></head><body>{content}</body></html>\n"
     )
 }
@@ -509,6 +512,52 @@ mod tests {
         // Before anything of the message's.
         assert!(head.find("Content-Security-Policy") < head.find("<style>"));
         assert!(body(&page).contains("<p>Hello</p>"));
+    }
+
+    #[test]
+    fn the_page_turns_dns_prefetch_off_before_any_content() {
+        for page in [
+            html("<p>Hello</p>"),
+            html("<style>p { color: red }</style><p>Hello</p>"),
+            page(b"Subject: Hi\r\n\r\nHello\r\n"),
+        ] {
+            let head = &page[..page.find("</head>").unwrap()];
+            let control = "<meta http-equiv=\"x-dns-prefetch-control\" content=\"off\">";
+            assert!(head.contains(control), "{page}");
+            assert!(head.find(control) < head.find("<style>"), "{page}");
+            assert!(head.find(control) < page.find("<body>"), "{page}");
+        }
+    }
+
+    #[test]
+    fn no_other_prefetch_hint_is_let_through() {
+        let page = html(
+            "<link rel=\"dns-prefetch\" href=\"//a.example.net\">\
+             <link rel=\"preconnect\" href=\"https://b.example.net\">\
+             <link rel=\"prefetch\" href=\"https://c.example.net/x\">\
+             <link rel=\"preload\" href=\"https://d.example.net/x\" as=\"image\">\
+             <link rel=\"prerender\" href=\"https://e.example.net/x\">\
+             <a href=\"https://f.example.net/\" ping=\"https://g.example.net/p\" \
+             rel=\"prefetch\">link</a>",
+        );
+        lacks(
+            &page,
+            &[
+                "<link",
+                "example.net/p",
+                "a.example.net",
+                "b.example.net",
+                "c.example.net",
+                "d.example.net",
+                "e.example.net",
+                "g.example.net",
+                "ping",
+                "prefetch\" href",
+            ],
+        );
+        // The link itself stays, with no relation but the one ammonia sets.
+        assert!(body(&page).contains("f.example.net"), "{page}");
+        assert!(!body(&page).contains("rel=\"prefetch"), "{page}");
     }
 
     #[test]
