@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use ammonia::{Builder, Url, UrlRelative};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use html5ever::LocalName;
 use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::states::RawKind;
 use html5ever::tokenizer::{
@@ -39,18 +40,36 @@ const POLICY: &str = "default-src 'none'; img-src data:; style-src 'unsafe-inlin
 /// The image types a page may show: no SVG, which is a document of its own.
 const IMAGES: [&str; 4] = ["png", "gif", "jpeg", "webp"];
 
+/// The deepest nesting of elements that is cleaned. The cleaning (the parser's tree) takes time
+/// quadratic in the depth: 5 000 levels take 50 ms, 50 000 take 5 s. A browser flattens
+/// anything past 512 levels itself; no real message gets near.
+const MAX_DEPTH: usize = 1024;
+
+/// The longest HTML that is cleaned, in bytes.
+const MAX_HTML: usize = 2 * 1024 * 1024;
+
 /// The page of a raw message.
 pub fn page(raw: &[u8]) -> String {
     let body = crate::body::read(raw);
     let (style, content) = match (&body.html, &body.text) {
         (Some(html), _) => {
-            let style: Vec<String> = stylesheets(html).iter().map(|s| sheet(s)).collect();
-            (style.concat(), clean(html, images(raw)))
+            // What cannot be cleaned in a bounded time is shown as text, never half cleaned.
+            let notice = if html.len() > MAX_HTML {
+                Some("The original is too large to clean: here is its text.")
+            } else if too_deep(html) {
+                Some("The original is too deeply nested to clean: here is its text.")
+            } else {
+                None
+            };
+            match notice {
+                Some(notice) => plain(body.text.as_deref().unwrap_or(&body.readable), notice),
+                None => {
+                    let style: Vec<String> = stylesheets(html).iter().map(|s| sheet(s)).collect();
+                    (style.concat(), clean(html, images(raw)))
+                }
+            }
         }
-        (None, Some(text)) => (
-            "pre{white-space:pre-wrap}".to_owned(),
-            format!("<pre>{}</pre>", escape(&text.replace("\r\n", "\n"))),
-        ),
+        (None, Some(text)) => plain(text, ""),
         (None, None) => (String::new(), String::new()),
     };
     format!(
@@ -58,6 +77,20 @@ pub fn page(raw: &[u8]) -> String {
          <meta http-equiv=\"Content-Security-Policy\" content=\"{POLICY}\">\
          <meta http-equiv=\"x-dns-prefetch-control\" content=\"off\">\
          <style>{style}</style></head><body>{content}</body></html>\n"
+    )
+}
+
+/// The style and content of a page showing text, escaped and never interpreted, under a line
+/// saying why when `notice` is not empty.
+fn plain(text: &str, notice: &str) -> (String, String) {
+    let notice = if notice.is_empty() {
+        String::new()
+    } else {
+        format!("<p><em>{notice}</em></p>")
+    };
+    (
+        "pre{white-space:pre-wrap}".to_owned(),
+        format!("{notice}<pre>{}</pre>", escape(&text.replace("\r\n", "\n"))),
     )
 }
 
@@ -177,19 +210,12 @@ impl TokenSink for Styles {
             Token::TagToken(tag) => {
                 self.inside.set(false);
                 if tag.kind == TagKind::StartTag {
-                    match &*tag.name {
-                        "style" => {
-                            self.inside.set(true);
-                            self.sheets.borrow_mut().push(String::new());
-                            return TokenSinkResult::RawData(RawKind::Rawtext);
-                        }
-                        "script" => return TokenSinkResult::RawData(RawKind::ScriptData),
-                        "title" | "textarea" => return TokenSinkResult::RawData(RawKind::Rcdata),
-                        "xmp" | "iframe" | "noembed" | "noframes" | "noscript" => {
-                            return TokenSinkResult::RawData(RawKind::Rawtext);
-                        }
-                        "plaintext" => return TokenSinkResult::Plaintext,
-                        _ => {}
+                    if &*tag.name == "style" {
+                        self.inside.set(true);
+                        self.sheets.borrow_mut().push(String::new());
+                    }
+                    if let Some(result) = raw_text(&tag.name) {
+                        return result;
                     }
                 }
             }
@@ -199,6 +225,88 @@ impl TokenSink for Styles {
                 }
             }
             _ => {}
+        }
+        TokenSinkResult::Continue
+    }
+}
+
+/// The state a tokenizer goes to after the start tag of an element that holds raw text.
+fn raw_text(name: &str) -> Option<TokenSinkResult<()>> {
+    Some(match name {
+        "style" | "xmp" | "iframe" | "noembed" | "noframes" | "noscript" => {
+            TokenSinkResult::RawData(RawKind::Rawtext)
+        }
+        "script" => TokenSinkResult::RawData(RawKind::ScriptData),
+        "title" | "textarea" => TokenSinkResult::RawData(RawKind::Rcdata),
+        "plaintext" => TokenSinkResult::Plaintext,
+        _ => return None,
+    })
+}
+
+/// Whether the elements of an HTML document nest deeper than [`MAX_DEPTH`], in one linear pass
+/// that only counts and changes nothing of what is cleaned afterwards. It is counted twice: as
+/// the parser reads raw text (a `</div>` inside a script closes nothing), and with every tag
+/// taken for markup (a `<title>` inside an `<svg>` is no raw text for the parser, and the
+/// tokenizer cannot know). Either count over the cap is enough, so that the document is never
+/// counted shallower than the parser sees it.
+fn too_deep(html: &str) -> bool {
+    [true, false].into_iter().any(|raw| {
+        let input = BufferQueue::default();
+        input.push_back(StrTendril::from_slice(html));
+        let tokenizer = Tokenizer::new(
+            Depth {
+                raw,
+                ..Depth::default()
+            },
+            TokenizerOpts::default(),
+        );
+        let _ = tokenizer.feed(&input);
+        tokenizer.sink.deep.get()
+    })
+}
+
+/// Elements with no end tag, which open nothing.
+const VOID: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+#[derive(Default)]
+struct Depth {
+    raw: bool,
+    open: RefCell<Vec<LocalName>>,
+    deep: Cell<bool>,
+}
+
+impl TokenSink for Depth {
+    type Handle = ();
+
+    fn process_token(&self, token: Token, _line: u64) -> TokenSinkResult<()> {
+        let Token::TagToken(tag) = token else {
+            return TokenSinkResult::Continue;
+        };
+        let mut open = self.open.borrow_mut();
+        match tag.kind {
+            TagKind::StartTag => {
+                if !VOID.contains(&&*tag.name) {
+                    open.push(tag.name.clone());
+                    if open.len() > MAX_DEPTH {
+                        self.deep.set(true);
+                    }
+                }
+                if self.raw
+                    && let Some(result) = raw_text(&tag.name)
+                {
+                    return result;
+                }
+            }
+            // The nearest open element of that name, and what is inside it, closes; an end tag
+            // matching nothing is ignored, as the parser does.
+            TagKind::EndTag => {
+                if let Some(at) = open.iter().rposition(|name| *name == tag.name) {
+                    open.truncate(at);
+                }
+            }
         }
         TokenSinkResult::Continue
     }
@@ -809,5 +917,145 @@ mod tests {
         let page = page(b"\x00\x01\xff\xfe not a mail\r\n\x80");
         assert!(page.contains("Content-Security-Policy"));
         assert!(body(&page).starts_with("</head><body>"), "{page}");
+    }
+
+    /// The page of an HTML body of `inside` between `depth` times `open` and `close`.
+    fn nested(open: &str, close: &str, depth: usize, inside: &str) -> String {
+        html(&format!(
+            "{}{inside}{}",
+            open.repeat(depth),
+            close.repeat(depth)
+        ))
+    }
+
+    #[test]
+    fn a_very_deeply_nested_message_is_cleaned_in_bounded_time_and_keeps_its_text() {
+        let start = std::time::Instant::now();
+        let page = nested("<div>", "</div>", 200_000, "Deep needle text");
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_secs_f32() < 1.0, "took {elapsed:?}");
+        assert!(body(&page).contains("Deep needle text"));
+        assert!(page.contains("Content-Security-Policy"));
+        // Past the size cap here, or the depth cap: either way the text, not the markup.
+        assert!(
+            body(&page).contains("to clean: here is its text"),
+            "{}",
+            body(&page)
+        );
+        assert!(!body(&page).contains("<div"));
+    }
+
+    #[test]
+    fn nesting_under_the_size_cap_but_far_over_the_depth_cap_is_shown_as_text() {
+        let start = std::time::Instant::now();
+        let page = nested("<div>", "</div>", 100_000, "Deep needle text");
+        assert!(
+            start.elapsed().as_secs_f32() < 1.0,
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(body(&page).contains("too deeply nested"), "{}", body(&page));
+        assert!(body(&page).contains("Deep needle text"));
+    }
+
+    #[test]
+    fn a_script_or_a_remote_image_beyond_the_depth_cap_is_still_absent() {
+        let page = nested(
+            "<div>",
+            "</div>",
+            MAX_DEPTH + 10,
+            "<script>alert(1)</script><img src=\"https://evil.example.net/p.gif\" \
+             onerror=\"alert(2)\"><a href=\"javascript:alert(3)\">x</a>Kept",
+        );
+        lacks(
+            &page,
+            &[
+                "<script",
+                "<img",
+                "<a ",
+                "onerror",
+                "javascript:",
+                "evil.example.net",
+            ],
+        );
+        assert!(body(&page).contains("Kept"), "{}", body(&page));
+    }
+
+    #[test]
+    fn a_message_at_the_depth_cap_is_still_cleaned_with_its_layout() {
+        let page = nested(
+            "<div>",
+            "</div>",
+            MAX_DEPTH - 1,
+            "<p style=\"color: red\">Text</p><script>alert(1)</script>",
+        );
+        let body = body(&page);
+        assert!(body.contains("<p style=\"color:red\">Text</p>"), "{page}");
+        assert!(!body.contains("too deeply"), "{page}");
+        lacks(&page, &["<script", "alert"]);
+    }
+
+    #[test]
+    fn nesting_hidden_from_a_tokenizer_that_reads_raw_text_is_still_counted() {
+        // The parser leaves the svg title at its first `<div>`: the divs nest, while a
+        // tokenizer that took the title for raw text would see none of them.
+        let page = nested("<div>", "", MAX_DEPTH + 10, "x");
+        assert!(body(&page).contains("too deeply"));
+        let svg = html(&format!(
+            "<svg><title>{}Hidden</title></svg><script>alert(1)</script>",
+            "<div>".repeat(MAX_DEPTH + 10)
+        ));
+        assert!(body(&svg).contains("too deeply"), "{}", body(&svg));
+        lacks(&svg, &["<script", "<svg"]);
+    }
+
+    #[test]
+    fn closing_tags_written_as_script_text_do_not_hide_the_nesting() {
+        // A parser reads `</div>` inside a script as text: the div stays open.
+        let page = nested("<div><script></div></script>", "", MAX_DEPTH + 10, "x");
+        assert!(body(&page).contains("too deeply"), "{}", body(&page));
+        lacks(&page, &["<script"]);
+    }
+
+    #[test]
+    fn a_flat_message_with_many_elements_is_not_too_deep() {
+        let page =
+            html(&"<p><b>a</b><br><br><img src=\"data:image/png;base64,AAAA\"></p>".repeat(5_000));
+        assert!(!body(&page).contains("too deeply"));
+        assert!(body(&page).contains("<p><b>a</b>"));
+    }
+
+    #[test]
+    fn a_message_over_the_size_cap_is_its_text_with_a_line_saying_so() {
+        let big = format!(
+            "<p>Start</p><script>alert(1)</script>{}<p>End</p>",
+            "<p>filler</p>".repeat(MAX_HTML / 13 + 1)
+        );
+        let page = html(&big);
+        let body = body(&page);
+        assert!(body.contains("too large to clean"), "{}", &body[..200]);
+        assert!(body.contains("Start") && body.contains("End"));
+        lacks(body, &["<script", "<p>filler"]);
+    }
+
+    #[test]
+    fn the_text_alternative_is_preferred_when_the_html_is_too_deep() {
+        let page = page(
+            format!(
+                "Subject: Hi\r\nMIME-Version: 1.0\r\n\
+                 Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+                 --b\r\nContent-Type: text/plain\r\n\r\nPlain <words> here\r\n\
+                 --b\r\nContent-Type: text/html\r\n\r\n{}Html words{}\r\n--b--\r\n",
+                "<div>".repeat(MAX_DEPTH + 10),
+                "</div>".repeat(MAX_DEPTH + 10)
+            )
+            .as_bytes(),
+        );
+        assert!(
+            body(&page).contains("Plain &lt;words&gt; here"),
+            "{}",
+            body(&page)
+        );
+        assert!(body(&page).contains("too deeply"));
     }
 }
