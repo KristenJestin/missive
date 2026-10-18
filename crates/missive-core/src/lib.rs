@@ -15,6 +15,7 @@ pub mod keyring;
 pub mod original;
 pub mod outbox;
 pub mod protocol;
+pub mod reply;
 pub mod store;
 pub mod submit;
 pub mod sync;
