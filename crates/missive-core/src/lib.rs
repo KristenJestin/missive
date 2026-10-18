@@ -6,4 +6,5 @@ pub mod connect;
 #[cfg(feature = "fake")]
 pub mod fake;
 pub mod keyring;
+pub mod store;
 pub mod tls;

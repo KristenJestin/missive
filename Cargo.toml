@@ -15,9 +15,13 @@ async-imap = { version = "0.12", default-features = false, features = ["runtime-
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
+# Reads messages for the local copy: their envelope, from the raw message kept beside it.
+mail-parser = "0.11"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rpassword = "7"
+# The local copy. Bundled, so that every machine has the same SQLite, with FTS5.
+rusqlite = { version = "0.40", features = ["bundled"] }
 rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
