@@ -48,14 +48,17 @@
 //! (`basicConstraints CA:TRUE`), like Proton Mail Bridge's: a standard webpki client refuses it,
 //! a client pinning [`FakeServer::certificate_pem`] accepts it.
 //!
-//! [`FakeKeyring`] is the keyring's counterpart: a fake Secret Service on a private session bus.
+//! [`FakeKeyring`] is the keyring's counterpart: a fake Secret Service on a private session bus;
+//! [`FakePortal`], a fake desktop portal that opens files, on another.
 
 mod bus;
 mod imap;
 mod keyring;
+mod portal;
 mod smtp;
 
 pub use keyring::{FakeItem, FakeKeyring, PromptAnswer};
+pub use portal::{FakePortal, PortalAnswer, PortalCall};
 
 use std::future::Future;
 use std::net::SocketAddr;
