@@ -647,11 +647,20 @@ impl Worker {
                         folder.row.id
                     );
                 }
+                if changes.refused > 0 {
+                    log!(
+                        "account {} folder {} ({role}): {} refused by the server, asked again at \
+                         the next pass",
+                        self.key,
+                        folder.row.id,
+                        changes.refused
+                    );
+                }
                 Ok(changes)
             }
             None => {
                 log!(
-                    "account {} folder {} ({role}): the server refused to examine it",
+                    "account {} folder {} ({role}): the server refused to examine or list it",
                     self.key,
                     folder.row.id
                 );

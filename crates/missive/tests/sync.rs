@@ -293,14 +293,25 @@ impl Env {
     /// Every table of the copy, row by row, without what depends on when things happened (the
     /// time of the last sync) or on the order rows were written (a message's row number).
     fn dump(&self) -> Vec<String> {
-        let copy = self.copy().unwrap();
-        let mut rows = Vec::new();
-        for query in [
-            "SELECT key, id, state FROM account ORDER BY key",
+        let mut rows = self.rows(&["SELECT key, id, state FROM account ORDER BY key"]);
+        rows.extend(self.mail());
+        rows
+    }
+
+    /// The folders and messages of the copy, as [`Env::dump`] gives them: what a sync must never
+    /// lose.
+    fn mail(&self) -> Vec<String> {
+        self.rows(&[
             "SELECT id, account, name, role, uidvalidity, highest_modseq FROM folder ORDER BY id",
             "SELECT folder, uid, flags, internal_date, size, date, subject, sender, recipients, \
              cc, message_id, hex(raw) FROM message ORDER BY folder, uid",
-        ] {
+        ])
+    }
+
+    fn rows(&self, queries: &[&str]) -> Vec<String> {
+        let copy = self.copy().unwrap();
+        let mut rows = Vec::new();
+        for query in queries {
             let mut statement = copy.prepare(query).unwrap();
             let columns = statement.column_count();
             let mut result = statement.query([]).unwrap();
@@ -663,6 +674,129 @@ async fn a_uidvalidity_change_of_the_inbox_while_idling_in_it_rebuilds_it_after_
     assert_eq!(logins(&server, USER), 2);
     assert_eq!(env.flags("INBOX", 1).unwrap(), "\\Flagged");
     succeeded(&env.sync().await);
+}
+
+/// Syncs the mailbox, lets `break_server` make the server misbehave, syncs again: the copy's
+/// folders and messages must be what they were. Returns the second sync's output.
+async fn a_broken_listing_changes_nothing(
+    server: &FakeServer,
+    break_server: impl FnOnce(&FakeServer),
+) -> (Env, Daemon, Output) {
+    let env = Env::new().await;
+    env.add_account("alice", server, USER, Some(PASSWORD)).await;
+    let daemon = env.daemon(&["--check-interval", "3600"]).await;
+    succeeded(&env.sync().await);
+    let before = env.mail();
+    assert_eq!(env.uids("INBOX"), [1, 2, 3]);
+
+    break_server(server);
+    let output = sync_soon(&env).await;
+
+    assert_eq!(
+        env.mail(),
+        before,
+        "the copy changed; the log:\n{}",
+        env.logs()
+    );
+    (env, daemon, output)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flag_listing_cut_short_without_condstore_removes_nothing() {
+    let server = mailbox().without_condstore().start().await;
+
+    let (env, _daemon, output) = a_broken_listing_changes_nothing(&server, |server| {
+        server.cut("UID FETCH 1:* (FLAGS", 1);
+    })
+    .await;
+
+    failed(&output);
+    assert_eq!(stdout(&output), "alice: unreachable\n");
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(env.uids("INBOX"), [1, 2, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_uid_search_answered_no_with_condstore_removes_nothing() {
+    let server = mailbox().start().await;
+
+    let (env, _daemon, _) = a_broken_listing_changes_nothing(&server, |server| {
+        server.refuse("UID SEARCH");
+    })
+    .await;
+
+    assert!(
+        env.logs()
+            .contains("the server refused to examine or list it"),
+        "{}",
+        env.logs()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_examine_cut_after_its_uidvalidity_removes_nothing() {
+    let server = mailbox().start().await;
+
+    let (_env, _daemon, output) = a_broken_listing_changes_nothing(&server, |server| {
+        // FLAGS, PERMANENTFLAGS, UIDVALIDITY, and no EXISTS.
+        server.cut("EXAMINE \"INBOX\"", 3);
+    })
+    .await;
+
+    failed(&output);
+    assert_eq!(stdout(&output), "alice: unreachable\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changedsince_listing_cut_short_does_not_move_the_sync_point() {
+    let server = mailbox().start().await;
+
+    let (env, _daemon, output) = a_broken_listing_changes_nothing(&server, |server| {
+        // Cut first: the daemon idling in the inbox hears of the change at once.
+        server.cut("UID FETCH 1:* (FLAGS) (CHANGEDSINCE", 0);
+        server.set_flags("INBOX", 3, &["\\Seen"]);
+    })
+    .await;
+
+    failed(&output);
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(env.flags("INBOX", 3).unwrap(), "\\Seen");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_the_server_refuses_to_send_is_skipped_and_asked_again_at_the_next_pass() {
+    let server = mailbox().start().await;
+    server.refuse("UID FETCH 2 (UID FLAGS");
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env
+        .daemon(&["--check-interval", "3600", "--batch-size", "1"])
+        .await;
+    let asked = || {
+        server
+            .imap_log()
+            .iter()
+            .filter(|c| c.starts_with("UID FETCH 2 (UID FLAGS"))
+            .count()
+    };
+
+    succeeded(&sync_soon(&env).await);
+
+    assert_eq!(env.uids("INBOX"), [1, 3]);
+    assert!(env.logs().contains("1 refused"), "{}", env.logs());
+    // Asked by the pass, and by the sync of the inbox before IDLE; then no more until the next
+    // sync of the inbox.
+    eventually(10, "IDLE", || server.imap_log().iter().any(|c| c == "IDLE")).await;
+    let asked_once = asked();
+    assert!((1..=2).contains(&asked_once), "{asked_once}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(asked(), asked_once);
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(env.uids("INBOX"), [1, 2, 3]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
