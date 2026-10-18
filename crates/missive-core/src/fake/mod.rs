@@ -25,8 +25,8 @@
 //! `UID FETCH`, `SEARCH` and `UID SEARCH` (`HEADER` included), `IDLE`, CONDSTORE
 //! (`HIGHESTMODSEQ`, `MODSEQ`, `CHANGEDSINCE`) unless [`Builder::without_condstore`] is used, and
 //! what changes messages in a folder selected read-write: `STORE` and `UID STORE`, `UID COPY`,
-//! `UID MOVE` (RFC 6851) unless [`Builder::without_move`], and UIDPLUS (`COPYUID`,
-//! `UID EXPUNGE`, RFC 4315) unless [`Builder::without_uidplus`]. Anything else, a bare `EXPUNGE`
+//! `UID MOVE` (RFC 6851) unless [`Builder::without_move`], UIDPLUS (`COPYUID`, `APPENDUID`,
+//! `UID EXPUNGE`, RFC 4315) unless [`Builder::without_uidplus`], and `APPEND` (flags, no date). Anything else, a bare `EXPUNGE`
 //! among them, is answered `BAD` (and logged), so a client using more than this fails loudly
 //! rather than silently.
 //!
