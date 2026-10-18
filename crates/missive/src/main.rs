@@ -1,6 +1,9 @@
+mod daemon;
+
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use missive_core::account::{
@@ -8,7 +11,9 @@ use missive_core::account::{
 };
 use missive_core::connect::{ConnectError, check_imap, check_smtp, client_config};
 use missive_core::keyring::Keyring;
+use missive_core::protocol::{Answer, Command as Request, PROTOCOL};
 use serde::Serialize;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 // A release build names its version in MISSIVE_VERSION (the tag it is published under, with its
 // `v`); Cargo.toml stays at 0.0.0. A local build has no such name and says what it is.
@@ -29,6 +34,27 @@ enum Command {
     /// Add, list and remove accounts.
     #[command(subcommand)]
     Account(AccountCommand),
+    /// Sync every account now, or one, and say each one's connection state. Starts the daemon
+    /// when none runs.
+    Sync {
+        /// The account's identifier, as `account list` shows it [default: every account].
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Run the daemon in the foreground: it keeps the local copy of every account up to date.
+    /// SIGTERM or SIGINT stops it.
+    Daemon(DaemonArgs),
+}
+
+#[derive(Args)]
+struct DaemonArgs {
+    /// How often, in seconds, the folders other than the inbox are checked; new mail in the inbox
+    /// comes at once, through IDLE.
+    #[arg(long, value_name = "SECONDS", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    check_interval: u64,
+    /// How many new messages are fetched, and written to the local copy, at a time.
+    #[arg(long, value_name = "N", default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..10_000))]
+    batch_size: u64,
 }
 
 #[derive(Subcommand)]
@@ -122,6 +148,13 @@ async fn main() -> ExitCode {
         Command::Account(AccountCommand::Add(args)) => add(args).await,
         Command::Account(AccountCommand::List { json }) => list(json),
         Command::Account(AccountCommand::Remove { id }) => remove(&id).await,
+        Command::Sync { account } => sync(account).await,
+        Command::Daemon(args) => daemon::run(daemon::Options {
+            check_interval: Duration::from_secs(args.check_interval),
+            batch_size: args.batch_size as usize,
+        })
+        .await
+        .map_err(Failure),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -274,6 +307,51 @@ async fn remove(id: &str) -> Result<()> {
     store.remove(id)?;
     println!("Removed the account {id}.");
     Ok(())
+}
+
+async fn sync(account: Option<String>) -> Result<()> {
+    let stream = daemon::connect().await.map_err(Failure)?;
+    let (read, mut write) = stream.into_split();
+    let request = missive_core::protocol::Request {
+        protocol: PROTOCOL,
+        command: Request::Sync { account },
+    };
+    let mut line = serde_json::to_string(&request)?;
+    line.push('\n');
+    write.write_all(line.as_bytes()).await?;
+    let mut line = String::new();
+    BufReader::new(read).read_line(&mut line).await?;
+    let answer: Answer = serde_json::from_str(&line)
+        .map_err(|_| Failure("the daemon gave an answer this missive cannot read".to_owned()))?;
+    if !answer.ok {
+        return Err(Failure(answer.message.unwrap_or_else(|| {
+            format!("the daemon refused: {}", answer.error.unwrap_or_default())
+        })));
+    }
+    let accounts = answer.accounts.unwrap_or_default();
+    if accounts.is_empty() {
+        return Err(Failure(
+            "there is no account to sync (missive account add adds one)".to_owned(),
+        ));
+    }
+    let mut failed = Vec::new();
+    for account in &accounts {
+        println!("{}: {}", account.id, account.state);
+        let why = match account.state.as_str() {
+            "ready" => continue,
+            "no-login" => "the keyring holds no password for it",
+            "auth-refused" => "the server refused the user name or password",
+            "certificate-refused" => "the server's certificate is not trusted",
+            "unreachable" => "the server cannot be reached now; the daemon tries again by itself",
+            _ => "it is not synced",
+        };
+        failed.push(format!("{}: {}: {why}", account.id, account.state));
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(Failure(failed.join("\nmissive: ")))
+    }
 }
 
 /// Asks for what the options did not give, on a terminal; elsewhere, collects what is missing to

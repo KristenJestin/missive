@@ -770,14 +770,17 @@ dependencies = [
 name = "missive"
 version = "0.0.0"
 dependencies = [
+ "async-imap",
  "clap",
  "missive-core",
  "rpassword",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "zbus",
 ]
 
 [[package]]

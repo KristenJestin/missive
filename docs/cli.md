@@ -92,3 +92,43 @@ content of the file). Standard output stays valid, and the exit status is still 
 
 Removes the account's keyring entry, then its settings and certificate. The keyring goes first:
 if it is unavailable, the account stays whole and the command can be run again.
+
+## The local copy
+
+Missive keeps a copy of each account in `$XDG_DATA_HOME/missive/copy.sqlite` (or
+`~/.local/share/missive/…`): folders, messages, flags and each account's connection state. Only
+the daemon talks to the servers and writes the copy, and it never changes anything on a server:
+it only reads.
+
+### `missive sync [--account <id>]`
+
+Asks the daemon to sync every account now, or one, waits until that sync has ended, and prints
+each account's connection state, one line per account:
+
+```
+alice: ready
+bob: auth-refused
+```
+
+When no daemon answers, `sync` starts one in the background first; its log goes to
+`$XDG_STATE_HOME/missive/daemon.log` (or `~/.local/state/missive/…`). The exit status is success
+only when every account is `ready`; for the others, standard error says why. The states are those
+of `docs/protocol.md`; `unreachable` never asks to log in again, the daemon tries again by itself.
+
+### `missive daemon`
+
+Runs the daemon in the foreground, logging to standard error. One daemon runs per user: a second
+one refuses to start. SIGTERM or SIGINT (Ctrl-C) stops it cleanly.
+
+| Option | Value | Default |
+|---|---|---|
+| `--check-interval` | how often, in seconds, the folders other than the inbox are checked | 300 |
+| `--batch-size` | how many new messages are fetched, and written to the copy, at a time | 50 |
+
+New mail in the inbox comes at once, through IDLE, which is issued again at each check (and at
+least every 25 minutes). A first sync goes inbox first, newest first: the copy is usable from its
+first batch on.
+
+The log says what happened in counts, durations, folder roles and error kinds. It names an
+account by its number in the copy and a folder by its id there, never by its name, and never
+shows a subject, an address or a message.
