@@ -42,6 +42,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add rustfmt clippy
+      # The window's dependencies (GPUI) doubled the time of this job: they are compiled once and
+      # restored from the cache after that.
+      - uses: Swatinem/rust-cache@v2
       # The keyring tests start their own private bus (see `missive_core::fake::FakeKeyring`).
       - name: Have dbus-daemon
         run: command -v dbus-daemon || { sudo apt-get update && sudo apt-get install -y dbus-daemon; }
