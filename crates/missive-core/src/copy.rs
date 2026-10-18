@@ -9,7 +9,7 @@
 //! UIDVALIDITY its UIDs belong to, and the UID. The row number of a message in the copy would be
 //! shorter, but it is lost when a folder is rebuilt after the server renumbered it; with this
 //! one, a later `open` can tell "that message is gone" from "that is another message now" by
-//! comparing the UIDVALIDITY.
+//! comparing the UIDVALIDITY: [`Copy::message`] does, and says which of the two it is.
 
 use std::path::Path;
 use std::time::Duration;
@@ -32,6 +32,41 @@ pub fn message_id(account: &str, folder: i64, uidvalidity: u32, uid: u32) -> Str
 /// The first schema version that has the search index.
 const SEARCH_VERSION: i64 = 2;
 
+/// The first schema version that says whether a message has an attachment.
+const ATTACHMENTS_VERSION: i64 = 3;
+
+/// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
+/// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageId {
+    pub account: String,
+    pub folder: i64,
+    /// `0` for a folder that had not been examined when the identifier was made.
+    pub uidvalidity: u32,
+    pub uid: u32,
+}
+
+impl MessageId {
+    pub fn parse(id: &str) -> Option<MessageId> {
+        let parts: Vec<&str> = id.split('/').collect();
+        let [account, folder, uidvalidity, uid] = parts[..] else {
+            return None;
+        };
+        // `parse` accepts a sign and leading zeros; writing the number back refuses them.
+        fn number<T: std::str::FromStr + ToString>(text: &str) -> Option<T> {
+            let number: T = text.parse().ok()?;
+            (number.to_string() == text).then_some(number)
+        }
+        (!account.is_empty()).then_some(())?;
+        Some(MessageId {
+            account: account.to_owned(),
+            folder: number(folder)?,
+            uidvalidity: number(uidvalidity)?,
+            uid: number(uid)?,
+        })
+    }
+}
+
 /// Why the copy could not be read.
 #[derive(Debug)]
 pub enum CopyError {
@@ -40,6 +75,8 @@ pub enum CopyError {
     Later(i64),
     /// The copy is older than the search index: the daemon adds it the next time it starts.
     NotIndexed,
+    /// The copy is older than the attachment marker: the daemon adds it the next time it starts.
+    NoAttachmentMarker,
 }
 
 impl std::fmt::Display for CopyError {
@@ -54,6 +91,11 @@ impl std::fmt::Display for CopyError {
             CopyError::NotIndexed => write!(
                 f,
                 "the local copy has no search index yet: it is built when the daemon next \
+                 starts (missive sync starts it)"
+            ),
+            CopyError::NoAttachmentMarker => write!(
+                f,
+                "the local copy has no attachment marker yet: it is added when the daemon next \
                  starts (missive sync starts it)"
             ),
         }
@@ -152,6 +194,114 @@ pub struct Hit {
     pub unread: bool,
 }
 
+/// What a list asks for.
+#[derive(Clone, Debug)]
+pub struct List {
+    /// The accounts to look in, by identifier.
+    pub accounts: Vec<String>,
+    /// The folders to list: those with this role or this name (the server's, as `unread` shows
+    /// it). Both `None`: every folder.
+    pub role: Option<String>,
+    pub name: Option<String>,
+    /// Only the messages without `\Seen`, and not marked `\Deleted`: those `unread` counts.
+    pub unread: bool,
+    pub limit: usize,
+}
+
+/// A message of a list: a search hit, and what a list shows more.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Listed {
+    #[serde(flatten)]
+    pub hit: Hit,
+    pub flagged: bool,
+    pub answered: bool,
+    /// The size the server gave (`RFC822.SIZE`), in bytes.
+    pub size: u64,
+    pub has_attachments: bool,
+}
+
+/// A message as the copy holds it, found by its identifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stored {
+    pub hit: Hit,
+    pub flagged: bool,
+    pub answered: bool,
+    pub size: u64,
+    pub cc: Vec<Person>,
+    pub message_id: Option<String>,
+    /// The message exactly as the server sent it.
+    pub raw: Vec<u8>,
+}
+
+/// Why an identifier names no message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotFound {
+    /// It is not an identifier at all.
+    Invalid,
+    /// The account, the folder or the UID is not in the copy: never was, or the message is gone.
+    Unknown,
+    /// The folder is in the copy under another UIDVALIDITY: the server renumbered it, so the
+    /// UID of the identifier may now name another message, which is not shown.
+    Renumbered(String),
+}
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotFound::Invalid => write!(
+                f,
+                "not a message identifier (expected <account>/<folder>/<uidvalidity>/<uid>, as \
+                 missive search and list print it)"
+            ),
+            NotFound::Unknown => write!(f, "no such message in the local copy"),
+            NotFound::Renumbered(folder) => write!(
+                f,
+                "no such message: the server renumbered the folder {folder} since this \
+                 identifier was made (its UIDVALIDITY changed); missive list gives the current ones"
+            ),
+        }
+    }
+}
+
+fn has_flag(flags: &str, flag: &str) -> bool {
+    flags.split(' ').any(|f| f.eq_ignore_ascii_case(flag))
+}
+
+/// The columns of [`hit`], in this order.
+const HIT_COLUMNS: &str = "account.id, folder.id, folder.name, folder.role, folder.uidvalidity,
+    message.uid, coalesce(message.date, message.internal_date), message.subject,
+    message.sender, message.recipients, message.flags";
+
+/// A hit from a row that starts with [`HIT_COLUMNS`]; the flags it read are the last of them.
+fn hit(r: &rusqlite::Row) -> rusqlite::Result<(Hit, String)> {
+    let account: String = r.get(0)?;
+    let folder = FolderRef {
+        id: r.get(1)?,
+        name: r.get(2)?,
+        role: r.get(3)?,
+    };
+    let uidvalidity: Option<u32> = r.get(4)?;
+    let uid: u32 = r.get(5)?;
+    let people = |column: usize| -> rusqlite::Result<Vec<Person>> {
+        let json: String = r.get(column)?;
+        Ok(serde_json::from_str(&json).unwrap_or_default())
+    };
+    let flags: String = r.get(10)?;
+    let hit = Hit {
+        id: message_id(&account, folder.id, uidvalidity.unwrap_or(0), uid),
+        account,
+        folder,
+        uidvalidity,
+        uid,
+        date: r.get(6)?,
+        subject: r.get(7)?,
+        from: people(8)?,
+        to: people(9)?,
+        unread: !has_flag(&flags, "\\Seen"),
+    };
+    Ok((hit, flags))
+}
+
 impl Copy {
     /// Opens the copy read only. `None` when there is none yet: no file, or one the daemon has
     /// created and not yet given its schema.
@@ -246,10 +396,8 @@ impl Copy {
             return Ok(Vec::new());
         };
         let accounts = serde_json::to_string(&search.accounts).expect("strings serialize");
-        let mut statement = self.connection.prepare_cached(
-            "SELECT account.id, folder.id, folder.name, folder.role, folder.uidvalidity,
-                    message.uid, coalesce(message.date, message.internal_date), message.subject,
-                    message.sender, message.recipients, message.flags
+        let mut statement = self.connection.prepare_cached(&format!(
+            "SELECT {HIT_COLUMNS}
                FROM message_search
                JOIN message ON message.id = message_search.rowid
                JOIN folder ON folder.id = message.folder
@@ -258,42 +406,114 @@ impl Copy {
                 AND account.id IN (SELECT value FROM json_each(?2))
                 AND (?3 IS NULL OR folder.role = ?3)
               ORDER BY coalesce(message.date, message.internal_date) DESC, message.id DESC
-              LIMIT ?4",
-        )?;
+              LIMIT ?4"
+        ))?;
         let role = search.role.clone().map_or(Value::Null, Value::Text);
         let rows = statement.query_map(
             params![expression, accounts, role, search.limit as i64],
+            |r| Ok(hit(r)?.0),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The messages of the folders `list` names, newest first (`Date`, else the internal date).
+    pub fn list(&self, list: &List) -> Result<Vec<Listed>> {
+        if self.version < ATTACHMENTS_VERSION {
+            return Err(CopyError::NoAttachmentMarker);
+        }
+        let accounts = serde_json::to_string(&list.accounts).expect("strings serialize");
+        let mut statement = self.connection.prepare_cached(&format!(
+            "SELECT {HIT_COLUMNS}, message.size, message.has_attachments
+               FROM message
+               JOIN folder ON folder.id = message.folder
+               JOIN account ON account.key = folder.account
+              WHERE account.id IN (SELECT value FROM json_each(?1))
+                AND (?2 IS NULL AND ?3 IS NULL OR folder.role = ?2 OR folder.name = ?3)
+                AND (NOT ?4 OR (' ' || message.flags || ' ' NOT LIKE '% \\Seen %'
+                            AND ' ' || message.flags || ' ' NOT LIKE '% \\Deleted %'))
+              ORDER BY coalesce(message.date, message.internal_date) DESC, message.id DESC
+              LIMIT ?5"
+        ))?;
+        let text = |text: &Option<String>| text.clone().map_or(Value::Null, Value::Text);
+        let rows = statement.query_map(
+            params![
+                accounts,
+                text(&list.role),
+                text(&list.name),
+                list.unread,
+                list.limit as i64
+            ],
             |r| {
-                let account: String = r.get(0)?;
-                let folder = FolderRef {
-                    id: r.get(1)?,
-                    name: r.get(2)?,
-                    role: r.get(3)?,
-                };
-                let uidvalidity: Option<u32> = r.get(4)?;
-                let uid: u32 = r.get(5)?;
-                let people = |column: usize| -> rusqlite::Result<Vec<Person>> {
-                    let json: String = r.get(column)?;
-                    Ok(serde_json::from_str(&json).unwrap_or_default())
-                };
-                let flags: String = r.get(10)?;
-                Ok(Hit {
-                    id: message_id(&account, folder.id, uidvalidity.unwrap_or(0), uid),
-                    account,
-                    folder,
-                    uidvalidity,
-                    uid,
-                    date: r.get(6)?,
-                    subject: r.get(7)?,
-                    from: people(8)?,
-                    to: people(9)?,
-                    unread: !flags
-                        .split(' ')
-                        .any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+                let (hit, flags) = hit(r)?;
+                Ok(Listed {
+                    hit,
+                    flagged: has_flag(&flags, "\\Flagged"),
+                    answered: has_flag(&flags, "\\Answered"),
+                    size: r.get::<_, i64>(11)? as u64,
+                    has_attachments: r.get(12)?,
                 })
             },
         )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The message an identifier names, with its raw message. Whether the identifier is one, and
+    /// whether it still names a message, is the answer's to say ([`NotFound`]) and not an error:
+    /// the identifier of a message that has gone since it was printed is what a caller will meet.
+    pub fn message(&self, id: &str) -> Result<std::result::Result<Stored, NotFound>> {
+        let Some(id) = MessageId::parse(id) else {
+            return Ok(Err(NotFound::Invalid));
+        };
+        let folder: Option<(String, Option<u32>)> = self
+            .connection
+            .prepare_cached(
+                "SELECT folder.name, folder.uidvalidity FROM folder
+                   JOIN account ON account.key = folder.account
+                  WHERE account.id = ?1 AND folder.id = ?2",
+            )?
+            .query_row(params![id.account, id.folder], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })?;
+        let Some((name, uidvalidity)) = folder else {
+            return Ok(Err(NotFound::Unknown));
+        };
+        if uidvalidity.unwrap_or(0) != id.uidvalidity {
+            return Ok(Err(NotFound::Renumbered(name)));
+        }
+        let stored = self
+            .connection
+            .prepare_cached(&format!(
+                "SELECT {HIT_COLUMNS}, message.size, message.cc, message.message_id,
+                        message_raw.raw
+                   FROM message
+                   JOIN folder ON folder.id = message.folder
+                   JOIN account ON account.key = folder.account
+                   JOIN message_raw ON message_raw.message = message.id
+                  WHERE account.id = ?1 AND folder.id = ?2 AND message.uid = ?3"
+            ))?
+            .query_row(params![id.account, id.folder, id.uid], |r| {
+                let (hit, flags) = hit(r)?;
+                let cc: String = r.get(12)?;
+                Ok(Stored {
+                    hit,
+                    flagged: has_flag(&flags, "\\Flagged"),
+                    answered: has_flag(&flags, "\\Answered"),
+                    size: r.get::<_, i64>(11)? as u64,
+                    cc: serde_json::from_str(&cc).unwrap_or_default(),
+                    message_id: r.get(13)?,
+                    raw: r.get(14)?,
+                })
+            });
+        match stored {
+            Ok(stored) => Ok(Ok(stored)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(Err(NotFound::Unknown)),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -357,6 +577,168 @@ mod tests {
         .iter()
         .map(|hit| hit.uid)
         .collect()
+    }
+
+    #[test]
+    fn an_identifier_is_read_back_exactly_as_it_is_written() {
+        let id = message_id("alice@example.org", 12, 1745112, 4);
+        assert_eq!(
+            MessageId::parse(&id),
+            Some(MessageId {
+                account: "alice@example.org".to_owned(),
+                folder: 12,
+                uidvalidity: 1745112,
+                uid: 4
+            })
+        );
+        // A folder not yet examined is written with a UIDVALIDITY of 0.
+        assert!(MessageId::parse("alice/1/0/1").is_some());
+        for wrong in [
+            "",
+            "alice",
+            "alice/1/2",
+            "alice/1/2/3/4",
+            "/1/2/3",
+            "alice/+1/2/3",
+            "alice/1/02/3",
+            "alice/1/2/ 3",
+            "alice/1/2/3 ",
+            "alice/x/2/3",
+            "alice/1/2/-3",
+            "alice/1/2/4294967296",
+            "alice/1/2/",
+        ] {
+            assert_eq!(MessageId::parse(wrong), None, "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn a_message_is_found_by_its_identifier_with_its_raw_message() {
+        let (_dir, mut store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        let folder = store.folder(alice, "INBOX", Some("inbox")).unwrap().id;
+        store.rebuild(folder, 77).unwrap();
+        let sent = message(
+            5,
+            "\\Seen \\Flagged",
+            "Sat, 17 Oct 2026 09:30:00 +0000",
+            "A",
+            "b",
+        );
+        let raw = sent.raw.clone();
+        store.insert(folder, &[sent]).unwrap();
+
+        let found = copy
+            .message(&message_id("alice", folder, 77, 5))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.raw, raw);
+        assert_eq!(found.hit.subject.as_deref(), Some("A"));
+        assert!(!found.hit.unread);
+        assert!(found.flagged);
+        assert!(!found.answered);
+        assert_eq!(found.size, raw.len() as u64);
+    }
+
+    #[test]
+    fn an_identifier_that_names_no_message_says_why() {
+        let (_dir, mut store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        let folder = store.folder(alice, "INBOX", Some("inbox")).unwrap().id;
+        store.rebuild(folder, 77).unwrap();
+        store
+            .insert(
+                folder,
+                &[message(5, "", "Sat, 17 Oct 2026 09:30:00 +0000", "A", "b")],
+            )
+            .unwrap();
+        let missing = |id: String| copy.message(&id).unwrap().unwrap_err();
+
+        assert_eq!(missing("alice/1".to_owned()), NotFound::Invalid);
+        assert_eq!(
+            missing(message_id("alice", folder, 77, 6)),
+            NotFound::Unknown
+        );
+        assert_eq!(
+            missing(message_id("alice", folder + 1, 77, 5)),
+            NotFound::Unknown
+        );
+        assert_eq!(missing(message_id("bob", folder, 77, 5)), NotFound::Unknown);
+        // The UID is there, but under another UIDVALIDITY: not that message, and said so, whether
+        // or not the UID exists.
+        assert_eq!(
+            missing(message_id("alice", folder, 78, 5)),
+            NotFound::Renumbered("INBOX".to_owned())
+        );
+        assert_eq!(
+            missing(message_id("alice", folder, 78, 6)),
+            NotFound::Renumbered("INBOX".to_owned())
+        );
+        // A folder never examined is written with 0, and only that finds its messages.
+        let fresh = store.folder(alice, "Fresh", None).unwrap().id;
+        assert_eq!(missing(message_id("alice", fresh, 0, 1)), NotFound::Unknown);
+        assert_eq!(
+            missing(message_id("alice", fresh, 1, 1)),
+            NotFound::Renumbered("Fresh".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_list_is_newest_first_and_follows_role_name_unread_and_limit() {
+        let (_dir, mut store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        let inbox = store.folder(alice, "INBOX", Some("inbox")).unwrap().id;
+        let other = store.folder(alice, "Other", None).unwrap().id;
+        store
+            .insert(
+                inbox,
+                &[
+                    message(1, "\\Seen", "Sat, 17 Oct 2026 09:30:00 +0000", "Old", "b"),
+                    message(2, "", "Sat, 17 Oct 2026 09:32:00 +0000", "New", "b"),
+                    message(
+                        3,
+                        "\\Deleted",
+                        "Sat, 17 Oct 2026 09:31:00 +0000",
+                        "Mid",
+                        "b",
+                    ),
+                ],
+            )
+            .unwrap();
+        store
+            .insert(
+                other,
+                &[message(
+                    1,
+                    "",
+                    "Sat, 17 Oct 2026 09:33:00 +0000",
+                    "Other",
+                    "b",
+                )],
+            )
+            .unwrap();
+        let list = |role: Option<&str>, name: Option<&str>, unread: bool, limit: usize| {
+            copy.list(&List {
+                accounts: vec!["alice".to_owned()],
+                role: role.map(str::to_owned),
+                name: name.map(str::to_owned),
+                unread,
+                limit,
+            })
+            .unwrap()
+            .iter()
+            .map(|m| m.hit.subject.clone().unwrap())
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(list(Some("inbox"), None, false, 10), ["New", "Mid", "Old"]);
+        assert_eq!(list(Some("inbox"), None, false, 2), ["New", "Mid"]);
+        // What `unread` counts: not seen and not marked deleted.
+        assert_eq!(list(Some("inbox"), None, true, 10), ["New"]);
+        assert_eq!(list(None, Some("Other"), false, 10), ["Other"]);
+        assert_eq!(list(Some("INBOX"), None, false, 10).len(), 0);
+        assert_eq!(list(None, None, false, 10), ["Other", "New", "Mid", "Old"]);
     }
 
     #[test]
