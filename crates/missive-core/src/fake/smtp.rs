@@ -29,6 +29,9 @@ pub(super) async fn serve(
         let Some(line) = read_line(&mut io).await else {
             return;
         };
+        if let Some(delay) = shared.smtp_delay(&line) {
+            tokio::time::sleep(delay).await;
+        }
         let (verb, argument) = line.split_once(' ').unwrap_or((&line, ""));
         let verb = verb.to_ascii_uppercase();
         if matches!(verb.as_str(), "MAIL" | "RCPT" | "DATA")

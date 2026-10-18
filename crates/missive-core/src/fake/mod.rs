@@ -48,7 +48,8 @@
 //! and `QUIT`, and records each message it accepted ([`FakeServer::smtp_messages`]). It can
 //! answer a chosen reply to `MAIL`, `RCPT`, `DATA` or the end of data
 //! ([`FakeServer::smtp_answer`]), or take a message and drop the connection before answering its
-//! end of data ([`FakeServer::smtp_cut_after_data`]), until [`FakeServer::heal`].
+//! end of data ([`FakeServer::smtp_cut_after_data`]), or wait before answering a command
+//! ([`FakeServer::smtp_delay`]), until [`FakeServer::heal`].
 //!
 //! Both sides listen twice: once in clear with STARTTLS (no login before TLS), once with implicit
 //! TLS. The certificate is self-signed for `localhost` and `127.0.0.1` and marked as a CA
@@ -379,6 +380,8 @@ impl Builder {
                 rules: self.rules,
                 refused_uids: self.refused_uids,
                 smtp_rules: self.smtp_rules,
+                smtp_delays: Vec::new(),
+                smtp_delayed: 0,
             }),
             changes: watch::channel(()).0,
             condstore: !self.without_condstore,
@@ -594,6 +597,7 @@ impl FakeServer {
         state.rules.clear();
         state.refused_uids.clear();
         state.smtp_rules.clear();
+        state.smtp_delays.clear();
     }
 
     /// Answers `reply` (`451 4.3.0 try again later`, `550 5.1.1 no such user`…) to every SMTP
@@ -615,6 +619,21 @@ impl FakeServer {
             command: ".".to_owned(),
             reply: None,
         });
+    }
+
+    /// Waits `delay` before answering every SMTP command that starts with `command`, like a slow
+    /// server. Until [`FakeServer::heal`].
+    pub fn smtp_delay(&self, command: &str, delay: Duration) {
+        self.shared
+            .state()
+            .smtp_delays
+            .push((command.to_ascii_uppercase(), delay));
+    }
+
+    /// How many SMTP answers [`FakeServer::smtp_delay`] has held so far, the one being held
+    /// included.
+    pub fn smtp_delayed(&self) -> usize {
+        self.shared.state().smtp_delayed
     }
 
     /// Every message the SMTP side accepted, in order.
@@ -681,6 +700,19 @@ impl Shared {
             .map(|rule| rule.reply.clone())
     }
 
+    /// How long a test asked the SMTP side to wait before answering this command line; counted.
+    fn smtp_delay(&self, line: &str) -> Option<Duration> {
+        let line = line.to_ascii_uppercase();
+        let mut state = self.state();
+        let delay = state
+            .smtp_delays
+            .iter()
+            .find(|(command, _)| line.starts_with(command.as_str()))
+            .map(|(_, delay)| *delay)?;
+        state.smtp_delayed += 1;
+        Some(delay)
+    }
+
     fn knows(&self, user: &str) -> bool {
         self.state().users.iter().any(|(u, _)| u == user)
     }
@@ -701,6 +733,8 @@ struct State {
     rules: Vec<Rule>,
     refused_uids: Vec<u32>,
     smtp_rules: Vec<SmtpRule>,
+    smtp_delays: Vec<(String, Duration)>,
+    smtp_delayed: usize,
 }
 
 /// What a test asked the SMTP side to answer to the commands that start with `command`.
