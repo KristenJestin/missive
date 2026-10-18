@@ -14,7 +14,9 @@
 //!    `UID FETCH 1:* (FLAGS)`, which gives both. A message of the copy missing from that listing
 //!    was expunged: it leaves the copy, in the same transaction as the flag changes and the new
 //!    HIGHESTMODSEQ.
-//! 3. The messages of the listing missing from the copy, newest first, fetched whole in batches.
+//! 3. The messages of the listing missing from the copy, newest first, fetched whole in batches
+//!    of at most `batch` messages and [`BATCH_BYTES`] bytes, by the sizes the server gives
+//!    (`RFC822.SIZE`, asked first); a message larger than that comes alone.
 //!
 //! The sync point is the set of UIDs in the copy itself, written with the messages: a sync cut at
 //! any point (a lost connection, a killed daemon) leaves whole batches behind, and the next one
@@ -37,6 +39,9 @@ use async_imap::types::Flag;
 
 use crate::connect::{ConnectError, ImapSession, imap_error};
 use crate::store::{FolderRow, NewMessage, Store};
+
+/// The most bytes of messages fetched, and held in memory, at a time: 32 MiB.
+pub const BATCH_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Why a sync stopped.
 #[derive(Debug)]
@@ -261,15 +266,47 @@ pub async fn folder(
         .filter(|uid| !local.contains_key(uid))
         .copied()
         .collect();
-    for uids in missing.chunks(batch.max(1)) {
+    let (Some(&newest), Some(&oldest)) = (missing.first(), missing.last()) else {
+        return Ok(Some(changes));
+    };
+    // One range, however scattered the missing UIDs are: a command line stays short.
+    let mut sizes = HashMap::new();
+    let ended = run(
+        session,
+        &format!("UID FETCH {oldest}:{newest} (UID RFC822.SIZE)"),
+        |response| {
+            if let Response::Fetch(_, attributes) = response
+                && let Some(uid) = uid(attributes)
+                && let Some(size) = attributes.iter().find_map(|a| match a {
+                    AttributeValue::Rfc822Size(size) => Some(*size),
+                    _ => None,
+                })
+            {
+                sizes.insert(uid, size);
+            }
+        },
+    )
+    .await?;
+    if ended == Ended::No {
+        changes.refused = missing.len();
+        return Ok(Some(changes));
+    }
+    // A message without a size was expunged meanwhile; the next listing tells.
+    let missing: Vec<(u32, u32)> = missing
+        .iter()
+        .filter_map(|uid| Some((*uid, *sizes.get(uid)?)))
+        .collect();
+    for uids in batches(&missing, batch, BATCH_BYTES) {
+        let uids = &uids[..];
         let mut messages = Vec::new();
         let command = format!(
-            "UID FETCH {} (UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])",
+            "UID FETCH {} (UID FLAGS INTERNALDATE BODY.PEEK[])",
             uid_set(uids)
         );
+        // Each answer is dropped once its message is taken out of it: a batch is held once.
         let ended = run(session, &command, |response| {
             if let Response::Fetch(_, attributes) = response
-                && let Some(message) = new_message(attributes)
+                && let Some(message) = new_message(attributes, &sizes)
                 && uids.contains(&message.uid)
             {
                 messages.push(message);
@@ -282,10 +319,31 @@ pub async fn folder(
         store.insert(folder.row.id, &messages)?;
         // A message expunged meanwhile is simply not there; the next listing tells.
         if ended? == Ended::No {
-            changes.refused += uids.len() - messages.len();
+            changes.refused += uids.len().saturating_sub(messages.len());
         }
     }
     Ok(Some(changes))
+}
+
+/// Cuts the messages to fetch, `(uid, size)` in the order given, into batches of at most `count`
+/// messages and `bytes` bytes. A message larger than `bytes` makes a batch of its own.
+fn batches(messages: &[(u32, u32)], count: usize, bytes: u64) -> Vec<Vec<u32>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut held = 0;
+    for &(uid, size) in messages {
+        let size = u64::from(size);
+        if !current.is_empty() && (current.len() >= count.max(1) || held + size > bytes) {
+            batches.push(std::mem::take(&mut current));
+            held = 0;
+        }
+        current.push(uid);
+        held += size;
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 /// How a command the server answered ended.
@@ -415,8 +473,9 @@ fn uid(attributes: &[AttributeValue<'_>]) -> Option<u32> {
     })
 }
 
-/// A whole message from a `FETCH` answer, `None` without its UID or its body.
-fn new_message(attributes: &[AttributeValue<'_>]) -> Option<NewMessage> {
+/// A whole message from a `FETCH` answer, `None` without its UID or its body. Its size is the
+/// one the server gave in `sizes`, else the length of its body.
+fn new_message(attributes: &[AttributeValue<'_>], sizes: &HashMap<u32, u32>) -> Option<NewMessage> {
     let mut internal_date = None;
     let mut raw = None;
     for attribute in attributes {
@@ -430,11 +489,16 @@ fn new_message(attributes: &[AttributeValue<'_>]) -> Option<NewMessage> {
             _ => {}
         }
     }
+    let uid = uid(attributes)?;
+    let raw = raw?;
     Some(NewMessage {
-        uid: uid(attributes)?,
+        uid,
         flags: flags(attributes),
         internal_date,
-        raw: raw?,
+        size: sizes
+            .get(&uid)
+            .map_or(raw.len() as i64, |size| i64::from(*size)),
+        raw,
     })
 }
 
@@ -582,6 +646,26 @@ mod tests {
         assert_eq!(quote("INBOX").unwrap(), "\"INBOX\"");
         assert_eq!(quote("a \"b\" \\c").unwrap(), "\"a \\\"b\\\" \\\\c\"");
         assert!(quote("a\r\nb").is_err());
+    }
+
+    #[test]
+    fn batches_are_cut_by_count_and_by_size_and_a_big_message_comes_alone() {
+        let messages = [
+            (9, 10),
+            (8, 10),
+            (7, 10),
+            (6, 10),
+            (5, 100),
+            (4, 10),
+            (3, 30),
+        ];
+        assert_eq!(
+            batches(&messages, 3, 50),
+            [vec![9, 8, 7], vec![6], vec![5], vec![4, 3]]
+        );
+        assert_eq!(batches(&messages[..2], 50, 20), [vec![9, 8]]);
+        assert_eq!(batches(&[(1, 21)], 50, 20), [vec![1]]);
+        assert!(batches(&[], 50, 20).is_empty());
     }
 
     #[test]

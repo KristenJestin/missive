@@ -33,7 +33,7 @@ CREATE TABLE message (
     flags TEXT NOT NULL,
     -- The server's INTERNALDATE, in seconds since the epoch.
     internal_date INTEGER,
-    -- The size of `raw`, in bytes.
+    -- The size the server gives (RFC822.SIZE), in bytes.
     size INTEGER NOT NULL,
     -- From the header, NULL when it is missing or unreadable. `date` is in seconds since the
     -- epoch; `sender`, `recipients` (To) and `cc` are JSON arrays of {"name", "address"}.

@@ -47,6 +47,8 @@ pub struct NewMessage {
     pub flags: String,
     /// The IMAP internal date, in seconds since the epoch.
     pub internal_date: Option<i64>,
+    /// The size the server gives (`RFC822.SIZE`), in bytes.
+    pub size: i64,
     pub raw: Vec<u8>,
 }
 
@@ -227,7 +229,7 @@ fn insert(transaction: &Transaction, folder: i64, message: &NewMessage) -> rusql
         message.uid,
         message.flags,
         message.internal_date,
-        message.raw.len() as i64,
+        message.size,
         parsed
             .and_then(|m| m.date())
             .map(|date| date.to_timestamp()),
@@ -262,16 +264,18 @@ mod tests {
     use super::*;
 
     fn message(uid: u32, flags: &str) -> NewMessage {
+        let raw: Vec<u8> = format!(
+            "From: Carol <carol@example.com>\r\nTo: dave@example.net, Eve <eve@example.org>\r\n\
+                 Subject: Number {uid}\r\nDate: Sat, 17 Oct 2026 09:30:00 +0200\r\n\
+                 Message-ID: <{uid}@example.com>\r\n\r\nHello.\r\n"
+        )
+        .into_bytes();
         NewMessage {
             uid,
             flags: flags.to_owned(),
             internal_date: Some(1_790_000_000),
-            raw: format!(
-                "From: Carol <carol@example.com>\r\nTo: dave@example.net, Eve <eve@example.org>\r\n\
-                 Subject: Number {uid}\r\nDate: Sat, 17 Oct 2026 09:30:00 +0200\r\n\
-                 Message-ID: <{uid}@example.com>\r\n\r\nHello.\r\n"
-            )
-            .into_bytes(),
+            size: raw.len() as i64,
+            raw,
         }
     }
 
