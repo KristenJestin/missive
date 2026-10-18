@@ -1,5 +1,5 @@
-//! `missive status`, `unread`, `search`, `list` and `show`, which answer from the local copy alone. The copy is
-//! filled by a daemon from the fake IMAP server; the reading commands then run with the daemon
+//! `missive status`, `unread`, `search`, `list`, `show` and `open`, which answer from the local
+//! copy alone. The copy is filled by a daemon from the fake IMAP server; the reading commands then run with the daemon
 //! stopped, the server gone and no session bus at all, so that whatever they would ask of the
 //! network or the keyring fails. Everything lives in temporary folders.
 
@@ -8,7 +8,9 @@ use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use missive_core::account::{Account, AccountStore, Password, Security, Server};
-use missive_core::fake::{FakeKeyring, FakeServer, Folder, Message, SpecialUse};
+use missive_core::fake::{
+    FakeKeyring, FakePortal, FakeServer, Folder, Message, PortalAnswer, SpecialUse,
+};
 use missive_core::keyring::Keyring;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -1486,4 +1488,271 @@ async fn a_copy_made_before_the_attachment_marker_is_listed_after_the_daemon_has
     let mut daemon = env.daemon(&["--check-interval", "3600"]).await;
     daemon.stop().await;
     succeeded(&env.read(&["list"]).await);
+}
+
+// ---- `missive open` ----
+
+/// Puts in `bin` an `xdg-open` that records its arguments and its environment, then exits.
+fn fake_xdg_open(env: &Env) {
+    let bin = env.path("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("xdg-open");
+    // The record is complete once `args` exists.
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n/usr/bin/env > '{bin}/env'\nprintf '%s\\n' \"$@\" > '{bin}/args.tmp'\n\
+             mv '{bin}/args.tmp' '{bin}/args'\n",
+            bin = bin.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `missive open` with the fake `xdg-open` first on `PATH`, and one variable of the user's own.
+async fn open(env: &Env, args: &[&str], bus: &str) -> Output {
+    let mut arguments = vec!["open"];
+    arguments.extend_from_slice(args);
+    env.command(&arguments, bus)
+        .env("PATH", path_variable(env))
+        .env("MISSIVE_TEST_MARK", "the user's own")
+        .output()
+        .await
+        .unwrap()
+}
+
+fn path_variable(env: &Env) -> String {
+    format!("{}:/usr/bin:/bin", env.path("bin").display())
+}
+
+fn nowhere(env: &Env) -> String {
+    format!("unix:path={}", env.path("no-bus").display())
+}
+
+/// What the fake `xdg-open` was given: its arguments and its environment.
+async fn xdg_opened(env: &Env) -> (Vec<String>, Vec<String>) {
+    let args = env.path("bin").join("args");
+    eventually(10, "xdg-open", || args.exists()).await;
+    let lines = |path: PathBuf| -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    (lines(args), lines(env.path("bin").join("env")))
+}
+
+fn originals(env: &Env) -> PathBuf {
+    env.path("runtime").join("missive/original")
+}
+
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_writes_a_private_cleaned_page_under_the_runtime_folder() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let id = inbox_id(&env, 4).await;
+
+    let output = open(&env, &[&id, "--original"], &nowhere(&env)).await;
+
+    succeeded(&output);
+    let printed = stdout(&output);
+    let path = PathBuf::from(printed.trim_end());
+    assert_eq!(printed, format!("{}\n", path.display()));
+    assert_eq!(path.parent().unwrap(), originals(&env));
+    assert_eq!(path.extension().unwrap(), "html");
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&originals(&env)), 0o700);
+    let page = std::fs::read_to_string(&path).unwrap();
+    assert!(page.contains("Content-Security-Policy"), "{page}");
+    assert!(page.contains("<b>Quokka</b>"), "{page}");
+    assert!(
+        !page.contains("<script") && !page.contains("never run"),
+        "{page}"
+    );
+    // Nothing of the message is said, only where its page is.
+    for secret in ["Plan 4", SENDER, "Quokka"] {
+        assert!(!printed.contains(secret) && !stderr(&output).contains(secret));
+    }
+    let (args, _) = xdg_opened(&env).await;
+    assert_eq!(args, [path.display().to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_portal_xdg_open_gets_exactly_the_environment_missive_received() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let id = inbox_id(&env, 4).await;
+    let bus = nowhere(&env);
+
+    succeeded(&open(&env, &[&id], &bus).await);
+
+    let (_, environment) = xdg_opened(&env).await;
+    let mut received: Vec<String> = environment
+        .into_iter()
+        // What the fake's own shell sets for itself.
+        .filter(|line| {
+            !["PWD=", "OLDPWD=", "SHLVL=", "_="]
+                .iter()
+                .any(|v| line.starts_with(v))
+        })
+        .collect();
+    received.sort();
+    let path = |folder: &str| env.path(folder).display().to_string();
+    let mut given = vec![
+        format!("HOME={}", env.home.path().display()),
+        format!("XDG_CONFIG_HOME={}", path("config")),
+        format!("XDG_DATA_HOME={}", path("data")),
+        format!("XDG_STATE_HOME={}", path("state")),
+        format!("XDG_RUNTIME_DIR={}", path("runtime")),
+        format!("DBUS_SESSION_BUS_ADDRESS={bus}"),
+        format!("PATH={}", path_variable(&env)),
+        "MISSIVE_TEST_MARK=the user's own".to_owned(),
+    ];
+    given.sort();
+    assert_eq!(received, given);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_hands_the_page_to_the_desktop_portal() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let portal = FakePortal::start(PortalAnswer::Opened).await;
+    let id = inbox_id(&env, 4).await;
+
+    let output = open(&env, &[&id, "--original"], portal.address()).await;
+
+    succeeded(&output);
+    let path = PathBuf::from(stdout(&output).trim_end());
+    let calls = portal.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let call = &calls[0];
+    assert_eq!(call.path, path);
+    assert_eq!(call.content, std::fs::read(&path).unwrap());
+    assert!(call.read_only);
+    assert_eq!(call.parent_window, "");
+    assert!(call.handle_token.is_some());
+    // The portal opened it: xdg-open is not run as well.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!env.path("bin").join("args").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_portal_that_cannot_open_the_page_leaves_it_to_xdg_open() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let portal = FakePortal::start(PortalAnswer::Failed).await;
+    let id = inbox_id(&env, 4).await;
+
+    let output = open(&env, &[&id], portal.address()).await;
+
+    succeeded(&output);
+    assert_eq!(portal.calls().len(), 1);
+    let (args, _) = xdg_opened(&env).await;
+    assert_eq!(args, [stdout(&output).trim_end()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_portal_that_does_not_answer_is_not_waited_for() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let portal = FakePortal::start(PortalAnswer::Silent).await;
+    let id = inbox_id(&env, 4).await;
+
+    let started = Instant::now();
+    let output = open(&env, &[&id], portal.address()).await;
+
+    succeeded(&output);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(portal.calls().len(), 1);
+    // It took the file: it may still be asking the user.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!env.path("bin").join("args").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_only_message_is_opened_as_plain_text() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let id = inbox_id(&env, 1).await;
+
+    let output = open(&env, &[&id], &nowhere(&env)).await;
+
+    succeeded(&output);
+    let page = std::fs::read_to_string(stdout(&output).trim_end()).unwrap();
+    assert!(page.contains("<pre>Nothing special."), "{page}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_of_an_identifier_that_names_nothing_is_not_found() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let id = inbox_id(&env, 1).await;
+    let parts: Vec<&str> = id.split('/').collect();
+
+    for wrong in [
+        format!("alice/{}/{}/99", parts[1], parts[2]),
+        "alice/1".to_owned(),
+    ] {
+        let output = open(&env, &[&wrong], &nowhere(&env)).await;
+        assert_eq!(output.status.code(), Some(3), "{wrong}");
+        assert_eq!(stdout(&output), "");
+        assert!(
+            stderr(&output).starts_with("missive: "),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert!(!originals(&env).exists());
+    assert!(!env.path("bin").join("args").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_without_a_runtime_folder_refuses() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let id = inbox_id(&env, 4).await;
+
+    let output = env
+        .command(&["open", &id], &nowhere(&env))
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("PATH", path_variable(&env))
+        .output()
+        .await
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("XDG_RUNTIME_DIR"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!env.path("bin").join("args").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_older_than_an_hour_is_removed_at_the_next_open() {
+    let env = Env::filled_with(vec![("alice", alice())]).await;
+    fake_xdg_open(&env);
+    let id = inbox_id(&env, 4).await;
+    std::fs::create_dir_all(originals(&env)).unwrap();
+    let old = originals(&env).join("old.html");
+    let recent = originals(&env).join("recent.html");
+    for (path, age) in [(&old, 61 * 60), (&recent, 59 * 60)] {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(age))
+            .unwrap();
+    }
+
+    succeeded(&open(&env, &[&id], &nowhere(&env)).await);
+
+    assert!(!old.exists());
+    assert!(recent.exists());
 }

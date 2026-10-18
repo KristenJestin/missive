@@ -966,6 +966,7 @@ version = "0.0.0"
 dependencies = [
  "async-imap",
  "clap",
+ "futures-util",
  "missive-core",
  "rpassword",
  "rusqlite",
