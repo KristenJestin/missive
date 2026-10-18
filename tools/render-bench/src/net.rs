@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use base64::Engine as _;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
+use missive_render::message::decode_data_url;
 use percent_encoding::percent_decode_str;
 
 pub struct MessageOnly {
@@ -49,49 +49,5 @@ impl NetProvider for MessageOnly {
         // Every request is answered, an empty body when refused: a stylesheet left unanswered in
         // the head would block Blitz's layout for ever.
         handler.bytes(url.to_string(), body.unwrap_or_default());
-    }
-}
-
-/// `data:[<type>][;base64],<data>`
-pub fn decode_data_url(url: &str) -> Option<Vec<u8>> {
-    let rest = url.strip_prefix("data:")?;
-    let (meta, data) = rest.split_once(',')?;
-    let data = percent_decode_str(data).collect::<Vec<u8>>();
-    if meta.ends_with(";base64") {
-        let compact: Vec<u8> = data
-            .into_iter()
-            .filter(|byte| !byte.is_ascii_whitespace())
-            .collect();
-        base64::engine::general_purpose::STANDARD
-            .decode(compact)
-            .ok()
-    } else {
-        Some(data)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_base64_data_url_is_decoded() {
-        assert_eq!(
-            decode_data_url("data:image/png;base64,aGVs bG8=").unwrap(),
-            b"hello"
-        );
-    }
-
-    #[test]
-    fn a_percent_encoded_data_url_is_decoded() {
-        assert_eq!(
-            decode_data_url("data:text/css,a%7Bcolor:red%7D").unwrap(),
-            b"a{color:red}"
-        );
-    }
-
-    #[test]
-    fn a_data_url_without_a_comma_is_refused() {
-        assert!(decode_data_url("data:image/png;base64").is_none());
     }
 }

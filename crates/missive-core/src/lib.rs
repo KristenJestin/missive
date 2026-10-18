@@ -13,6 +13,7 @@ pub mod events;
 pub mod fake;
 pub mod keyring;
 pub mod mailto;
+pub mod opener;
 pub mod original;
 pub mod outbox;
 pub mod protocol;

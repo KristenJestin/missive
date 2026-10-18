@@ -45,6 +45,13 @@ jobs:
       # The keyring tests start their own private bus (see `missive_core::fake::FakeKeyring`).
       - name: Have dbus-daemon
         run: command -v dbus-daemon || { sudo apt-get update && sudo apt-get install -y dbus-daemon; }
+      # The window (crates/missive-window) links against the fonts and the keyboard maps; GPUI
+      # loads Wayland and Vulkan at run time and opens no window here: its tests use GPUI's own
+      # test platform. Only this job builds the window: the betas and releases build `missive`.
+      - name: Have the window's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig-dev libfreetype-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
