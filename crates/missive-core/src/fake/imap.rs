@@ -48,6 +48,7 @@ pub(super) async fn serve(
             Some(Action::Refuse) => {
                 session.refuse(text, Some("NO [UNAVAILABLE] the test refused this command"))
             }
+            Some(Action::Bad) => session.refuse(text, Some("BAD the test refused this command")),
             Some(Action::BareBad) => session.refuse(text, Some("BAD")),
             Some(Action::Stall) => session.refuse(text, None),
             _ => session.command(text),

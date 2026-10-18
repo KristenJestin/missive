@@ -40,8 +40,8 @@
 //! or from a point of the test on ([`FakeServer::refuse`], [`FakeServer::cut`], until
 //! [`FakeServer::heal`]): it answers `NO` to a chosen command, drops the client in the middle
 //! of an answer, ends an answer short but with its `OK` ([`FakeServer::truncate`]), refuses
-//! one message ([`FakeServer::refuse_uid`]), answers nothing ([`Builder::stall`]) or a bare
-//! `BAD` ([`Builder::bare_bad`]).
+//! one message ([`FakeServer::refuse_uid`]), answers nothing ([`Builder::stall`]), `BAD`
+//! ([`Builder::bad`]) or a bare `BAD` ([`Builder::bare_bad`]).
 //!
 //! The SMTP side serves `EHLO`/`HELO`, `STARTTLS`, `AUTH PLAIN` and `AUTH LOGIN` (offered only
 //! over TLS; [`Builder::smtp_login_only`] drops `PLAIN`), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP`
@@ -307,6 +307,13 @@ impl Builder {
     /// `command`, without running it. Until [`FakeServer::heal`].
     pub fn bare_bad(mut self, command: &str) -> Self {
         self.rules.push(Rule::new(command, Action::BareBad));
+        self
+    }
+
+    /// Answers `{tag} BAD the test refused this command` to every IMAP command that starts with
+    /// `command`, without running it. Until [`FakeServer::heal`].
+    pub fn bad(mut self, command: &str) -> Self {
+        self.rules.push(Rule::new(command, Action::Bad));
         self
     }
 
@@ -672,6 +679,7 @@ impl Rule {
 enum Action {
     Refuse,
     Stall,
+    Bad,
     BareBad,
     Cut(usize),
     Truncate(usize),
