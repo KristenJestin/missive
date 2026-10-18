@@ -53,12 +53,14 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `unsupported-protocol` | the daemon speaks another protocol version (`message` says which) |
 | `unknown-request` | the daemon knows no such request |
 | `no-such-account` | the account named is not in the configuration |
-| `no-such-message` | an identifier names no message in the local copy (`message` says which, and why) |
+| `no-such-message` | an identifier names no message in the local copy (`message` says which, and why), or a `resend` or `discard` names no message of the outbox |
 | `no-such-folder` | the folder a `move` names is not one of the account's |
 | `no-trash` | a `delete` without `permanently`, in an account that has no trash |
 | `in-trash` | a `delete` without `permanently` of a message already in the trash |
 | `not-in-trash` | a `delete` with `permanently` of a message outside the trash, in an account that has one |
 | `busy` | a message whose move waits for the server: it takes no other action until then; or a `draft` naming a draft whose message waits in the outbox |
+| `uncertain` | a `resend` without `yes` of an `uncertain` message: the server may have taken it already |
+| `not-failed` | a `resend` or a `discard` of a message that is neither `failed` nor `uncertain` (`message` says its state) |
 | `bad-request` (`send`, `draft`) | also: the message cannot be sent as written (`message` says why: no recipient, an address that is not one…) |
 | `failed` | the daemon could not do it: it is stopping, an account's sync could not write the local copy (`message` names the account), the local copy could not be written, or the connection is already subscribed |
 
@@ -144,6 +146,30 @@ in the local copy, and answers: nothing waits for the server.
 `outbox` is the message's number in the outbox, which the `sent`, `send-failed` and
 `send-uncertain` events (`docs/events.md`) name it by; `message_id` is its `Message-ID`, without
 angle brackets.
+
+### `resend`, `discard`
+
+Act on a message the outbox keeps because it was not sent: `failed` (the server refused it for
+good) or `uncertain` (the server may have taken it). `resend` puts it back in the queue, to send
+at once; `discard` removes it from the outbox, for good. Nothing else ever sends a `failed` or
+`uncertain` message again.
+
+```json
+{"protocol": 1, "request": "resend", "outbox": 3, "yes": true}
+{"protocol": 1, "request": "discard", "outbox": 3}
+```
+
+| Field | | |
+|---|---|---|
+| `outbox` | number | the message's number in the outbox, as `send` answered it |
+| `yes` (`resend` only) | boolean, `false` when absent | resend an `uncertain` message: its recipients may then get it twice. Without it, an `uncertain` message is answered `uncertain` and stays as it is |
+
+```json
+{"protocol": 1, "answer": "resend", "ok": true, "outbox": 3}
+```
+
+A message resent is sent as any other, once, under its number and its `Message-ID`; the `sent`,
+`send-failed` and `send-uncertain` events tell what became of it.
 
 ### `draft`
 

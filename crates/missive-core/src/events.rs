@@ -49,6 +49,9 @@ pub enum Event {
     /// The connection was lost after a message's end of data, before the server's answer: it
     /// may have been sent, and is not sent again.
     SendUncertain(SendUncertain),
+    /// The copy of a message sent will never be in the Sent folder: the message was sent all the
+    /// same.
+    SentCopyFailed(SentCopyFailed),
     /// A draft was written to the Drafts folder, removed from it, or is tried again later.
     Draft(DraftEvent),
     /// The watcher read too slowly: this many events were dropped for it.
@@ -164,6 +167,16 @@ pub struct SendFailed {
 /// A message that may or may not have been sent (`docs/events.md`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendUncertain {
+    pub account: String,
+    pub outbox: i64,
+    pub message_id: String,
+    /// For people.
+    pub message: String,
+}
+
+/// A copy for Sent given up (`docs/events.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentCopyFailed {
     pub account: String,
     pub outbox: i64,
     pub message_id: String,
@@ -413,6 +426,16 @@ mod tests {
         assert_eq!(
             uncertain.line(),
             r#"{"protocol":1,"event":"send-uncertain","account":"alice","outbox":7,"message_id":"1f@example.org","message":"lost"}"#
+        );
+        let given_up = Event::SentCopyFailed(SentCopyFailed {
+            account: "alice".to_owned(),
+            outbox: 7,
+            message_id: "1f@example.org".to_owned(),
+            message: "refused".to_owned(),
+        });
+        assert_eq!(
+            given_up.line(),
+            r#"{"protocol":1,"event":"sent-copy-failed","account":"alice","outbox":7,"message_id":"1f@example.org","message":"refused"}"#
         );
     }
 

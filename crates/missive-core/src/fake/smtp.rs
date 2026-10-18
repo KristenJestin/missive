@@ -120,6 +120,9 @@ pub(super) async fn serve(
                 let Some(data) = read_data(&mut io).await else {
                     return;
                 };
+                if let Some(delay) = shared.smtp_delay(".") {
+                    tokio::time::sleep(delay).await;
+                }
                 let message = SmtpMessage {
                     from: session.from.take().unwrap_or_default(),
                     to: std::mem::take(&mut session.to),
@@ -243,17 +246,21 @@ fn address(argument: &str, prefix: &str) -> Option<String> {
     Some(inner[..end].to_owned())
 }
 
-/// Reads the data of a message up to its `.` line, removing the dot stuffing.
+/// Reads the data of a message up to its end, `CRLF . CRLF` as RFC 5321 says (a real server
+/// takes nothing less), removing the dot stuffing.
 async fn read_data(io: &mut BufReader<Box<dyn Io>>) -> Option<Vec<u8>> {
     let mut data = Vec::new();
+    // The CRLF that ended `DATA` counts as the one before a `.` on the first line.
+    let mut after_crlf = true;
     loop {
         let mut line = Vec::new();
         if io.read_until(b'\n', &mut line).await.ok()? == 0 {
             return None;
         }
-        if line == b".\r\n" || line == b".\n" {
+        if after_crlf && line == b".\r\n" {
             return Some(data);
         }
+        after_crlf = line.ends_with(b"\r\n");
         let line = line.strip_prefix(b".").unwrap_or(&line);
         data.extend_from_slice(line);
     }

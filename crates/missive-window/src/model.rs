@@ -298,7 +298,8 @@ impl Model {
             Event::SyncStarted { .. }
             | Event::Sent(_)
             | Event::SendFailed(_)
-            | Event::SendUncertain(_) => self.daemon = Daemon::Running,
+            | Event::SendUncertain(_)
+            | Event::SentCopyFailed(_) => self.daemon = Daemon::Running,
             Event::Action(action) => {
                 if action.outcome == "refused" {
                     self.notice = Some(refused(action));

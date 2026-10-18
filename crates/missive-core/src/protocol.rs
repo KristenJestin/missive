@@ -72,6 +72,15 @@ pub enum Command {
     /// Saves a draft, a new one or a new version of one, and with `send` sends it; answered once
     /// it is in the local copy (and in the outbox).
     Draft(SaveDraft),
+    /// Puts a `failed` message of the outbox back in the queue, or with `yes` an `uncertain` one
+    /// (it may have arrived already); answered once queued.
+    Resend {
+        outbox: i64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        yes: bool,
+    },
+    /// Removes a `failed` or `uncertain` message from the outbox, for good.
+    Discard { outbox: i64 },
 }
 
 /// A draft to save: the fields given replace those of the draft named, the others are kept.
@@ -168,6 +177,8 @@ impl Command {
             Command::Delete { .. } => "delete",
             Command::Send(_) => "send",
             Command::Draft(_) => "draft",
+            Command::Resend { .. } => "resend",
+            Command::Discard { .. } => "discard",
         }
     }
 }
@@ -196,7 +207,8 @@ pub struct Answer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept: Option<String>,
     /// When not `ok`: `bad-request`, `unsupported-protocol`, `unknown-request`,
-    /// `no-such-account`, `failed`, or why an action was refused (`docs/protocol.md`).
+    /// `no-such-account`, `no-such-message`, `failed`, or why an action was refused
+    /// (`docs/protocol.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// When not `ok`: what went wrong, for people.
@@ -254,7 +266,17 @@ pub fn read_request(line: &str) -> Result<Request, Answer> {
     }
     let known = matches!(
         name,
-        Some("sync" | "subscribe" | "mark" | "move" | "delete" | "send" | "draft")
+        Some(
+            "sync"
+                | "subscribe"
+                | "mark"
+                | "move"
+                | "delete"
+                | "send"
+                | "draft"
+                | "resend"
+                | "discard"
+        )
     );
     serde_json::from_value(value).map_err(|_| {
         if known || name.is_none() {
@@ -349,6 +371,44 @@ mod tests {
         );
         assert_eq!(
             read_request(r#"{"protocol":1,"request":"move","messages":["a/1/2/3"]}"#)
+                .unwrap_err()
+                .error
+                .unwrap(),
+            "bad-request"
+        );
+    }
+
+    #[test]
+    fn outbox_requests_read_as_documented() {
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"resend","outbox":3}"#),
+            Ok(Request {
+                protocol: 1,
+                command: Command::Resend {
+                    outbox: 3,
+                    yes: false
+                }
+            })
+        );
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"resend","outbox":3,"yes":true}"#),
+            Ok(Request {
+                protocol: 1,
+                command: Command::Resend {
+                    outbox: 3,
+                    yes: true
+                }
+            })
+        );
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"discard","outbox":3}"#),
+            Ok(Request {
+                protocol: 1,
+                command: Command::Discard { outbox: 3 }
+            })
+        );
+        assert_eq!(
+            read_request(r#"{"protocol":1,"request":"discard"}"#)
                 .unwrap_err()
                 .error
                 .unwrap(),
