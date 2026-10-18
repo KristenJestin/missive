@@ -43,7 +43,11 @@ pub(super) async fn serve(
         }
         let text = String::from_utf8_lossy(&line);
         let text = text.trim_end_matches(['\r', '\n']);
-        match session.command(text) {
+        let flow = session.command(text);
+        if !session.shared.fetch_delay.is_zero() && is_fetch(text) {
+            tokio::time::sleep(session.shared.fetch_delay).await;
+        }
+        match flow {
             Flow::Continue => {}
             Flow::Close => {
                 let _ = flush(&mut io, &mut session.out).await;
@@ -66,6 +70,16 @@ pub(super) async fn serve(
             }
         }
     }
+}
+
+/// Whether a command line is a `FETCH` or a `UID FETCH`.
+fn is_fetch(line: &str) -> bool {
+    let mut words = line.split(' ').skip(1);
+    let name = match words.next() {
+        Some(word) if word.eq_ignore_ascii_case("UID") => words.next(),
+        word => word,
+    };
+    name.is_some_and(|name| name.eq_ignore_ascii_case("FETCH"))
 }
 
 async fn flush(io: &mut BufReader<Box<dyn Io>>, out: &mut Vec<u8>) -> std::io::Result<()> {

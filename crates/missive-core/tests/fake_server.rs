@@ -422,6 +422,34 @@ async fn a_folder_without_special_use_has_no_role() {
     assert!(names[1].attributes().is_empty());
 }
 
+#[tokio::test]
+async fn a_fetch_delay_holds_each_fetch_answer_back() {
+    let server = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .folder(Folder::new("INBOX").message(Message::new(HELLO)))
+        .fetch_delay(Duration::from_millis(300))
+        .start()
+        .await;
+    let mut session = login(imap_tls(server.imap_tls_addr(), pinned(&server)).await).await;
+    session.examine("INBOX").await.unwrap();
+
+    let started = std::time::Instant::now();
+    let fetches: Vec<_> = session
+        .uid_fetch("1:*", "(FLAGS)")
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(fetches.len(), 1);
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    // Other commands are not held back.
+    let started = std::time::Instant::now();
+    session.noop().await.unwrap();
+    assert!(started.elapsed() < Duration::from_millis(300));
+}
+
 /// A minimal SMTP client: SMTP is line based, and lettre cannot take a pinned rustls config.
 struct Smtp {
     stream: BufReader<TlsStream<TcpStream>>,

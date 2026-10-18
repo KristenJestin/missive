@@ -28,7 +28,8 @@
 //!
 //! Changes made through [`FakeServer`] reach a connected client the way a real server tells them:
 //! during `IDLE` at once, otherwise at its next `NOOP`. A client whose selected folder gets a new
-//! UIDVALIDITY is disconnected with `BYE`.
+//! UIDVALIDITY is disconnected with `BYE`. [`Builder::fetch_delay`] slows every `FETCH` answer,
+//! to catch a client in the middle of a sync.
 //!
 //! The SMTP side serves `EHLO`/`HELO`, `STARTTLS`, `AUTH PLAIN` and `AUTH LOGIN` (offered only
 //! over TLS; [`Builder::smtp_login_only`] drops `PLAIN`), `MAIL`, `RCPT`, `DATA`, `RSET`, `NOOP`
@@ -51,6 +52,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -184,6 +186,7 @@ pub struct Builder {
     without_condstore: bool,
     imap_login_unavailable: bool,
     smtp_login_only: bool,
+    fetch_delay: Duration,
 }
 
 impl Builder {
@@ -217,6 +220,13 @@ impl Builder {
     /// unknown user name (`535`) at the user name step, before asking for a password.
     pub fn smtp_login_only(mut self) -> Self {
         self.smtp_login_only = true;
+        self
+    }
+
+    /// Waits this long before answering each `FETCH` or `UID FETCH`, like a slow server or a
+    /// big mailbox: a test can then catch a client in the middle of a sync.
+    pub fn fetch_delay(mut self, delay: Duration) -> Self {
+        self.fetch_delay = delay;
         self
     }
 
@@ -268,6 +278,7 @@ impl Builder {
             condstore: !self.without_condstore,
             imap_login_unavailable: self.imap_login_unavailable,
             smtp_login_only: self.smtp_login_only,
+            fetch_delay: self.fetch_delay,
         });
 
         let mut listeners = Vec::new();
@@ -429,6 +440,7 @@ struct Shared {
     condstore: bool,
     imap_login_unavailable: bool,
     smtp_login_only: bool,
+    fetch_delay: Duration,
 }
 
 impl Shared {
