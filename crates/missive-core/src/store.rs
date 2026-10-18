@@ -6,11 +6,24 @@
 //! is ever held across a wait on the network: a process killed at any point leaves a copy that is
 //! whole as of its last commit.
 //!
-//! The schema, version 1 (`PRAGMA user_version`):
+//! The schema, version 2 (`PRAGMA user_version`). Version 1 is the copy itself:
 //!
 //! ```sql
 #![doc = include_str!("store/schema-1.sql")]
 //! ```
+//!
+//! Version 2 adds the full-text index of `missive search`, which is filled from the raw message
+//! when a message is written (in the same transaction), and, when a copy of version 1 is opened,
+//! for the messages it already holds:
+//!
+//! ```sql
+#![doc = include_str!("store/schema-2.sql")]
+//! ```
+//!
+//! The index is contentless: it keeps the words and where they are, not the text, so a message
+//! costs its words and their places beside its raw message, and no text is stored twice. The text it is built from is read by `mail-parser`: the text parts of a message, and,
+//! for a message with only HTML, that HTML reduced to its text (markup, styles and scripts
+//! left out).
 
 use std::collections::HashMap;
 use std::io;
@@ -23,10 +36,13 @@ use serde::Serialize;
 
 /// The schema version this build writes. A copy written by a later version is refused rather
 /// than misread.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Each step brings the schema from the version before it: `MIGRATIONS[0]` from nothing to 1.
-const MIGRATIONS: &[&str] = &[include_str!("store/schema-1.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("store/schema-1.sql"),
+    include_str!("store/schema-2.sql"),
+];
 
 /// The local copy, opened for writing.
 pub struct Store {
@@ -249,6 +265,62 @@ fn insert(transaction: &Transaction, folder: i64, message: &NewMessage) -> rusql
              ON CONFLICT (message) DO NOTHING",
         )?
         .execute(params![id, message.raw])?;
+    index(transaction, id, parsed)
+}
+
+/// Puts a message in the full-text index, in place of what the index held for it.
+fn index(
+    transaction: &Transaction,
+    id: i64,
+    parsed: Option<&mail_parser::Message>,
+) -> rusqlite::Result<()> {
+    let words = |address: Option<&Address>| {
+        let mut words = String::new();
+        for mailbox in address.into_iter().flat_map(|address| address.iter()) {
+            for part in [mailbox.name(), mailbox.address()].into_iter().flatten() {
+                words.push_str(part);
+                words.push(' ');
+            }
+        }
+        words
+    };
+    let mut recipients = words(parsed.and_then(|m| m.to()));
+    recipients.push_str(&words(parsed.and_then(|m| m.cc())));
+    let mut body = String::new();
+    if let Some(parsed) = parsed {
+        for part in 0..parsed.text_body_count() {
+            body.extend(parsed.body_text(part).as_deref());
+            body.push('\n');
+        }
+    }
+    transaction
+        .prepare_cached("DELETE FROM message_search WHERE rowid = ?1")?
+        .execute([id])?;
+    transaction
+        .prepare_cached(
+            "INSERT INTO message_search (rowid, sender, recipients, subject, body)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute(params![
+            id,
+            words(parsed.and_then(|m| m.from())),
+            recipients,
+            parsed.and_then(|m| m.subject()),
+            body,
+        ])?;
+    Ok(())
+}
+
+/// Indexes the messages a copy of version 1 already holds.
+fn index_existing(transaction: &Transaction) -> rusqlite::Result<()> {
+    let mut statement =
+        transaction.prepare("SELECT message, raw FROM message_raw ORDER BY message")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let raw: Vec<u8> = row.get(1)?;
+        let parsed = MessageParser::default().parse(&raw);
+        index(transaction, row.get(0)?, parsed.as_ref())?;
+    }
     Ok(())
 }
 
@@ -263,6 +335,9 @@ fn migrate(connection: &mut Connection) -> rusqlite::Result<()> {
     }
     for (index, step) in MIGRATIONS.iter().enumerate().skip(version as usize) {
         transaction.execute_batch(step)?;
+        if index == 1 {
+            index_existing(&transaction)?;
+        }
         transaction.pragma_update(None, "user_version", index as i64 + 1)?;
     }
     transaction.commit()
@@ -464,5 +539,199 @@ mod tests {
         assert_eq!(rows[0].1, "ready");
         assert!(rows[0].2.is_some());
         assert_eq!(rows[1], ("bob".to_owned(), "auth-refused".to_owned(), None));
+    }
+
+    fn mail(uid: u32, headers: &str, body: &str) -> NewMessage {
+        let raw = format!(
+            "From: Carol <carol@example.com>\r\nTo: dave@example.net\r\nSubject: Hello\r\n\
+             {headers}\r\n{body}"
+        )
+        .into_bytes();
+        NewMessage {
+            uid,
+            flags: String::new(),
+            internal_date: Some(1_790_000_000),
+            size: raw.len() as i64,
+            raw,
+        }
+    }
+
+    /// The UIDs of the messages the index finds for one word.
+    fn found(store: &Store, word: &str) -> Vec<u32> {
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT message.uid FROM message_search \
+                 JOIN message ON message.id = message_search.rowid \
+                 WHERE message_search MATCH ?1 ORDER BY message.uid",
+            )
+            .unwrap();
+        statement
+            .query_map([format!("\"{word}\"")], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_message_is_indexed_by_sender_recipients_subject_and_body() {
+        let (_dir, mut store) = open();
+        let account = store.account("alice").unwrap();
+        let folder = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
+        let raw = "From: Zoé Sender <zoe@example.com>\r\n\
+                   To: Dave Recipient <dave@example.net>\r\n\
+                   Cc: erin.copied@example.org\r\n\
+                   Subject: Quarterly plan\r\n\r\nThe walnut is in the body.\r\n";
+        let message = NewMessage {
+            uid: 1,
+            flags: String::new(),
+            internal_date: None,
+            size: raw.len() as i64,
+            raw: raw.as_bytes().to_vec(),
+        };
+        store.insert(folder, &[message]).unwrap();
+        for word in [
+            "zoe",
+            "sender",
+            "recipient",
+            "copied",
+            "quarterly",
+            "walnut",
+        ] {
+            assert_eq!(found(&store, word), [1], "{word}");
+        }
+        assert!(found(&store, "absent").is_empty());
+    }
+
+    #[test]
+    fn the_text_of_an_html_only_message_is_indexed_without_its_markup() {
+        let (_dir, mut store) = open();
+        let account = store.account("alice").unwrap();
+        let folder = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
+        let html = mail(
+            1,
+            "Content-Type: text/html; charset=utf-8\r\n",
+            "<html><head><style>.hidden { color: red }</style></head>\
+             <body><p>The <b>marmot</b> sleeps.</p><script>var secret = 1;</script></body></html>",
+        );
+        store.insert(folder, &[html]).unwrap();
+        assert_eq!(found(&store, "marmot"), [1]);
+        assert!(found(&store, "body").is_empty());
+        assert!(found(&store, "html").is_empty());
+        assert!(found(&store, "hidden").is_empty());
+        assert!(found(&store, "secret").is_empty());
+    }
+
+    #[test]
+    fn the_text_part_of_an_alternative_message_and_an_encoded_body_are_indexed() {
+        let (_dir, mut store) = open();
+        let account = store.account("alice").unwrap();
+        let folder = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
+        let alternative = mail(
+            1,
+            "MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"b\"\r\n",
+            "--b\r\nContent-Type: text/plain\r\n\r\nThe plain gazelle.\r\n--b\r\n\
+             Content-Type: text/html\r\n\r\n<p>The html gazelle.</p>\r\n--b--\r\n",
+        );
+        let encoded = mail(
+            2,
+            "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n",
+            // "Crème brûlée" in UTF-8, base64.
+            "Q3LDqG1lIGJyw7tsw6ll\r\n",
+        );
+        store.insert(folder, &[alternative, encoded]).unwrap();
+        assert_eq!(found(&store, "gazelle"), [1]);
+        assert_eq!(found(&store, "brulee"), [2]);
+    }
+
+    #[test]
+    fn case_and_accents_do_not_matter_in_the_index() {
+        let (_dir, mut store) = open();
+        let account = store.account("alice").unwrap();
+        let folder = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
+        let accented = mail(
+            1,
+            "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n",
+            "Les Éléphants d'Élodie\r\n",
+        );
+        store.insert(folder, &[accented]).unwrap();
+        for word in ["éléphants", "ELEPHANTS", "elephants", "Élodie", "elodie"] {
+            assert_eq!(found(&store, word), [1], "{word}");
+        }
+    }
+
+    #[test]
+    fn a_replayed_batch_indexes_a_message_once() {
+        let (_dir, mut store) = open();
+        let account = store.account("alice").unwrap();
+        let folder = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
+        store.insert(folder, &[message(1, "")]).unwrap();
+        store.insert(folder, &[message(1, "\\Seen")]).unwrap();
+        assert_eq!(found(&store, "hello"), [1]);
+        let rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM message_search WHERE message_search MATCH '\"hello\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn a_message_leaves_the_index_however_it_leaves_the_copy() {
+        let (_dir, mut store) = open();
+        let account = store.account("alice").unwrap();
+        let inbox = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
+        let other = store.folder(account, "Other", None).unwrap().id;
+        store
+            .insert(inbox, &[message(1, ""), message(2, "")])
+            .unwrap();
+        store.insert(other, &[message(3, "")]).unwrap();
+        assert_eq!(found(&store, "hello"), [1, 2, 3]);
+
+        // Expunged on the server.
+        store.apply_listing(inbox, &[1], &[], None).unwrap();
+        assert_eq!(found(&store, "hello"), [2, 3]);
+        // A folder renumbered by the server.
+        store.rebuild(inbox, 9).unwrap();
+        assert_eq!(found(&store, "hello"), [3]);
+        // A folder deleted outright.
+        store
+            .connection
+            .execute("DELETE FROM folder WHERE id = ?1", [other])
+            .unwrap();
+        assert!(found(&store, "hello").is_empty());
+    }
+
+    #[test]
+    fn opening_a_copy_of_schema_1_indexes_the_messages_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy.sqlite");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(MIGRATIONS[0]).unwrap();
+            connection.pragma_update(None, "user_version", 1).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO account (key, id, state) VALUES (1, 'alice', 'ready');
+                     INSERT INTO folder (id, account, name, role) VALUES (1, 1, 'INBOX', 'inbox');
+                     INSERT INTO message (id, folder, uid, flags, size, subject, sender,
+                         recipients, cc)
+                     VALUES (1, 1, 1, '', 0, 'Old', '[]', '[]', '[]');",
+                )
+                .unwrap();
+            let old = message(1, "");
+            connection
+                .execute(
+                    "INSERT INTO message_raw (message, raw) VALUES (1, ?1)",
+                    [old.raw],
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(found(&store, "hello"), [1]);
+        assert_eq!(found(&store, "carol"), [1]);
     }
 }

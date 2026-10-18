@@ -1558,12 +1558,23 @@ async fn the_copy_is_in_wal_mode_with_a_schema_version() {
         .unwrap();
 
     assert_eq!(mode, "wal");
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
+    // The search index is a virtual table with its shadow tables.
     assert_eq!(
         env.table_names(),
-        ["account", "folder", "message", "message_raw"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        [
+            "account",
+            "folder",
+            "message",
+            "message_raw",
+            "message_search",
+            "message_search_config",
+            "message_search_data",
+            "message_search_docsize",
+            "message_search_idx",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
     );
 }
