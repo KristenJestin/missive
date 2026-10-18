@@ -3,6 +3,7 @@
 
 pub mod account;
 pub mod connect;
+pub mod events;
 #[cfg(feature = "fake")]
 pub mod fake;
 pub mod keyring;
