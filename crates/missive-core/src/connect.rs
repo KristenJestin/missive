@@ -107,6 +107,9 @@ pub fn client_config(pinned: Option<CertificateDer<'static>>) -> Arc<ClientConfi
     )
 }
 
+/// An IMAP session over TLS, logged in.
+pub type ImapSession = async_imap::Session<TlsStream<TcpStream>>;
+
 /// Logs in to the IMAP server and out again.
 pub async fn check_imap(
     server: &Server,
@@ -115,34 +118,54 @@ pub async fn check_imap(
     tls: Arc<ClientConfig>,
 ) -> Result<()> {
     within(CHECK_TIMEOUT, async {
-        let tcp = connect(server).await?;
-        let stream = match server.security {
-            Security::Tls => {
-                let stream = handshake(server, tls, tcp).await?;
-                let mut client = async_imap::Client::new(stream);
-                greeting(&mut client).await?;
-                client.into_inner()
-            }
-            Security::Starttls => {
-                let mut client = async_imap::Client::new(tcp);
-                greeting(&mut client).await?;
-                client
-                    .run_command_and_check_ok("STARTTLS", None)
-                    .await
-                    .map_err(imap_error)?;
-                handshake(server, tls, client.into_inner()).await?
-            }
-        };
-        let mut session = async_imap::Client::new(stream)
-            .login(user, password.expose())
-            .await
-            .map_err(|(error, _)| match error {
-                async_imap::error::Error::No(text) => login_refusal(&text),
-                error => imap_error(error),
-            })?;
+        let mut session = login_imap(server, user, password, tls).await?;
         session.logout().await.map_err(imap_error)
     })
     .await
+}
+
+/// Connects to the IMAP server, secures the connection and logs in, within the time a login
+/// check may take.
+pub async fn open_imap(
+    server: &Server,
+    user: &str,
+    password: &Password,
+    tls: Arc<ClientConfig>,
+) -> Result<ImapSession> {
+    within(CHECK_TIMEOUT, login_imap(server, user, password, tls)).await
+}
+
+async fn login_imap(
+    server: &Server,
+    user: &str,
+    password: &Password,
+    tls: Arc<ClientConfig>,
+) -> Result<ImapSession> {
+    let tcp = connect(server).await?;
+    let stream = match server.security {
+        Security::Tls => {
+            let stream = handshake(server, tls, tcp).await?;
+            let mut client = async_imap::Client::new(stream);
+            greeting(&mut client).await?;
+            client.into_inner()
+        }
+        Security::Starttls => {
+            let mut client = async_imap::Client::new(tcp);
+            greeting(&mut client).await?;
+            client
+                .run_command_and_check_ok("STARTTLS", None)
+                .await
+                .map_err(imap_error)?;
+            handshake(server, tls, client.into_inner()).await?
+        }
+    };
+    async_imap::Client::new(stream)
+        .login(user, password.expose())
+        .await
+        .map_err(|(error, _)| match error {
+            async_imap::error::Error::No(text) => login_refusal(&text),
+            error => imap_error(error),
+        })
 }
 
 /// A `NO` to `LOGIN` is a refusal of the credentials when it has no response code, or the code
@@ -184,7 +207,7 @@ where
 }
 
 /// Server texts are left out: they are not needed to tell the states apart.
-fn imap_error(error: async_imap::error::Error) -> ConnectError {
+pub fn imap_error(error: async_imap::error::Error) -> ConnectError {
     match error {
         async_imap::error::Error::Io(error) => error.into(),
         async_imap::error::Error::ConnectionLost => {
