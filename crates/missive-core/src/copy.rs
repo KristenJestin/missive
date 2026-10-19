@@ -23,6 +23,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::compose::Followup;
 use crate::store::{HALF_MOVE_LEFT, SCHEMA_VERSION, SkippedFolder};
 
 /// Roles whose unread messages are left out of every total: nobody wants a badge for spam.
@@ -67,6 +68,9 @@ const DELETED_LEFT_VERSION: i64 = 15;
 
 /// The first schema version that tells a half move that is only a maybe.
 const MAYBE_HALF_MOVE_VERSION: i64 = 16;
+
+/// The first schema version that records which drafts Missive wrote itself.
+const OWN_DRAFT_VERSION: i64 = 17;
 
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
@@ -895,6 +899,31 @@ impl Copy {
             .optional()?)
     }
 
+    /// What `raw`, a version of a draft of `account`, follows up: the message it answers or
+    /// forwards, when Missive saved the draft with the same headers. A draft another client
+    /// wrote names nothing, whatever its headers say (see [`Followup::trusted`]).
+    pub fn followup(&self, account: &str, raw: &[u8]) -> Result<Followup> {
+        let recorded = match crate::compose::draft_message_id(raw) {
+            Some(message_id) if self.version >= OWN_DRAFT_VERSION => self
+                .connection
+                .query_row(
+                    "SELECT own_draft.answers, own_draft.forwards FROM own_draft
+                       JOIN account ON account.key = own_draft.account
+                      WHERE account.id = ?1 AND own_draft.message_id = ?2",
+                    params![account, message_id],
+                    |r| {
+                        Ok(Followup {
+                            answers: r.get(0)?,
+                            forwards: r.get(1)?,
+                        })
+                    },
+                )
+                .optional()?,
+            _ => None,
+        };
+        Ok(Followup::trusted(raw, recorded.as_ref()))
+    }
+
     /// A message the server does not hold yet, named by its Message-ID (with or without angle
     /// brackets), as `compose` prints it and as [`Copy::list`] shows a draft waiting for the
     /// server: the draft's version waiting in the copy, else the message waiting in the outbox
@@ -1204,6 +1233,24 @@ mod tests {
         assert_eq!(copy.draft("alice", "d@example.org").unwrap(), Some(waiting));
         assert_eq!(copy.draft("alice", "x@example.org").unwrap(), None);
         assert_eq!(copy.draft("bob", "d@example.org").unwrap(), None);
+    }
+
+    #[test]
+    fn the_follow_up_of_a_draft_is_read_back_only_when_missive_saved_it() {
+        let (_dir, mut store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        store.account("bob").unwrap();
+        let raw = b"X-Missive-Draft: 1\r\nX-Missive-Forwards: alice/1/1/1\r\n\
+                    Message-ID: <d@example.org>\r\n\r\nText\r\n";
+        assert_eq!(copy.followup("alice", raw).unwrap(), Followup::default());
+
+        store.save_draft(alice, "d@example.org", raw).unwrap();
+        let forwards = Followup {
+            answers: None,
+            forwards: Some("alice/1/1/1".to_owned()),
+        };
+        assert_eq!(copy.followup("alice", raw).unwrap(), forwards);
+        assert_eq!(copy.followup("bob", raw).unwrap(), Followup::default());
     }
 
     #[test]

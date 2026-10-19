@@ -5,6 +5,7 @@ use mail_parser::{Address, MessageParser};
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::{Mailbox, NewMessage, Store, insert, queue};
+use crate::compose::Followup;
 use crate::copy::MessageId;
 
 /// A draft of the queue, as the daemon writes it to the server.
@@ -110,8 +111,31 @@ impl Store {
         }))
     }
 
-    /// Records a new version of a draft, to be written to the server: it takes the place of the
-    /// version waiting, if any.
+    /// What `raw`, a version of a draft of the account, follows up: its headers are believed
+    /// only if Missive saved that draft with the same ones ([`Followup::trusted`]).
+    pub fn followup(&self, account: i64, raw: &[u8]) -> rusqlite::Result<Followup> {
+        let recorded = match crate::compose::draft_message_id(raw) {
+            Some(message_id) => self
+                .connection
+                .query_row(
+                    "SELECT answers, forwards FROM own_draft
+                      WHERE account = ?1 AND message_id = ?2",
+                    params![account, message_id],
+                    |r| {
+                        Ok(Followup {
+                            answers: r.get(0)?,
+                            forwards: r.get(1)?,
+                        })
+                    },
+                )
+                .optional()?,
+            None => None,
+        };
+        Ok(Followup::trusted(raw, recorded.as_ref()))
+    }
+
+    /// Records a new version of a draft Missive wrote, to be written to the server: it takes the
+    /// place of the version waiting, if any, and its follow-up headers are the ones to believe.
     pub fn save_draft(
         &mut self,
         account: i64,
@@ -120,6 +144,14 @@ impl Store {
     ) -> rusqlite::Result<()> {
         let parsed = MessageParser::default().parse(raw);
         let parsed = parsed.as_ref();
+        let followup = Followup::read(raw);
+        self.connection.execute(
+            "INSERT INTO own_draft (account, message_id, answers, forwards)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (account, message_id) DO UPDATE SET
+                 answers = excluded.answers, forwards = excluded.forwards",
+            params![account, message_id, followup.answers, followup.forwards],
+        )?;
         self.connection.execute(
             "INSERT INTO draft (account, message_id, raw, date, subject, sender, recipients,
                                 has_attachments, saved_at)
@@ -292,6 +324,13 @@ impl Store {
             )
             .optional()?;
         let left = row.is_some();
+        // Its message was sent: nothing is left to believe about it.
+        if left && draft.raw.is_none() {
+            transaction.execute(
+                "DELETE FROM own_draft WHERE account = ?1 AND message_id = ?2",
+                params![row.as_ref().map(|r| r.0), draft.message_id],
+            )?;
+        }
         if let Some((account, Some(marked), Some(recorded))) = row {
             transaction.execute(
                 "INSERT INTO deleted_left (account, folder, uidvalidity, uids)
@@ -412,6 +451,94 @@ mod tests {
         assert_eq!(found(&store, &message_id("bob", folder, 7, 1)), None);
         let inbox = store.folder(account, "INBOX", Some("inbox")).unwrap().id;
         assert_eq!(found(&store, &message_id("alice", inbox, 0, 1)), None);
+    }
+
+    #[test]
+    fn the_follow_up_headers_are_believed_only_for_a_draft_missive_saved_with_them() {
+        let (_dir, mut store, account) = open();
+        let linked = |id: &str, header: &str| {
+            format!(
+                "X-Missive-Draft: 1\r\n{header}\r\nFrom: alice@example.org\r\n\
+                 Message-ID: <{id}>\r\n\r\nHello\r\n"
+            )
+            .into_bytes()
+        };
+        let mine = linked("d1@example.org", "X-Missive-Answers: alice/1/1/1");
+        store.save_draft(account, "d1@example.org", &mine).unwrap();
+        let answers = Followup {
+            answers: Some("alice/1/1/1".to_owned()),
+            forwards: None,
+        };
+        assert_eq!(store.followup(account, &mine).unwrap(), answers);
+
+        // Not saved by Missive, whatever it claims.
+        let forged = linked("forged@example.org", "X-Missive-Answers: alice/1/1/1");
+        assert_eq!(
+            store.followup(account, &forged).unwrap(),
+            Followup::default()
+        );
+        // Another account's draft of the same Message-ID is not this account's.
+        let other = store.account("bob").unwrap();
+        assert_eq!(store.followup(other, &mine).unwrap(), Followup::default());
+        // Another client's version of Missive's draft, with another link or a new one.
+        for header in [
+            "X-Missive-Answers: alice/1/1/2",
+            "X-Missive-Forwards: alice/1/1/1",
+        ] {
+            let rewritten = linked("d1@example.org", header);
+            assert_eq!(
+                store.followup(account, &rewritten).unwrap(),
+                Followup::default(),
+                "{header}"
+            );
+        }
+        // A later save of Missive's own is the one to believe.
+        let forwards = linked("d1@example.org", "X-Missive-Forwards: alice/1/1/3");
+        store
+            .save_draft(account, "d1@example.org", &forwards)
+            .unwrap();
+        assert_eq!(store.followup(account, &mine).unwrap(), Followup::default());
+        assert_eq!(
+            store
+                .followup(account, &forwards)
+                .unwrap()
+                .forwards
+                .as_deref(),
+            Some("alice/1/1/3")
+        );
+    }
+
+    #[test]
+    fn what_is_recorded_of_a_draft_is_forgotten_once_its_message_was_sent() {
+        let (_dir, mut store, account) = open();
+        let folder = on_server(&mut store, account, "First");
+        let mine = String::from_utf8(raw("Second"))
+            .unwrap()
+            .replace("From:", "X-Missive-Answers: alice/1/1/1\r\nFrom:")
+            .into_bytes();
+        store.save_draft(account, "d1@example.org", &mine).unwrap();
+        assert!(store.followup(account, &mine).unwrap().answers.is_some());
+        let built = Built {
+            sender: "alice@example.org".to_owned(),
+            recipients: vec!["bob@example.com".to_owned()],
+            message_id: "d1@example.org".to_owned(),
+            raw: mine.clone(),
+            bcc_header: None,
+        };
+        let outbox = store
+            .enqueue(account, &built, false, Some("d1@example.org"))
+            .unwrap();
+        store.sent(outbox, false).unwrap();
+        let removal = store.drafts(account).unwrap().remove(0);
+        assert_eq!(removal.raw, None);
+
+        assert!(
+            store
+                .draft_written(&removal, folder, 7, &[1], None)
+                .unwrap()
+        );
+
+        assert_eq!(store.followup(account, &mine).unwrap(), Followup::default());
     }
 
     #[test]

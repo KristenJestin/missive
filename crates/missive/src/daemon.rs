@@ -763,13 +763,14 @@ impl Daemon {
             None => (Draft::default(), None, None, None, Followup::default()),
             Some(id) => match store.find_draft(key, id) {
                 Ok(Some(stored)) => match Draft::read(&stored.raw) {
-                    Ok(draft) if compose::is_own_draft(&stored.raw) => (
-                        draft,
-                        stored.message_id,
-                        None,
-                        None,
-                        Followup::read(&stored.raw),
-                    ),
+                    Ok(draft) if compose::is_own_draft(&stored.raw) => {
+                        // Its links are believed only if Missive saved them.
+                        let followup = match store.followup(key, &stored.raw) {
+                            Ok(followup) => followup,
+                            Err(e) => return failed(e.to_string()),
+                        };
+                        (draft, stored.message_id, None, None, followup)
+                    }
                     // Named by its own Message-ID, whichever way the request named it.
                     Ok(draft) => (
                         draft,

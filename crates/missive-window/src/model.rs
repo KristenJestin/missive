@@ -1000,12 +1000,21 @@ impl Model {
             }
         };
         let raw = match self.copy() {
-            Ok(Some(copy)) => copy.draft(&account, &id).map_err(|e| e.to_string()),
+            Ok(Some(copy)) => copy
+                .draft(&account, &id)
+                .and_then(|raw| {
+                    raw.map(|raw| {
+                        copy.followup(&account, &raw)
+                            .map(|followup| (raw, followup))
+                    })
+                    .transpose()
+                })
+                .map_err(|e| e.to_string()),
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         };
         let found = match raw {
-            Ok(Some(raw)) => Compose::draft(accounts, account, id, &raw),
+            Ok(Some((raw, followup))) => Compose::draft(accounts, account, id, &raw, followup),
             Ok(None) => Err("it is no longer in the local copy".to_owned()),
             Err(e) => Err(e),
         };

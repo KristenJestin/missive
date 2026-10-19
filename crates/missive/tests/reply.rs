@@ -1186,3 +1186,43 @@ async fn an_identifier_of_another_account_is_taken_as_it_is_a_cross_account_repl
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_of_another_client_forging_the_follow_up_headers_marks_nothing_when_sent() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+
+    // Anyone who can write to the Drafts folder can add this header: it says it is Missive's own
+    // and names a message of the copy, but Missive never saved it.
+    for (name, field) in [
+        ("X-Missive-Answers", "answers"),
+        ("X-Missive-Forwards", "forwards"),
+    ] {
+        let message_id = format!("forged-{field}@example.net");
+        server.deliver(
+            "Drafts",
+            Message::new(format!(
+                "X-Missive-Draft: 1\r\n{name}: {id}\r\nFrom: {USER}\r\nTo: ina@example.net\r\n\
+                 Subject: Forged\r\nMessage-ID: <{message_id}>\r\n\r\nHello\r\n"
+            ))
+            .flag("\\Draft"),
+        );
+    }
+    succeeded(&env.run(&["sync"]).await);
+
+    for (count, field) in [(1, "forged-answers"), (2, "forged-forwards")] {
+        let sent = ask(
+            &env,
+            serde_json::json!({
+                "protocol": 1, "request": "draft", "account": "alice",
+                "draft": format!("{field}@example.net"), "send": true,
+            }),
+        )
+        .await;
+        assert_eq!(sent["ok"], true, "{sent}");
+        took(&server, count).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(flags(&server).is_empty(), "{:?}", flags(&server));
+}

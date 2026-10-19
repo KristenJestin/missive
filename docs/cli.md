@@ -825,7 +825,9 @@ the text above the quote.
   another account sends the reply. A reply or a forward saved as a draft keeps the link to its
   original (an `X-Missive-Answers` or `X-Missive-Forwards` header of the draft, which the message
   sent never carries): picked up later and sent, from the command line or the window, it marks the
-  original all the same. The message answered must be in the local copy when the reply is saved
+  original all the same. Only the links of drafts Missive saved itself are believed (the copy records
+  them): a draft of another client that carries these headers is edited and sent as any other, and
+  marks nothing. The message answered must be in the local copy when the reply is saved
   or sent: an identifier of a message that is gone is refused with the error `original-gone` (exit
   status 3; the window drops the link and asks again), and one that is no identifier at all with
   `no-such-message`.

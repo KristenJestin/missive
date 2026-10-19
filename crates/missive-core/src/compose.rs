@@ -141,8 +141,8 @@ pub struct Followup {
 }
 
 impl Followup {
-    /// What a draft Missive wrote says it follows up. A draft of another client says nothing,
-    /// whatever its headers.
+    /// What a draft that carries [`OWN_DRAFT`] says it follows up. Whether to believe it is for
+    /// [`Followup::trusted`]: these headers can be written by anyone.
     pub fn read(raw: &[u8]) -> Followup {
         let Some(parsed) = MessageParser::default().parse_headers(raw) else {
             return Followup::default();
@@ -160,6 +160,19 @@ impl Followup {
         Followup {
             answers: text(ANSWERS),
             forwards: text(FORWARDS),
+        }
+    }
+
+    /// What `raw` says it follows up, believed only when `recorded` (what Missive recorded when
+    /// it saved the draft, `None` for a draft it did not write) says the same: anyone who can
+    /// write to the Drafts folder can add these headers to a draft, so a draft Missive did not
+    /// save names nothing, and neither does a version of one whose headers were changed.
+    pub fn trusted(raw: &[u8], recorded: Option<&Followup>) -> Followup {
+        let read = Followup::read(raw);
+        if recorded == Some(&read) {
+            read
+        } else {
+            Followup::default()
         }
     }
 

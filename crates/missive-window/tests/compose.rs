@@ -4,6 +4,7 @@
 mod common;
 
 use common::{ID, Mail, mailbox};
+use missive_core::compose::Followup;
 use missive_core::protocol::{Answer, Attached, Command, PROTOCOL, SaveDraft};
 use missive_window::compose::{Compose, Field, MAX_ATTACHMENT, State, addresses, load};
 use missive_window::model::{Model, Start};
@@ -401,6 +402,7 @@ fn a_draft_picked_up_again_shows_its_fields_and_saves_under_its_identifier() {
         ID.to_owned(),
         "d@example.org".to_owned(),
         raw,
+        Followup::default(),
     )
     .unwrap();
     assert_eq!(
@@ -419,6 +421,7 @@ fn a_draft_picked_up_again_shows_its_fields_and_saves_under_its_identifier() {
         ID.to_owned(),
         "d@example.org".to_owned(),
         raw,
+        Followup::default(),
     )
     .unwrap();
     let request = draft(type_and_wait(&mut compose, Field::Subject, "Plans, v2").unwrap());
@@ -508,6 +511,8 @@ fn picked_up(raw: &[u8]) -> Compose {
         ID.to_owned(),
         "alice/3/1/5".to_owned(),
         raw,
+        // As the copy gives it for a draft Missive saved itself.
+        Followup::read(raw),
     )
     .unwrap()
 }
@@ -554,9 +559,72 @@ fn a_draft_picked_up_again_remembers_the_message_it_answers_or_forwards() {
 fn a_draft_of_another_client_names_nothing_it_answers() {
     let raw = b"X-Missive-Answers: alice/3/1/5\r\nTo: zoe@example.com\r\nSubject: Re: Plans\r\n\
         Message-ID: <d@example.org>\r\n\r\nHello\r\n";
-    let mut compose = picked_up(raw);
+    // The copy believes no link of a draft Missive did not save.
+    let mut compose = Compose::draft(
+        vec![ID.to_owned()],
+        ID.to_owned(),
+        "alice/3/1/5".to_owned(),
+        raw,
+        Followup::trusted(raw, None),
+    )
+    .unwrap();
     let save = draft(type_and_wait(&mut compose, Field::Body, "Noon.").unwrap());
     assert_eq!((save.answers, save.forwards), (None, None));
+}
+
+#[tokio::test]
+async fn a_draft_forging_the_follow_up_headers_names_nothing_but_one_missive_saved_does() {
+    let mail = Mail::new(mailbox()).await;
+    let mut store = missive_core::store::Store::open(&mail.copy_path()).unwrap();
+    let key = store.account(ID).unwrap();
+    let draft_with = |id: &str| {
+        format!(
+            "X-Missive-Draft: 1\r\nX-Missive-Answers: alice/3/1/5\r\nTo: zoe@example.com\r\n\
+             Subject: Re: Plans\r\nMessage-ID: <{id}>\r\n\r\nHello\r\n"
+        )
+        .into_bytes()
+    };
+    // One Missive saved, and one that only sits in the Drafts folder, written by anyone.
+    store
+        .save_draft(key, "mine@example.org", &draft_with("mine@example.org"))
+        .unwrap();
+    let folder = store.folder(key, "Drafts", Some("drafts")).unwrap().id;
+    store.rebuild(folder, 7).unwrap();
+    let forged = draft_with("forged@example.org");
+    store
+        .insert(
+            folder,
+            &[missive_core::store::NewMessage {
+                uid: 1,
+                flags: "\\Draft".to_owned(),
+                internal_date: None,
+                size: forged.len() as i64,
+                raw: forged,
+            }],
+        )
+        .unwrap();
+    // A version of Missive's own draft that another client rewrote with another link.
+    let rewritten = String::from_utf8(draft_with("mine@example.org"))
+        .unwrap()
+        .replace("alice/3/1/5", "alice/3/1/6")
+        .into_bytes();
+    let copy = missive_core::copy::Copy::open(&mail.copy_path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        copy.followup(ID, &rewritten).unwrap(),
+        Followup::default(),
+        "a link that is not the one Missive saved"
+    );
+
+    let answers = |id: &str| {
+        let mut compose =
+            missive_window::launch::compose(&mail.sources(), ID.to_owned(), id.to_owned());
+        assert!(compose.notice.is_none(), "{:?}", compose.notice);
+        draft(type_and_wait(&mut compose, Field::Body, "Noon.").unwrap()).answers
+    };
+    assert_eq!(answers("mine@example.org").as_deref(), Some("alice/3/1/5"));
+    assert_eq!(answers("forged@example.org"), None);
 }
 
 #[test]

@@ -198,12 +198,14 @@ impl Compose {
     }
 
     /// A draft picked up again: `id` names it as the daemon's `draft` request takes it, `raw` is
-    /// its latest version.
+    /// its latest version, and `followup` the message it answers or forwards, as the copy
+    /// believes it (`Copy::followup`: a draft of another client names none).
     pub fn draft(
         accounts: Vec<String>,
         account: String,
         id: String,
         raw: &[u8],
+        followup: Followup,
     ) -> Result<Compose, String> {
         let draft = Draft::read(raw)?;
         let mut compose = Compose::new(accounts, account);
@@ -216,7 +218,6 @@ impl Compose {
         compose.attachments = draft.attachments;
         compose.in_reply_to = draft.in_reply_to.into_iter().next();
         compose.references = draft.references;
-        let followup = Followup::read(raw);
         compose.answers = followup.answers;
         compose.forwards = followup.forwards;
         compose.message_id = compose::draft_message_id(raw);
