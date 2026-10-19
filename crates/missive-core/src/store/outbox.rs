@@ -1,4 +1,4 @@
-//! The outbox (schema versions 6, 8 and 9): the messages to send, and where each one is between
+//! The outbox (schema versions 6, 8, 9 and 10): the messages to send, and where each one is between
 //! its writing and its server's answer. See [`crate::outbox`].
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -216,6 +216,15 @@ impl Store {
         Ok(())
     }
 
+    /// Makes the account's queued messages due at once, whatever wait they were given: a login
+    /// that was refused is no reason for a message to wait once the password is another.
+    pub fn due_now(&self, account: i64) -> rusqlite::Result<usize> {
+        self.connection.execute(
+            "UPDATE outbox SET next_attempt_at = 0 WHERE account = ?1 AND state = 'queued'",
+            [account],
+        )
+    }
+
     /// Puts a `failed` message, or with `uncertain_too` an `uncertain` one, back in the queue,
     /// to send at once. Only the user asks for it: an `uncertain` message may have reached the
     /// server already. In one statement, so that the message is queued once.
@@ -375,6 +384,17 @@ impl Store {
         self.connection.query_row(
             "UPDATE outbox SET copy_attempts = copy_attempts + 1 WHERE id = ?1
              RETURNING copy_attempts",
+            [id],
+            |r| r.get(0),
+        )
+    }
+
+    /// Looking for a copy in Sent failed; returns how many times it did so far, this one
+    /// included.
+    pub fn copy_search_failed(&self, id: i64) -> rusqlite::Result<u32> {
+        self.connection.query_row(
+            "UPDATE outbox SET copy_search_failures = copy_search_failures + 1 WHERE id = ?1
+             RETURNING copy_search_failures",
             [id],
             |r| r.get(0),
         )

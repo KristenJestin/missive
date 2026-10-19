@@ -256,8 +256,9 @@ before any watcher can be subscribed: `status` shows it.
 ### `sent-copy-failed`
 
 The copy of a message the server took will never be in the account's Sent folder: appending it
-failed five times, or the server says there is no such folder, or the folder's name cannot be
-written in an IMAP command, or the account turned out to have no Sent folder. The message was
+failed five times, looking for it in Sent (to avoid appending it twice) failed five times, the
+server says there is no such folder, the folder's name cannot be written in an IMAP command, or
+the account turned out to have no Sent folder. The message was
 sent all the same; it leaves the outbox.
 
 ```json

@@ -55,7 +55,8 @@ async fn send(fake: &FakeServer) -> (Result<Submitted, ConnectError>, bool) {
             Ok(())
         },
     )
-    .await;
+    .await
+    .map(|(submitted, _)| submitted);
     (submitted, called.load(Ordering::SeqCst))
 }
 
@@ -81,7 +82,8 @@ async fn a_message_arrives_as_built_with_its_envelope_over_tls_and_starttls() {
             },
             || Ok(()),
         )
-        .await;
+        .await
+        .map(|(submitted, _)| submitted);
         assert_eq!(submitted, Ok(Submitted::Sent));
     }
 
@@ -111,7 +113,8 @@ async fn a_wrong_certificate_is_refused_before_anything_is_sent() {
         },
         || Ok(()),
     )
-    .await;
+    .await
+    .map(|(submitted, _)| submitted);
 
     assert_eq!(submitted, Err(ConnectError::CertificateRefused));
     assert!(fake.smtp_messages().is_empty());
@@ -191,7 +194,8 @@ async fn without_the_mark_of_sending_the_end_of_data_is_never_written() {
         },
         || Err("the outbox could not be written".to_owned()),
     )
-    .await;
+    .await
+    .map(|(submitted, _)| submitted);
 
     assert_eq!(
         submitted,
@@ -268,7 +272,8 @@ async fn starttls_answered_with_anything_but_220_aborts_before_auth() {
             },
             || Ok(()),
         )
-        .await;
+        .await
+        .map(|(submitted, _)| submitted);
 
         assert!(
             matches!(submitted, Err(ConnectError::Unreachable(_))),

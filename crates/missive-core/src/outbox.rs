@@ -37,9 +37,10 @@
 //! path (`APPEND` counts only with its tagged `OK`), flagged `\Seen`, with the message's Bcc
 //! recipients in it (see [`crate::compose`]). A try whose answer was lost, or that a killed daemon
 //! left, may have appended it: each try is counted before its `APPEND`, and every try after the
-//! first searches the Sent folder for its `Message-ID` first (a search that fails is not a try).
-//! Missive never creates a Sent folder.
-//! After [`MAX_ATTEMPTS`] tries the copy is given up (the message was sent).
+//! first searches the Sent folder for its `Message-ID` first (a search that fails is not a try,
+//! but is counted apart). Missive never creates a Sent folder.
+//! After [`MAX_ATTEMPTS`] tries, or [`MAX_ATTEMPTS`] failed searches, the copy is given up (the
+//! message was sent).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,13 +51,17 @@ use crate::account::{Account, Password};
 use crate::actions::MAX_ATTEMPTS;
 use crate::connect::{ConnectError, ImapSession};
 use crate::store::Store;
-use crate::submit::{Outgoing, Submitted, submit};
+use crate::submit::{Goodbye, Outgoing, Submitted, submit};
 use crate::sync::{self, Done, SyncError};
 
 /// How many times recording what came of a submission is tried, [`RECORD_PAUSE`] apart, when the
 /// copy is busy: each try already waits for the copy as long as its busy timeout says.
 const RECORD_TRIES: u32 = 5;
 const RECORD_PAUSE: Duration = Duration::from_secs(1);
+/// How long a daemon that stops is to give the record: the pauses between all its tries, and a
+/// second for the last one, so that a stop never takes away tries the record would have had.
+pub const RECORD_GRACE: Duration =
+    Duration::from_secs(RECORD_PAUSE.as_secs() * (RECORD_TRIES as u64 - 1) + 1);
 
 /// How long a message stays `claimed` before `status` calls it stuck, in milliseconds: more than
 /// a submission can take (each command waits at most 5 minutes, the data 10).
@@ -107,6 +112,8 @@ pub struct Submission {
     /// Whether a copy is to go in Sent (the server does not keep one itself).
     sent_copy: bool,
     submitted: Result<Submitted, ConnectError>,
+    /// Said once the submission is recorded.
+    goodbye: Goodbye,
 }
 
 /// Submits the account's first message whose time has come, if there is one, and records what
@@ -139,7 +146,7 @@ pub async fn submit_next(
     };
     let id = message.id;
     let marking = &mut *store;
-    let submitted = submit(
+    let (submitted, goodbye) = match submit(
         &account.smtp,
         &account.user,
         password,
@@ -155,12 +162,17 @@ pub async fn submit_next(
                 .map_err(|e| format!("the outbox could not be written ({e})"))
         },
     )
-    .await;
+    .await
+    {
+        Ok((submitted, goodbye)) => (Ok(submitted), goodbye),
+        Err(error) => (Err(error), Goodbye::none()),
+    };
     Ok(Some(Submission {
         id,
         message_id: message.message_id,
         sent_copy: message.sent_copy,
         submitted,
+        goodbye,
     }))
 }
 
@@ -175,8 +187,9 @@ pub async fn record(
         message_id,
         sent_copy: copy,
         submitted,
+        goodbye,
     } = submission;
-    Ok(match submitted {
+    let tried = match submitted {
         Ok(Submitted::Sent) => {
             // A folder that cannot be read is not an answer: the copy is left to the IMAP worker,
             // which looks again. What was sent is recorded whatever these reads say.
@@ -225,7 +238,10 @@ pub async fn record(
             recorded(store, |store| store.send_again(id, &why, now())).await?;
             Tried::Login { id, error }
         }
-    })
+    };
+    // Apart, so that neither a slow server nor a stop waits for a courtesy.
+    tokio::spawn(goodbye.say());
+    Ok(tried)
 }
 
 /// Records what came of a submission, trying again while the copy is busy: the server's answer
@@ -318,21 +334,30 @@ async fn copy_each(
             continue;
         };
         // Only an append started counts: a search that fails (the connection dropped) says
-        // nothing of the copy, and the next pass searches again.
+        // nothing of the copy, and the next pass searches again, a few times.
         if copy.attempts > 0 {
             let searched =
                 tokio::time::timeout(timeout, already_there(session, &name, &copy.message_id))
                     .await;
             match searched {
-                Ok(Ok(true)) => {
+                Ok(Ok(Some(true))) => {
                     store.copy_done(id)?;
                     copies.copied.push(Copied::Appended { id });
                     copies.resync = Some(folder);
                     continue;
                 }
-                Ok(Ok(false)) => {}
-                Ok(Err(error)) => return Err(error),
+                Ok(Ok(Some(false))) => {}
+                // A refusal is not an answer: appending again could double the copy.
+                Ok(Ok(None)) => {
+                    search_failed(store, id, copy.message_id, copies)?;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    search_failed(store, id, copy.message_id, copies)?;
+                    return Err(error);
+                }
                 Err(_) => {
+                    search_failed(store, id, copy.message_id, copies)?;
                     copies.timed_out = true;
                     return Err(SyncError::Connection(ConnectError::Unreachable(
                         "the IMAP server did not answer SEARCH in time".to_owned(),
@@ -401,22 +426,41 @@ fn failed(
     Ok(())
 }
 
+/// A look in Sent for a copy failed: the copy stays, and is given up after [`MAX_ATTEMPTS`] of
+/// them, as after as many failed appends.
+fn search_failed(
+    store: &mut Store,
+    id: i64,
+    message_id: String,
+    copies: &mut Copies,
+) -> rusqlite::Result<()> {
+    if store.copy_search_failed(id)? >= MAX_ATTEMPTS {
+        store.copy_done(id)?;
+        copies.copied.push(Copied::GivenUp {
+            id,
+            message_id,
+            why: "looking for it in Sent failed too many times",
+        });
+    }
+    Ok(())
+}
+
 /// Whether Sent holds a message with this Message-ID: a try whose answer was lost may have
-/// appended it.
+/// appended it. `None` when the server refused to say.
 async fn already_there(
     session: &mut ImapSession,
     name: &str,
     message_id: &str,
-) -> Result<bool, SyncError> {
+) -> Result<Option<bool>, SyncError> {
     if sync::examine_uidvalidity(session, name).await?.is_none() {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(quoted) = sync::quote(&format!("<{message_id}>")) else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     Ok(
         sync::search(session, &format!("HEADER Message-ID {quoted}"))
             .await?
-            .is_some_and(|found| !found.is_empty()),
+            .map(|found| !found.is_empty()),
     )
 }

@@ -386,6 +386,7 @@ impl Builder {
                 smtp_rules: self.smtp_rules,
                 smtp_delays: Vec::new(),
                 smtp_delayed: 0,
+                smtp_quits: 0,
             }),
             changes: watch::channel(()).0,
             condstore: !self.without_condstore,
@@ -658,6 +659,11 @@ impl FakeServer {
         self.shared.state().smtp_delayed
     }
 
+    /// How many SMTP sessions said `QUIT` so far.
+    pub fn smtp_quits(&self) -> usize {
+        self.shared.state().smtp_quits
+    }
+
     /// Every message the SMTP side accepted, in order.
     pub fn smtp_messages(&self) -> Vec<SmtpMessage> {
         self.shared.state().smtp_messages.clone()
@@ -757,6 +763,7 @@ struct State {
     smtp_rules: Vec<SmtpRule>,
     smtp_delays: Vec<(String, Duration)>,
     smtp_delayed: usize,
+    smtp_quits: usize,
 }
 
 /// What a test asked the SMTP side to answer to the commands that start with `command`.

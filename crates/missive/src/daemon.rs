@@ -62,7 +62,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 /// IDLE is re-issued after this long at most: RFC 2177 lets a server drop a client idle for 30
@@ -160,6 +160,7 @@ pub async fn run(options: Options) -> Result<(), String> {
         stopping,
         workers: Mutex::new(BTreeMap::new()),
         senders: Mutex::new(BTreeMap::new()),
+        rechecks: Mutex::new(BTreeMap::new()),
         tasks: Mutex::new(JoinSet::new()),
     });
     let accounts = daemon.reload();
@@ -306,6 +307,9 @@ struct Daemon {
     workers: Mutex<BTreeMap<String, mpsc::UnboundedSender<Request>>>,
     /// Where to wake each account's SMTP worker, by identifier.
     senders: Mutex<BTreeMap<String, mpsc::UnboundedSender<()>>>,
+    /// Where to tell each account's SMTP worker that the user asked for a sync, which is how a
+    /// password fixed is told (the IMAP worker reads the keyring again for it too).
+    rechecks: Mutex<BTreeMap<String, Arc<Notify>>>,
     tasks: Mutex<JoinSet<()>>,
 }
 
@@ -358,6 +362,7 @@ impl Daemon {
         self.forget_removed(&listing);
         let mut workers = locked(&self.workers);
         let mut senders = locked(&self.senders);
+        let mut rechecks = locked(&self.rechecks);
         // An account whose settings cannot be read now keeps its worker: it was not removed.
         let kept = |id: &String| {
             listing.accounts.iter().any(|(a, _)| a == id)
@@ -365,6 +370,7 @@ impl Daemon {
         };
         workers.retain(|id, _| kept(id));
         senders.retain(|id, _| kept(id));
+        rechecks.retain(|id, _| kept(id));
         for (id, account) in listing.accounts {
             if workers.contains_key(&id) {
                 continue;
@@ -409,6 +415,7 @@ impl Daemon {
             };
             let (requests, receiver) = mpsc::unbounded_channel();
             let (wake, woken) = mpsc::unbounded_channel();
+            let recheck = Arc::new(Notify::new());
             let smtp = SmtpWorker {
                 id: id.clone(),
                 key,
@@ -416,6 +423,7 @@ impl Daemon {
                 certificate: certificate.clone(),
                 store: sending,
                 wake: woken,
+                recheck: recheck.clone(),
                 imap: requests.downgrade(),
                 stop: self.stopping.clone(),
                 events: self.events.clone(),
@@ -423,6 +431,7 @@ impl Daemon {
             locked(&self.tasks).spawn(smtp.run());
             workers.insert(id.clone(), requests);
             senders.insert(id.clone(), wake);
+            rechecks.insert(id.clone(), recheck);
             let worker = Worker {
                 id,
                 key,
@@ -555,6 +564,9 @@ impl Daemon {
                 }
                 let mut pending = Vec::new();
                 for (id, sender) in targets {
+                    if let Some(recheck) = locked(&self.rechecks).get(&id) {
+                        recheck.notify_one();
+                    }
                     let (waiter, answer) = oneshot::channel();
                     let _ = sender.send(Request::Sync(waiter));
                     pending.push((id, answer));
@@ -1912,6 +1924,8 @@ struct SmtpWorker {
     store: Store,
     /// A message was written to the outbox.
     wake: mpsc::UnboundedReceiver<()>,
+    /// The user asked for a sync: a password may have been fixed.
+    recheck: Arc<Notify>,
     /// The account's IMAP worker; weak, so that it still ends when its account is removed.
     imap: mpsc::WeakUnboundedSender<Request>,
     stop: watch::Receiver<bool>,
@@ -2006,14 +2020,15 @@ impl SmtpWorker {
                 Ok(Some(submission)) => {
                     // The server's answer is known only here: a stop does not drop it, or the
                     // message it took would stay `sending`, then `uncertain`. It is a few local
-                    // writes, given a little time, not all the time a broken disk takes.
+                    // writes, given the time of all its tries, not all the time a broken disk
+                    // takes.
                     let record = outbox::record(&mut self.store, self.key, submission);
                     tokio::pin!(record);
                     tokio::select! {
                         tried = &mut record => tried.map(Some),
                         _ = async {
                             stopped(&mut self.stop).await;
-                            tokio::time::sleep(STOP_GRACE).await;
+                            tokio::time::sleep(outbox::RECORD_GRACE).await;
                         } => {
                             log!(
                                 "account {}: the daemon stopped before the outbox could be \
@@ -2041,10 +2056,11 @@ impl SmtpWorker {
             // A login that failed fails for every message: the worker waits too, so as not to log
             // in once per message, and a message written meanwhile does not cut the wait short:
             // a wrong password would be tried again at each one.
+            let mut refused = None;
             let login_failed = match &tried {
                 Tried::Login { error, .. } => {
                     if *error == ConnectError::AuthRefused {
-                        password = None;
+                        refused = password.take();
                     }
                     true
                 }
@@ -2055,7 +2071,7 @@ impl SmtpWorker {
                 }
             };
             self.tell(tried);
-            if login_failed && !self.pause(backoff.next()).await {
+            if login_failed && !self.pause(backoff.next(), refused.as_ref()).await {
                 return;
             }
         }
@@ -2085,20 +2101,35 @@ impl SmtpWorker {
         };
         tokio::select! {
             woken = self.wake.recv() => woken.is_some(),
+            // A sync: the password the worker waits for may be there.
+            _ = self.recheck.notified() => true,
             _ = sleep => true,
             _ = stopped(&mut self.stop) => false,
         }
     }
 
-    /// Waits the whole of `timeout`: a message written meanwhile is for later. `false` when the
-    /// daemon stops or the account was removed.
-    async fn pause(&mut self, timeout: Duration) -> bool {
+    /// Waits the whole of `timeout`: a message written meanwhile is for later, but a password
+    /// that is not `refused` any more (the user fixed it, and asked for a sync) ends it. `false`
+    /// when the daemon stops or the account was removed.
+    async fn pause(&mut self, timeout: Duration, refused: Option<&Password>) -> bool {
         let until = tokio::time::Instant::now() + timeout;
         loop {
             tokio::select! {
                 woken = self.wake.recv() => {
                     if woken.is_none() {
                         return false;
+                    }
+                }
+                _ = self.recheck.notified(), if refused.is_some() => {
+                    let now = self.password().await;
+                    if let (Some(now), Some(refused)) = (now, refused)
+                        && now.expose() != refused.expose()
+                    {
+                        // The messages wait their own time too, from the same refusals.
+                        if let Err(e) = self.store.due_now(self.key) {
+                            log!("account {}: cannot write the outbox ({e})", self.key);
+                        }
+                        return true;
                     }
                 }
                 _ = tokio::time::sleep_until(until) => return true,
