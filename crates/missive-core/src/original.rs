@@ -947,15 +947,31 @@ mod tests {
 
     #[test]
     fn nesting_under_the_size_cap_but_far_over_the_depth_cap_is_shown_as_text() {
-        let start = std::time::Instant::now();
-        let page = nested("<div>", "</div>", 100_000, "Deep needle text");
+        // The bound is the growth, not a duration that depends on the machine: four times the
+        // levels cost about four times as long when linear, sixteen when quadratic. The fastest
+        // of a few runs leaves out what a busy machine adds; the ceiling in seconds is only a
+        // backstop against a hang.
+        let time = |depth: usize| {
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let page = nested("<div>", "</div>", depth, "Deep needle text");
+                    let elapsed = start.elapsed();
+                    assert!(body(&page).contains("too deeply nested"), "{}", body(&page));
+                    assert!(body(&page).contains("Deep needle text"));
+                    elapsed
+                })
+                .min()
+                .unwrap()
+        };
+        let few = time(25_000);
+        let many = time(100_000);
+        let growth = many.as_secs_f64() / few.as_secs_f64();
         assert!(
-            start.elapsed().as_secs_f32() < 1.0,
-            "took {:?}",
-            start.elapsed()
+            growth < 10.0,
+            "four times the levels took {growth:.1} times as long ({few:?}, {many:?})"
         );
-        assert!(body(&page).contains("too deeply nested"), "{}", body(&page));
-        assert!(body(&page).contains("Deep needle text"));
+        assert!(many.as_secs_f32() < 20.0, "took {many:?}");
     }
 
     #[test]
