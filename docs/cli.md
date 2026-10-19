@@ -232,7 +232,8 @@ the daemon runs.
 | `accounts[].outbox[].queued_at` | number | when it was written, in seconds since the epoch |
 | `accounts[].outbox[].attempts` | number | the tries that failed before the end of its data (tried again later) |
 | `accounts[].outbox[].last_error` | string or `null` | the last error, for people |
-| `accounts[].outbox[].stuck` | boolean | the message has been `claimed` for more than an hour: the daemon's worker could not write the outbox to put it back in the queue (five tries), and it stays so until the daemon starts again, which queues it again. `false` for any other state, and for a claim that is being tried |
+| `accounts[].outbox[].copy_search_failures` | number | for a `sent` message: how many times looking for its copy in Sent failed (the connection was lost, or the server refused the search); the copy is given up at five, with a `sent-copy-failed` event. `0` for any other state |
+| `accounts[].outbox[].stuck` | boolean | the message has been `claimed` for more than an hour: the daemon's worker could not write the outbox to put it back in the queue (five tries), and it stays so until the daemon starts again, which queues it again. `false` for any other state, for a claim that is being tried, and for a claim without a time (made by a daemon older than the claim time) |
 | `accounts[].drafts` | array | the drafts the copy keeps until the server holds them, oldest first (see [Drafts](#drafts)) |
 | `accounts[].drafts[].id` | string | the draft's identifier (its `Message-ID`, without angle brackets), as `compose --json` printed it |
 | `accounts[].drafts[].state` | string | `waiting` (to write to the Drafts folder), `removing` (its message was sent: to remove from the Drafts folder) or `no-drafts-folder` (the account has no Drafts folder: the draft stays in the copy) |
@@ -268,14 +269,15 @@ bob	never synced	0 messages
 
 A line reads `unknown (the daemon is not running)` in the place of the state when `state` is
 `null` for the second reason above. An account whose outbox holds messages has a line more,
-`	outbox: 1 queued, 1 failed`, and one line for each failed or uncertain message, with why, and
-for each stuck one (`stuck` above). An account whose drafts wait in the copy has a line more too, `	drafts: 1 to write to the Drafts
-folder` (or `kept in the local copy: the account has no Drafts folder`), and one line for each
-draft whose last try failed. Each message of `half_moved` has a line: `	half moved:
-alice/1/1745112/4 is in both inbox and archive, since the server refused to remove it after
-copying it; delete or move one of the two`. A message leaves `half_moved` once one of the two is
-gone from the copy (the user deleted or moved it, or another client did); a copy written before
-this field existed says `[]`.
+`	outbox: 1 queued, 1 failed`, and one line for each failed or uncertain message, with why, for
+each stuck one (`stuck` above) and for each sent one whose copy could not be looked for in Sent
+(`copy_search_failures` above). An account whose drafts wait in the copy has a line more too,
+`	drafts: 1 to write to the Drafts folder` (or `kept in the local copy: the account has no
+Drafts folder`), and one line for each draft whose last try failed. Each message of `half_moved`
+has a line: `	half moved: alice/1/1745112/4 is in both inbox and archive, since the server refused to
+remove it after copying it; delete or move one of the two`. A message leaves `half_moved` once one
+of the two is gone from the copy (the user deleted or moved it, or another client did); a copy
+written before this field existed says `[]`.
 
 ### `missive unread [--json]`
 
@@ -867,8 +869,12 @@ A message stays in the outbox until its server took it, in one of these states:
 | `uncertain` | the connection was lost after its end of data and before the server's answer (or the daemon was killed then): the server may have taken it. It stays, shown by `status` and `missive outbox`, and is never sent again by itself: a message delivered twice is worse than a question. Only `missive outbox resend <n> --yes` sends it again |
 
 Messages are sent one at a time, in the order they were written, each when its time has come: a
-message that waits for a new try holds back none of the others. `missive watch` tells when a
-message is `sent`, `send-failed` or `send-uncertain` (`docs/events.md`).
+message that waits for a new try holds back none of the others. After a login the server
+refused, or with no password in the keyring, the daemon waits longer each time (1 second, then
+twice as long, up to 5 minutes) and a new message does not cut the wait short; a password fixed
+meanwhile does, once `missive sync` tells the daemon to look again: the password is read again,
+and if it is not the one that was refused, the messages are tried at once. `missive watch` tells
+when a message is `sent`, `send-failed` or `send-uncertain` (`docs/events.md`).
 
 #### `missive outbox [--json]`, `missive outbox resend <n> [--yes]`, `missive outbox discard <n>`
 
