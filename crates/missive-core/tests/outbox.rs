@@ -4,7 +4,7 @@ use missive_core::account::{Account, Password, Security, Server};
 use missive_core::compose::Built;
 use missive_core::connect::client_config;
 use missive_core::fake::FakeServer;
-use missive_core::outbox::{Tried, send_next};
+use missive_core::outbox::{Tried, record, send_next, submit_next};
 use missive_core::store::Store;
 
 const USER: &str = "alice@example.org";
@@ -162,4 +162,52 @@ async fn a_message_the_server_took_is_recorded_sent_though_the_sent_folder_canno
         .query_row("SELECT state FROM outbox WHERE id = ?1", [id], |r| r.get(0))
         .unwrap();
     assert_eq!(state, "sent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_submission_is_recorded_before_the_session_says_quit() {
+    let fake = FakeServer::builder().user(USER, PASSWORD).start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("copy.sqlite");
+    let mut store = Store::open(&path).unwrap();
+    let key = store.account("alice").unwrap();
+    store
+        .enqueue(
+            key,
+            &Built {
+                sender: USER.to_owned(),
+                recipients: vec!["bob@example.com".to_owned()],
+                message_id: "1@example.org".to_owned(),
+                raw: b"Subject: Quit\r\n\r\nHello\r\n".to_vec(),
+                bcc_header: None,
+            },
+            false,
+            None,
+        )
+        .unwrap();
+    let account = account(&fake);
+    let password = Password::new(PASSWORD.to_owned());
+    let tls = client_config(Some(fake.certificate_der()));
+
+    let submission = submit_next(&mut store, key, &account, &password, tls)
+        .await
+        .unwrap()
+        .expect("a message to send");
+
+    // The server took the message, and nothing is recorded yet: a stop now would leave the row
+    // `sending`, so the session must not spend time on `QUIT` before it is.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(fake.smtp_messages().len(), 1);
+    assert_eq!(fake.smtp_quits(), 0, "QUIT came before the record");
+
+    let tried = record(&mut store, key, submission).await;
+    assert!(matches!(tried, Ok(Tried::Sent { .. })), "{tried:?}");
+    // Polite, and after: the session still says goodbye.
+    for _ in 0..50 {
+        if fake.smtp_quits() == 1 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the session never said QUIT");
 }

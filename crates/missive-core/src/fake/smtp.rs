@@ -148,6 +148,7 @@ pub(super) async fn serve(
             }
             "NOOP" => "250 2.0.0 OK".to_owned(),
             "QUIT" => {
+                shared.state().smtp_quits += 1;
                 let _ = reply(&mut io, "221 2.0.0 bye").await;
                 return;
             }

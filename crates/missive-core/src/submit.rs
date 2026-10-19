@@ -57,10 +57,34 @@ pub struct Outgoing<'a> {
     pub raw: &'a [u8],
 }
 
+/// The end of a session, to be said once what the server took is recorded: `QUIT` is polite and
+/// not needed, so it never comes between the server's answer and the record of it.
+pub struct Goodbye(Option<SmtpSession>);
+
+impl Goodbye {
+    /// A session with nothing to say goodbye to.
+    pub fn none() -> Goodbye {
+        Goodbye(None)
+    }
+
+    /// Says `QUIT`, at most 2 seconds, and drops the connection.
+    pub async fn say(self) {
+        if let Some(mut smtp) = self.0 {
+            let _ = tokio::time::timeout(Duration::from_secs(2), send(&mut smtp, "QUIT")).await;
+        }
+    }
+}
+
+impl std::fmt::Debug for Goodbye {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Goodbye")
+    }
+}
+
 /// Submits a message. `sending` is called just before the end of data
 /// is written, and the end is written only if it returns `Ok`: the caller records there that what
 /// follows may have reached the server. A login that fails is the error; whatever comes after it
-/// is a [`Submitted`].
+/// is a [`Submitted`], with the [`Goodbye`] to say once it is recorded.
 pub async fn submit(
     server: &Server,
     user: &str,
@@ -68,14 +92,12 @@ pub async fn submit(
     tls: Arc<ClientConfig>,
     message: Outgoing<'_>,
     sending: impl FnOnce() -> Result<(), String>,
-) -> Result<Submitted, ConnectError> {
+) -> Result<(Submitted, Goodbye), ConnectError> {
     let mut smtp = open_smtp(server, user, password, tls).await?;
     let submitted = transaction(&mut smtp, message, sending).await;
-    if !matches!(submitted, Submitted::Uncertain { .. }) {
-        // Polite, not needed: what the server took is already said.
-        let _ = tokio::time::timeout(Duration::from_secs(2), send(&mut smtp, "QUIT")).await;
-    }
-    Ok(submitted)
+    // After a message that may have been taken, the connection is simply dropped.
+    let goodbye = Goodbye((!matches!(submitted, Submitted::Uncertain { .. })).then_some(smtp));
+    Ok((submitted, goodbye))
 }
 
 async fn transaction(

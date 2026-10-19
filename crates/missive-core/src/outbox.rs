@@ -50,7 +50,7 @@ use crate::account::{Account, Password};
 use crate::actions::MAX_ATTEMPTS;
 use crate::connect::{ConnectError, ImapSession};
 use crate::store::Store;
-use crate::submit::{Outgoing, Submitted, submit};
+use crate::submit::{Goodbye, Outgoing, Submitted, submit};
 use crate::sync::{self, Done, SyncError};
 
 /// How many times recording what came of a submission is tried, [`RECORD_PAUSE`] apart, when the
@@ -107,6 +107,8 @@ pub struct Submission {
     /// Whether a copy is to go in Sent (the server does not keep one itself).
     sent_copy: bool,
     submitted: Result<Submitted, ConnectError>,
+    /// Said once the submission is recorded.
+    goodbye: Goodbye,
 }
 
 /// Submits the account's first message whose time has come, if there is one, and records what
@@ -139,7 +141,7 @@ pub async fn submit_next(
     };
     let id = message.id;
     let marking = &mut *store;
-    let submitted = submit(
+    let (submitted, goodbye) = match submit(
         &account.smtp,
         &account.user,
         password,
@@ -155,12 +157,17 @@ pub async fn submit_next(
                 .map_err(|e| format!("the outbox could not be written ({e})"))
         },
     )
-    .await;
+    .await
+    {
+        Ok((submitted, goodbye)) => (Ok(submitted), goodbye),
+        Err(error) => (Err(error), Goodbye::none()),
+    };
     Ok(Some(Submission {
         id,
         message_id: message.message_id,
         sent_copy: message.sent_copy,
         submitted,
+        goodbye,
     }))
 }
 
@@ -175,8 +182,9 @@ pub async fn record(
         message_id,
         sent_copy: copy,
         submitted,
+        goodbye,
     } = submission;
-    Ok(match submitted {
+    let tried = match submitted {
         Ok(Submitted::Sent) => {
             // A folder that cannot be read is not an answer: the copy is left to the IMAP worker,
             // which looks again. What was sent is recorded whatever these reads say.
@@ -225,7 +233,10 @@ pub async fn record(
             recorded(store, |store| store.send_again(id, &why, now())).await?;
             Tried::Login { id, error }
         }
-    })
+    };
+    // Apart, so that neither a slow server nor a stop waits for a courtesy.
+    tokio::spawn(goodbye.say());
+    Ok(tried)
 }
 
 /// Records what came of a submission, trying again while the copy is busy: the server's answer
