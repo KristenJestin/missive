@@ -2539,3 +2539,45 @@ async fn a_move_after_a_refusal_that_left_its_deleted_flag_does_not_carry_it_to_
     assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
     assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_left_in_a_folder_since_deleted_on_the_server_is_let_go() {
+    // The removal is refused, and taking its flag back too, until the limit refuses the move.
+    let (server, env, _daemon) = started(
+        mailbox()
+            .without_move()
+            .refuse("UID EXPUNGE")
+            .refuse("UID STORE 1 -FLAGS"),
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let one = env.id(PRIVATE_FOLDER, 1);
+    succeeded(&env.act(&["move", &one, "--to", "archive"]).await);
+    loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            assert_eq!(event["outcome"], "refused", "{event}");
+            break;
+        }
+        succeeded(&sync_soon(&env).await);
+    }
+    assert_eq!(
+        env.status_of_alice().await["deleted_left"],
+        serde_json::json!([one])
+    );
+
+    // Another client deletes the folder: no message is left to take the flag back from.
+    server.delete_folder(PRIVATE_FOLDER);
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    let started = Instant::now();
+    while env.status_of_alice().await["deleted_left"] != serde_json::json!([]) {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the flag of a deleted folder is still listed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // What another client marked is left alone.
+    assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
+}

@@ -39,7 +39,7 @@
 //! A removal records the `\Deleted` it sets itself before it sets it: when the connection is lost
 //! before the flag is taken back, the next try still knows it is its own. An action refused for
 //! good that leaves it there keeps it in [`Store::deleted_left`], and it is taken back at once,
-//! then at the next connection. Until then, a move of those messages is refused: `UID MOVE` and
+//! then at the next connection, unless the folder was renumbered or deleted since. Until then, a move of those messages is refused: `UID MOVE` and
 //! `UID COPY` keep the flags, and the copy in the target would keep a `\Deleted` nothing records.
 //!
 //! An action asked while a move of its messages waits is recorded on them as the server still has
@@ -64,7 +64,9 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use async_imap::imap_proto::{AttributeValue, MailboxDatum, Response, StatusAttribute};
+use async_imap::imap_proto::{
+    AttributeValue, MailboxDatum, NameAttribute, Response, StatusAttribute,
+};
 
 use crate::connect::{ConnectError, ImapSession};
 use crate::copy::message_id;
@@ -610,7 +612,13 @@ async fn take_back(
             continue;
         }
         match server.select(&left.folder.name).await? {
-            None => continue,
+            None => {
+                // A folder deleted since has none of its messages left to take the flag from.
+                if listed(server, &left.folder.name).await? == Some(false) {
+                    store.taken_back(left.id)?;
+                }
+                continue;
+            }
             Some(uidvalidity) if uidvalidity != left.uidvalidity => {
                 store.taken_back(left.id)?;
                 continue;
@@ -632,6 +640,30 @@ async fn take_back(
         }
     }
     Ok(())
+}
+
+/// Whether the server lists a folder (`LIST "" <name>`); `None` when it cannot tell.
+async fn listed(
+    server: &mut Server<'_>,
+    name: &str,
+) -> std::result::Result<Option<bool>, SyncError> {
+    let Some(quoted) = sync::quote(name) else {
+        return Ok(None);
+    };
+    let mut found = false;
+    let done = server
+        .run_done(&format!("LIST \"\" {quoted}"), |response| {
+            if let Response::MailboxData(MailboxDatum::List(list)) = response
+                && sync::unescape(&list.name) == name
+                && !list.name_attributes.iter().any(|a| {
+                    matches!(a, NameAttribute::Extension(e) if e.eq_ignore_ascii_case("\\NonExistent"))
+                })
+            {
+                found = true;
+            }
+        })
+        .await?;
+    Ok(matches!(done, Done::Ok(_)).then_some(found))
 }
 
 /// What one try of an action came to.

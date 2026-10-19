@@ -246,7 +246,7 @@ the daemon runs.
 | `accounts[].half_moved[].copy` | string or `null` | the identifier of its copy in the target; `null` when the server did not tell its UID (the copy is in the target all the same) |
 | `accounts[].half_moved[].folder`, `.target` | string | the folder it was to leave and its target: their roles, else their names |
 | `accounts[].half_moved[].maybe` | boolean | `true` when the message may only be in both: the move was refused while the server's answer to its copy was lost, so whether the target has it is not known (`copy` is then `null`); `false` in a copy written before this field existed |
-| `accounts[].deleted_left` | array of strings | the messages an action refused for good, or the removal of a draft's older versions, left marked `\Deleted` on the server, by their identifiers: Missive set the flag itself and could not take it back (the connection was lost, or the server refused). It takes it back at the next connection; `[]` when none |
+| `accounts[].deleted_left` | array of strings | the messages an action refused for good, or the removal of a draft's older versions, left marked `\Deleted` on the server, by their identifiers: Missive set the flag itself and could not take it back (the connection was lost, or the server refused). It takes it back at the next connection, or lets it go once the folder was renumbered or deleted on the server (no message is left to take it from); `[]` when none |
 
 `ready` does not mean the copy is complete: a folder the server refuses is skipped, the others are
 synced, and the account is `ready` all the same. `skipped` is what keeps that from being silent. It

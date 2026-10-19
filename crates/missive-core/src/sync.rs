@@ -872,7 +872,7 @@ fn new_message(attributes: &[AttributeValue<'_>], sizes: &HashMap<u32, u32>) -> 
 
 /// The name `LIST` gave, without the escapes of its quoted string (`\\` and `\"`): `imap-proto`
 /// hands the string over as it was written.
-fn unescape(name: &str) -> String {
+pub(crate) fn unescape(name: &str) -> String {
     let mut unescaped = String::with_capacity(name.len());
     let mut chars = name.chars();
     while let Some(c) = chars.next() {

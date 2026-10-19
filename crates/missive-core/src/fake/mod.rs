@@ -524,6 +524,14 @@ impl FakeServer {
         })
     }
 
+    /// Deletes a folder and its messages, as another client would.
+    pub fn delete_folder(&self, name: &str) {
+        self.shared.change(|state| {
+            state.folder(name);
+            state.folders.retain(|f| f.name != name);
+        })
+    }
+
     /// Gives a folder a new UIDVALIDITY and renumbers its messages from 1, as a server does when
     /// it rebuilds a folder. Returns the new UIDVALIDITY.
     pub fn bump_uidvalidity(&self, folder: &str) -> u32 {
