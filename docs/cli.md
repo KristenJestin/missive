@@ -818,7 +818,10 @@ kept, its Bcc recipients and attachments included (`--attach` replaces every att
 `--send` the draft is sent as it is then, and it is removed from the Drafts folder **once the
 server took the message**: a message the server refuses (`failed`) or that may not have arrived
 (`uncertain`) keeps its draft. A draft whose message waits in the outbox cannot be changed or sent
-again until it is sent.
+again until it is sent, and a draft whose message was already sent (the Sent folder holds it, or
+the outbox sent it or does not know whether the server took it) cannot be sent again: `--send`
+refuses it with an error, so that a server without UIDPLUS, which keeps the sent draft's last
+version in the Drafts folder, never makes the same message go twice.
 
 Missive only ever replaces or removes a draft it wrote itself: its drafts carry an
 `X-Missive-Draft: 1` header (the message sent from one does not). A draft **another client
@@ -835,11 +838,15 @@ account's Drafts folder (the folder with the `drafts` role), as soon as the serv
 reached:
 
 1. it looks for the versions the folder already holds, by `Message-ID` and Missive's own header
-   (`UID SEARCH`), one from a connection cut before the server answered included;
-2. it appends the new version, flagged `\Draft` and `\Seen`; the command counts as done only with
-   the server's `OK`;
+   (`UID SEARCH`), one from a connection cut before the server answered included (a
+   `Message-ID` that is not ASCII is not searched for, the server would answer `BAD`: the
+   versions the local copy holds stand for them);
+2. it appends the new version, flagged `\Draft` and `\Seen`, waiting for the server's answer
+   longer the larger the draft is (up to 15 minutes); the command counts as done only with the
+   server's `OK`;
 3. only then it removes the older versions, by their UIDs only (`UID STORE … +FLAGS.SILENT
-   (\Deleted)` then `UID EXPUNGE …`): a message another client marked deleted stays. A server
+   (\Deleted)` then `UID EXPUNGE …`): a message another client marked deleted stays, and when
+   the `UID EXPUNGE` is refused only the `\Deleted` Missive set is taken back. A server
    without UIDPLUS has no `UID EXPUNGE`: the older versions are then left in place, and the
    `draft` event says so (`docs/events.md`). Missive never sends a bare `EXPUNGE`.
 
