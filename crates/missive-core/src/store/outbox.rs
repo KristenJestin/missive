@@ -147,11 +147,12 @@ impl Store {
     /// Claims the account's first message to send whose time has come at `now` (milliseconds
     /// since the epoch), before any command is sent for it: in one statement, so that two workers
     /// of the same account (an old one whose account was removed and added again, and its
-    /// successor) never both take it.
+    /// successor) never both take it. The claim's time goes where the next try's goes, which a
+    /// claimed message has no use for: `status` tells a claim that was never released by it.
     pub fn claim_next(&self, account: i64, now: i64) -> rusqlite::Result<Option<ToSend>> {
         self.connection
             .query_row(
-                "UPDATE outbox SET state = 'claimed'
+                "UPDATE outbox SET state = 'claimed', next_attempt_at = ?2
                   WHERE id = (SELECT id FROM outbox WHERE account = ?1 AND state = 'queued'
                                                       AND next_attempt_at <= ?2
                                ORDER BY id LIMIT 1)
@@ -664,5 +665,17 @@ mod tests {
         assert!(!store.sent(reply, true).unwrap());
         assert!(actions(&store).is_empty());
         assert_eq!(states(&store), [(reply, "sent".to_owned())]);
+    }
+
+    #[test]
+    fn a_claim_records_when_it_was_made() {
+        let (_dir, store, account) = open();
+        store.enqueue(account, &built(2), false, None).unwrap();
+        store.claim_next(account, 123_456).unwrap().unwrap();
+        let claimed_at: i64 = store
+            .connection
+            .query_row("SELECT next_attempt_at FROM outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(claimed_at, 123_456);
     }
 }

@@ -9,7 +9,9 @@
 //!   message ([`crate::store::Store::send_again`]).
 //! - `claimed`: a worker took it, before its first command: no other worker takes it. Nothing
 //!   was sent for it yet, so a daemon killed then leaves it to the next one, which puts it back
-//!   in the queue ([`crate::store::Store::release_claimed`]).
+//!   in the queue ([`crate::store::Store::release_claimed`]). A worker that cannot write the
+//!   outbox for five tries leaves it so until the next start: `status` calls a message claimed
+//!   for more than [`CLAIM_STUCK_MS`] stuck.
 //! - `sending`: written just before the end of data is, and only when the message was written
 //!   whole: what follows may reach the server. A daemon killed then leaves the row so; the next
 //!   one makes it `uncertain` ([`crate::store::Store::sending_left`]).
@@ -55,6 +57,10 @@ use crate::sync::{self, Done, SyncError};
 /// copy is busy: each try already waits for the copy as long as its busy timeout says.
 const RECORD_TRIES: u32 = 5;
 const RECORD_PAUSE: Duration = Duration::from_secs(1);
+
+/// How long a message stays `claimed` before `status` calls it stuck, in milliseconds: more than
+/// a submission can take (each command waits at most 5 minutes, the data 10).
+pub const CLAIM_STUCK_MS: i64 = 60 * 60 * 1000;
 
 /// Now, in milliseconds since the epoch: the outbox's clock.
 pub fn now() -> i64 {

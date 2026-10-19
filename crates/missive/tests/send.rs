@@ -1399,3 +1399,38 @@ async fn a_failed_search_of_sent_is_not_one_of_the_tries_of_the_copy() {
     assert!(env.outbox().is_empty());
     assert_eq!(server.uids("Sent").len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_says_that_a_message_stays_claimed_for_good() {
+    let (_server, _relay, env) = smtp_down().await;
+    let mut daemon = env.daemon().await;
+    env.ready().await;
+    succeeded(&env.compose(&["--body", "stuck"]).await);
+    succeeded(&env.compose(&["--body", "taken"]).await);
+    daemon.kill().await;
+    // What a worker that could not put its message back in the queue leaves: claimed, since long.
+    // The other one was claimed just now: a try, as far as `status` can tell.
+    let long_ago = missive_core::outbox::now() - 2 * 60 * 60 * 1000;
+    let copy = Connection::open(env.copy_path()).unwrap();
+    copy.execute(
+        "UPDATE outbox SET state = 'claimed', next_attempt_at = ?1 WHERE id = 1",
+        [long_ago],
+    )
+    .unwrap();
+    copy.execute(
+        "UPDATE outbox SET state = 'claimed', next_attempt_at = ?1 WHERE id = 2",
+        [missive_core::outbox::now()],
+    )
+    .unwrap();
+
+    let status = env.status().await;
+    let outbox = &status["accounts"][0]["outbox"];
+    assert_eq!(outbox[0]["state"], "claimed", "{status}");
+    assert_eq!(outbox[0]["stuck"], true, "{status}");
+    assert_eq!(outbox[1]["stuck"], false, "{status}");
+    let output = env.run(&["status"]).await;
+    succeeded(&output);
+    let text = stdout(&output);
+    assert!(text.contains("message 1 claimed: stuck"), "{text}");
+    assert!(!text.contains("message 2 claimed"), "{text}");
+}
