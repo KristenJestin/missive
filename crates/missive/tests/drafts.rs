@@ -1524,3 +1524,442 @@ async fn with_a_display_mailto_and_compose_open_the_window_on_the_draft_saved_fi
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!args.exists(), "no window without a display");
 }
+
+// ---- #73: a draft the server does not hold yet, cleared fields, the HTML part ----
+
+/// `show` and `open` of an unsent draft read it from the copy, named by its Message-ID.
+#[tokio::test(flavor = "multi_thread")]
+async fn show_reads_a_draft_the_server_does_not_hold_yet() {
+    let (_server, _relay, env, _daemon) = imap_down().await;
+    let id = env
+        .save(&[
+            "--to",
+            RECIPIENT,
+            "--cc",
+            COPIED,
+            "--subject",
+            "Not yet there",
+            "--body",
+            BODY,
+        ])
+        .await;
+    assert_eq!(env.drafts().await[0]["uid"], 0, "still only in the copy");
+
+    let text = env.run(&["show", &id]).await;
+    succeeded(&text);
+    let text = stdout(&text);
+    for line in [
+        format!("To: {RECIPIENT}"),
+        format!("Cc: {COPIED}"),
+        "Subject: Not yet there".to_owned(),
+        format!("Message-ID: {id}"),
+        BODY.to_owned(),
+    ] {
+        assert!(text.contains(&line), "{line} is not in\n{text}");
+    }
+    let json = env.run(&["show", "--json", &id]).await;
+    succeeded(&json);
+    let shown: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(shown["id"], id.as_str());
+    assert_eq!(shown["subject"], "Not yet there");
+    assert_eq!(shown["to"][0]["address"], RECIPIENT);
+    assert_eq!(shown["message_id"], id.as_str());
+    assert_eq!(shown["uid"], 0);
+    assert_eq!(shown["folder"]["role"], "drafts");
+    assert!(shown["text"].as_str().unwrap().contains(BODY), "{shown}");
+    let raw = env.run(&["show", "--raw", &id]).await;
+    succeeded(&raw);
+    assert!(
+        stdout(&raw).contains("X-Missive-Draft: 1"),
+        "{}",
+        stdout(&raw)
+    );
+
+    // Brackets are as good as none; another Message-ID, or nothing like one, names no message.
+    succeeded(&env.run(&["show", &format!("<{id}>")]).await);
+    for unknown in ["nothing@example.org", "nothing"] {
+        let output = env.run(&["show", unknown]).await;
+        assert_eq!(output.status.code(), Some(3), "{unknown}");
+        assert!(stderr(&output).starts_with("missive: "));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_reads_a_message_waiting_in_the_outbox_by_its_message_id() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    // The server holds the message at MAIL FROM: it is in the outbox for a while.
+    server.smtp_delay("MAIL", Duration::from_secs(4));
+    let output = env
+        .run(&[
+            "compose",
+            "--json",
+            "--send",
+            "--to",
+            RECIPIENT,
+            "--subject",
+            "Waiting",
+            "--body",
+            BODY,
+        ])
+        .await;
+    succeeded(&output);
+    let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = queued["message_id"].as_str().unwrap();
+
+    let shown = env.run(&["show", "--json", id]).await;
+
+    succeeded(&shown);
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["subject"], "Waiting");
+    assert!(shown["text"].as_str().unwrap().contains(BODY), "{shown}");
+    took(&server, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_opens_a_draft_the_server_does_not_hold_yet() {
+    let (_server, _relay, env, _daemon) = imap_down().await;
+    let id = env
+        .save(&["--to", RECIPIENT, "--subject", "Page", "--body", BODY])
+        .await;
+    let bin = env.path("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("xdg-open");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{bin}/args.tmp'\nmv '{bin}/args.tmp' '{bin}/args'\n",
+            bin = bin.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let output = env
+        .command(&["open", &id])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        // No portal to ask: `xdg-open` is the fall-back.
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", env.path("no-bus").display()),
+        )
+        .output()
+        .await
+        .unwrap();
+
+    succeeded(&output);
+    let page = stdout(&output).trim().to_owned();
+    assert!(
+        std::fs::read_to_string(&page).unwrap().contains(BODY),
+        "the page holds the draft's text"
+    );
+    eventually(10, "xdg-open", || bin.join("args").exists()).await;
+    assert!(
+        std::fs::read_to_string(bin.join("args"))
+            .unwrap()
+            .contains(&page)
+    );
+}
+
+/// The addresses of a header of the newest draft on the server.
+fn addresses(parsed: &mail_parser::Message, header: &str) -> Vec<String> {
+    let value = match header {
+        "to" => parsed.to(),
+        "cc" => parsed.cc(),
+        _ => parsed.bcc(),
+    };
+    value
+        .into_iter()
+        .flat_map(|list| list.iter())
+        .filter_map(|m| m.address().map(str::to_owned))
+        .collect()
+}
+
+/// The newest draft of the server, once it holds `count` of them.
+async fn newest_draft(server: &FakeServer, count: usize) -> Vec<u8> {
+    eventually(30, "the drafts on the server", || {
+        server.uids("Drafts").len() == count
+    })
+    .await;
+    // The versions replace each other: wait for the last one.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let uids = server.uids("Drafts");
+    server.raw("Drafts", *uids.last().unwrap()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_no_flags_take_recipients_and_attachments_off_a_draft_picked_up() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let file = env.file("note.txt", b"A note");
+    let id = env
+        .save(&[
+            "--to",
+            RECIPIENT,
+            "--cc",
+            COPIED,
+            "--bcc",
+            HIDDEN,
+            "--subject",
+            "Full",
+            "--attach",
+            &file,
+        ])
+        .await;
+    let raw = newest_draft(&server, 1).await;
+    let parsed = MessageParser::default().parse(&raw).unwrap();
+    assert_eq!(addresses(&parsed, "cc"), [COPIED]);
+    assert_eq!(addresses(&parsed, "bcc"), [HIDDEN]);
+    assert_eq!(parsed.attachment_count(), 1);
+
+    // Only what is named goes: the others are kept.
+    env.save(&["--draft", &id, "--no-cc", "--no-attach"]).await;
+    eventually(30, "the new version", || {
+        server_drafts(&server).len() == 1 && server_drafts(&server)[0].0 == 2
+    })
+    .await;
+    let raw = newest_draft(&server, 1).await;
+    let parsed = MessageParser::default().parse(&raw).unwrap();
+    assert_eq!(addresses(&parsed, "to"), [RECIPIENT]);
+    assert!(addresses(&parsed, "cc").is_empty());
+    assert_eq!(addresses(&parsed, "bcc"), [HIDDEN]);
+    assert_eq!(parsed.attachment_count(), 0);
+    assert_eq!(parsed.subject(), Some("Full"));
+
+    env.save(&["--draft", &id, "--no-to", "--no-bcc"]).await;
+    eventually(30, "the third version", || {
+        server_drafts(&server).len() == 1 && server_drafts(&server)[0].0 == 3
+    })
+    .await;
+    let raw = newest_draft(&server, 1).await;
+    let parsed = MessageParser::default().parse(&raw).unwrap();
+    assert!(addresses(&parsed, "to").is_empty());
+    assert!(addresses(&parsed, "bcc").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_no_flags_need_a_draft_and_exclude_the_field_they_clear() {
+    let env = Env::new().await;
+    for (flags, why) in [
+        (&["--no-cc"][..], "without --draft"),
+        (&["--no-attach"], "without --draft"),
+        (
+            &["--draft", "a@example.org", "--no-cc", "--cc", COPIED],
+            "with --cc",
+        ),
+        (
+            &["--draft", "a@example.org", "--no-to", "--to", RECIPIENT],
+            "with --to",
+        ),
+    ] {
+        let mut arguments = vec!["compose"];
+        arguments.extend_from_slice(flags);
+        let output = env.run(&arguments).await;
+        assert_eq!(output.status.code(), Some(2), "{why}: {}", stderr(&output));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_cleared_of_its_recipients_cannot_be_sent() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "Gone"]).await;
+
+    let output = env
+        .run(&["compose", "--draft", &id, "--no-to", "--send"])
+        .await;
+
+    failed(&output);
+    assert!(
+        stderr(&output).contains("no recipient"),
+        "{}",
+        stderr(&output)
+    );
+    took(&server, 0).await;
+}
+
+/// The HTML part of a message, as written.
+fn html_of(raw: &[u8]) -> Option<String> {
+    let parsed = MessageParser::default().parse(raw).unwrap();
+    parsed.html_part(0).and_then(|part| match &part.body {
+        mail_parser::PartType::Html(html) => Some(html.to_string()),
+        _ => None,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_html_part_of_a_draft_picked_up_stays_as_it_was() {
+    let (server, env, _daemon, id) = with_a_foreign_draft().await;
+    let original = html_of(foreign_html_reply().as_bytes()).unwrap();
+
+    let first = env.save(&["--draft", &id, "--subject", "Changed"]).await;
+    let raw = newest_draft(&server, 2).await;
+    assert_eq!(html_of(&raw).as_deref(), Some(original.as_str()));
+    let parsed = MessageParser::default().parse(&raw).unwrap();
+    assert!(parsed.body_text(0).unwrap().contains(BODY));
+
+    // Missive's own version, picked up again and given the same text: still there.
+    let output = env
+        .run(&["compose", "--draft", &first, "--body", BODY, "--to", COPIED])
+        .await;
+    succeeded(&output);
+    assert!(!stderr(&output).contains("HTML"), "{}", stderr(&output));
+    eventually(30, "the new version", || {
+        server_drafts(&server).len() == 2 && server_drafts(&server)[1].0 == 3
+    })
+    .await;
+    let raw = newest_draft(&server, 2).await;
+    assert_eq!(html_of(&raw).as_deref(), Some(original.as_str()));
+    assert_eq!(
+        addresses(&MessageParser::default().parse(&raw).unwrap(), "to"),
+        [COPIED]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_html_draft_picked_up_and_sent_goes_with_its_html_part() {
+    let (server, env, _daemon, id) = with_a_foreign_draft().await;
+    let original = html_of(foreign_html_reply().as_bytes()).unwrap();
+
+    succeeded(&env.run(&["compose", "--draft", &id, "--send"]).await);
+    took(&server, 1).await;
+
+    let sent = &server.smtp_messages()[0];
+    assert_eq!(html_of(&sent.data).as_deref(), Some(original.as_str()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_text_drops_the_html_part_and_says_so() {
+    let (server, env, _daemon, id) = with_a_foreign_draft().await;
+
+    let output = env
+        .run(&["compose", "--draft", &id, "--body", "Another text"])
+        .await;
+
+    succeeded(&output);
+    assert!(
+        stderr(&output).contains("HTML part is dropped"),
+        "{}",
+        stderr(&output)
+    );
+    let raw = newest_draft(&server, 2).await;
+    assert_eq!(html_of(&raw), None);
+    let parsed = MessageParser::default().parse(&raw).unwrap();
+    assert_eq!(parsed.body_text(0).unwrap().trim(), "Another text");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_draft_stays_a_text_draft() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--subject", "Plain", "--body", BODY]).await;
+    newest_draft(&server, 1).await;
+
+    let output = env.run(&["compose", "--draft", &id, "--body", BODY]).await;
+
+    succeeded(&output);
+    assert!(!stderr(&output).contains("HTML"), "{}", stderr(&output));
+    eventually(30, "the new version", || {
+        server_drafts(&server).first().is_some_and(|d| d.0 == 2)
+    })
+    .await;
+    assert_eq!(html_of(&newest_draft(&server, 1).await), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_refused_as_already_sent_saves_the_changes_of_the_request_first() {
+    let server = mailbox().without_uidplus().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+    eventually(20, "the draft in the copy", || {
+        block(env.drafts()).first().is_some_and(|d| d["uid"] == 1)
+    })
+    .await;
+    succeeded(&env.run(&["compose", "--draft", &id, "--send"]).await);
+    took(&server, 1).await;
+    eventually(20, "the copy in Sent", || !server.uids("Sent").is_empty()).await;
+    settled(&env).await;
+    succeeded(&env.run(&["sync"]).await);
+
+    let output = env
+        .run(&["compose", "--draft", &id, "--subject", "Edited", "--send"])
+        .await;
+
+    failed(&output);
+    assert!(
+        stderr(&output).contains("already sent") && stderr(&output).contains("saved"),
+        "{}",
+        stderr(&output)
+    );
+    // The edit is a draft now, listed as it is picked up again; nothing was sent twice.
+    eventually(20, "the edited draft listed", || {
+        block(env.drafts()).iter().any(|d| d["subject"] == "Edited")
+    })
+    .await;
+    drafts_on_server(&server, &["First", "Edited"]).await;
+    took(&server, 1).await;
+
+    // Nothing to save, nothing said about saving.
+    let output = env.run(&["compose", "--draft", &id, "--send"]).await;
+    failed(&output);
+    assert!(!stderr(&output).contains("saved"), "{}", stderr(&output));
+    drafts_on_server(&server, &["First", "Edited"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_to_a_draft_whose_send_is_uncertain_survives_its_resend_as_a_new_draft() {
+    let server = mailbox().start().await;
+    server.smtp_cut_after_data();
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+
+    // The connection is cut after the end of data: the outbox does not know whether it went.
+    let output = env
+        .run(&["compose", "--json", "--draft", &id, "--send"])
+        .await;
+    succeeded(&output);
+    let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let outbox = queued["outbox"].to_string();
+    eventually(20, "the message uncertain", || {
+        block(env.status())["accounts"][0]["outbox"][0]["state"] == "uncertain"
+    })
+    .await;
+    server.heal();
+
+    let output = env
+        .run(&["compose", "--draft", &id, "--subject", "Edited", "--send"])
+        .await;
+
+    failed(&output);
+    let said = stderr(&output);
+    let new = said
+        .split("saved as a new draft ")
+        .nth(1)
+        .map(|rest| {
+            rest.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .unwrap_or_default();
+    assert!(said.contains("already sent") && !new.is_empty(), "{said}");
+    assert_ne!(new, id, "{said}");
+    assert!(!said.contains("in the draft"), "{said}");
+
+    // The user sends the uncertain message again, and it goes: X is removed, the edit is not.
+    succeeded(&env.run(&["outbox", "resend", &outbox, "--yes"]).await);
+    took(&server, 2).await;
+    settled(&env).await;
+    drafts_on_server(&server, &["Edited"]).await;
+    let held = server_drafts(&server);
+    assert_eq!(held[0].2.as_deref(), Some(new.as_str()), "{held:?}");
+    assert_eq!(
+        block(env.drafts())
+            .iter()
+            .filter(|d| d["subject"] == "Edited")
+            .count(),
+        1
+    );
+}

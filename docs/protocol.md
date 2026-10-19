@@ -201,7 +201,7 @@ Saves a draft: a new one, or a new version of the draft `draft` names. With `sen
 |---|---|---|
 | `account` | string | the account's identifier |
 | `draft` | string, absent for a new draft | the draft to pick up again: its identifier (its `Message-ID`), or the identifier of a message of the account's Drafts folder, as `list` prints it |
-| `to`, `cc`, `bcc`, `subject`, `body`, `attachments` | as for `send`, each absent to keep the draft's own | the fields that replace the draft's; for a new draft, those absent are empty. No recipient is needed |
+| `to`, `cc`, `bcc`, `subject`, `body`, `attachments` | as for `send`, each absent to keep the draft's own | the fields that replace the draft's; for a new draft, those absent are empty. No recipient is needed. An empty list (`"to": []`) clears the field: that is what `compose --no-to` asks. The draft's HTML alternative is kept, unless `body` gives another text (line ends aside): then it is dropped |
 | `in_reply_to` | string, absent to keep the draft's own | the `Message-ID`, without angle brackets, of the message the draft answers |
 | `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered unless `answers` names it |
 | `send` | boolean, `false` when absent | send the draft, as it is once changed (at least one recipient then); it is removed from the Drafts folder once the server took the message |
@@ -222,7 +222,13 @@ every version of the draft. With `send`, the answer also has `outbox`, as for `s
 that names no draft of the account is answered `no-such-message`. A `draft` naming a draft whose
 message still waits in the outbox is answered `busy`: a client that lost the answer to its `send`
 and asks again sends nothing twice. A `draft` with `send` naming a draft whose message was already
-sent is answered `already-sent`.
+sent is answered `already-sent`, once the changes that request gives are saved as a new draft, under
+a new `Message-ID`, never as a version of the sent one: the answer then also has `message_id`, the
+new draft's identifier (the `message` says so). Without changes, nothing is saved and there is no
+`message_id`.
+
+When `body` replaced the text of a draft that had an HTML alternative, which is dropped with it, the
+answer also has `"html_dropped": true` (absent otherwise).
 
 A `draft` naming a draft another client wrote (one without Missive's `X-Missive-Draft` header)
 does not replace it: the daemon makes a new draft from it, under a new `message_id`, and the

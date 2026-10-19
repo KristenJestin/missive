@@ -14,7 +14,7 @@
 use mail_builder::MessageBuilder;
 use mail_builder::headers::Header;
 use mail_builder::headers::address::Address;
-use mail_parser::{HeaderValue, MessageParser, MimeHeaders};
+use mail_parser::{HeaderValue, MessageParser, MimeHeaders, PartType};
 
 use crate::account::Account;
 
@@ -103,6 +103,9 @@ pub struct Draft {
     pub bcc: Vec<Mailbox>,
     pub subject: Option<String>,
     pub body: String,
+    /// The HTML alternative of the text, kept as it was written by the client that made it: a
+    /// draft read back and written again carries it unchanged. Only [`Draft::set_body`] drops it.
+    pub html: Option<String>,
     pub attachments: Vec<Attachment>,
     /// The message it answers, and its thread: Message-IDs without angle brackets.
     pub in_reply_to: Vec<String>,
@@ -154,10 +157,24 @@ impl Draft {
 }
 
 impl Draft {
+    /// Gives the draft this text. Its HTML alternative stays when the text is the one it has
+    /// (line ends aside: a window or a pipe does not write them as the message holds them), and
+    /// is dropped when the text differs, since it would say something else than the text. Whether
+    /// an HTML part was dropped.
+    pub fn set_body(&mut self, body: String) -> bool {
+        let same = crlf(&body) == crlf(&self.body);
+        self.body = body;
+        if same {
+            return false;
+        }
+        self.html.take().is_some()
+    }
+
     /// What a message saved as a draft holds: its recipients (Bcc included, which a draft keeps),
-    /// its subject, its text, its attachments and the thread it answers. An address Missive
-    /// cannot send to is refused: the draft could not be written again as it is. Its HTML is not
-    /// kept: a message with only HTML gives its text. Other headers (Reply-To…) are not kept.
+    /// its subject, its text, its HTML alternative, its attachments and the thread it answers. An
+    /// address Missive cannot send to is refused: the draft could not be written again as it is.
+    /// A message with only HTML gives its text, made from it, beside the HTML itself (the first
+    /// HTML part: a draft with several keeps one). Other headers (Reply-To…) are not kept.
     pub fn read(raw: &[u8]) -> Result<Draft, String> {
         let parsed = MessageParser::default()
             .parse(raw)
@@ -191,6 +208,11 @@ impl Draft {
                 data: part.contents().to_vec(),
             });
         }
+        // `body_html` makes a page of a message that has only text: only a real HTML part counts.
+        let html = parsed.html_part(0).and_then(|part| match &part.body {
+            PartType::Html(html) => Some(html.to_string()),
+            _ => None,
+        });
         Ok(Draft {
             to: mailboxes(parsed.to())?,
             cc: mailboxes(parsed.cc())?,
@@ -200,6 +222,7 @@ impl Draft {
                 .body_text(0)
                 .map(|text| text.into_owned())
                 .unwrap_or_default(),
+            html,
             attachments,
             in_reply_to: ids(parsed.in_reply_to()),
             references: ids(parsed.references()),
@@ -284,6 +307,9 @@ pub fn write(
         message = message.references(draft.references.as_slice());
     }
     message = message.text_body(crlf(&draft.body));
+    if let Some(html) = &draft.html {
+        message = message.html_body(html.as_str());
+    }
     for attachment in &draft.attachments {
         let media_type = mime_guess::from_path(&attachment.name)
             .first_or_octet_stream()
@@ -560,6 +586,7 @@ mod tests {
             bcc: vec![mailbox("hidden@example.net")],
             subject: Some("Réunion ☕".to_owned()),
             body: "Bonjour,\r\nà demain.\r\n".to_owned(),
+            html: Some("<p>Bonjour,<br>à <b>demain</b>.</p>".to_owned()),
             attachments: vec![Attachment {
                 name: "notes é.txt".to_owned(),
                 data: b"some notes".to_vec(),
@@ -631,5 +658,43 @@ mod tests {
             };
             assert!(write(&account(), &draft, 0, None).is_err(), "{id:?}");
         }
+    }
+
+    #[test]
+    fn the_html_alternative_of_a_draft_is_kept_by_a_text_that_does_not_change() {
+        let html = "<p>Hello <b>there</b>,\r\n it is é</p>";
+        let mut draft = Draft {
+            body: "Hello there,\r\nit is é\r\n".to_owned(),
+            html: Some(html.to_owned()),
+            ..Draft::default()
+        };
+        let built = write(&account(), &draft, 0, None).unwrap();
+        assert_eq!(Draft::read(&built.raw).unwrap(), draft);
+
+        // The same text, its line ends written otherwise: the HTML stays.
+        assert!(!draft.set_body("Hello there,\nit is é\n".to_owned()));
+        assert_eq!(draft.html.as_deref(), Some(html));
+        assert!(!draft.set_body("Hello there,\r\nit is é\r\n".to_owned()));
+        // Another text: the HTML would contradict it, and goes.
+        assert!(draft.set_body("Something else".to_owned()));
+        assert_eq!(draft.html, None);
+        assert_eq!(draft.body, "Something else");
+        // Nothing to drop: not said.
+        assert!(!draft.set_body("Again something else".to_owned()));
+    }
+
+    #[test]
+    fn a_text_message_has_no_html_part_and_an_html_only_one_keeps_its_html() {
+        let text = write(&account(), &Draft::default(), 0, None).unwrap();
+        assert_eq!(Draft::read(&text.raw).unwrap().html, None);
+
+        let raw = b"From: a@example.org\r\nSubject: Only html\r\nMIME-Version: 1.0\r\n\
+                    Content-Type: text/html; charset=utf-8\r\n\r\n<p>Just <b>html</b></p>\r\n";
+        let draft = Draft::read(raw).unwrap();
+        assert_eq!(draft.html.as_deref(), Some("<p>Just <b>html</b></p>\r\n"));
+        assert!(draft.body.contains("Just"), "{:?}", draft.body);
+        // Written again, it is a message with both.
+        let again = Draft::read(&write(&account(), &draft, 0, None).unwrap().raw).unwrap();
+        assert_eq!(again.html, draft.html);
     }
 }

@@ -10,8 +10,8 @@
 //! Missive only ever replaces or removes a version it wrote itself: one that carries
 //! [`OWN_DRAFT`]. A draft another client wrote, picked up again, becomes a new draft of
 //! Missive's own, under a new Message-ID, and the original stays on the server as it is: Missive
-//! reads a draft back without its HTML and most of its headers, and would otherwise replace the
-//! only rich copy with a poorer one.
+//! reads a draft back without most of its headers (it keeps the HTML as it was, unless the text
+//! is replaced), and would otherwise replace the only rich copy with a poorer one.
 //!
 //! On the server, every command goes through the sync's verified path, and counts only with its
 //! tagged `OK`:

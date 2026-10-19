@@ -882,6 +882,74 @@ impl Copy {
             .optional()?)
     }
 
+    /// A message the server does not hold yet, named by its Message-ID (with or without angle
+    /// brackets), as `compose` prints it and as [`Copy::list`] shows a draft waiting for the
+    /// server: the draft's version waiting in the copy, else the message waiting in the outbox
+    /// (or sent from it and not yet in the Sent folder). Shown as a message of the account's
+    /// Drafts folder, with no UID: its identifier is the Message-ID. `None` when no row holds it.
+    pub fn waiting(&self, id: &str) -> Result<Option<Stored>> {
+        if self.version < DRAFTS_VERSION {
+            return Ok(None);
+        }
+        let message_id = id.trim_start_matches('<').trim_end_matches('>');
+        let found: Option<(String, i64, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT account.id, account.key, draft.raw FROM draft
+                   JOIN account ON account.key = draft.account
+                  WHERE draft.message_id = ?1 AND draft.raw IS NOT NULL
+                  UNION ALL
+                 SELECT account.id, account.key, outbox.raw FROM outbox
+                   JOIN account ON account.key = outbox.account
+                  WHERE outbox.message_id = ?1
+                  LIMIT 1",
+                [message_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((account, key, raw)) = found else {
+            return Ok(None);
+        };
+        let folder = self
+            .connection
+            .query_row(
+                "SELECT id, name FROM folder WHERE account = ?1 AND role = 'drafts'
+                  ORDER BY id LIMIT 1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0, "Drafts".to_owned()));
+        let envelope = envelope(&raw);
+        let date = mail_parser::MessageParser::default()
+            .parse_headers(&raw)
+            .and_then(|parsed| parsed.date().map(|date| date.to_timestamp()));
+        Ok(Some(Stored {
+            hit: Hit {
+                id: message_id.to_owned(),
+                account,
+                folder: FolderRef {
+                    id: folder.0,
+                    name: folder.1,
+                    role: Some("drafts".to_owned()),
+                },
+                uidvalidity: None,
+                uid: 0,
+                date,
+                subject: envelope.subject,
+                from: envelope.from,
+                to: envelope.to,
+                unread: false,
+            },
+            flagged: false,
+            answered: false,
+            size: raw.len() as u64,
+            cc: envelope.cc,
+            message_id: Some(message_id.to_owned()),
+            raw,
+        }))
+    }
+
     /// The message an identifier names, with its raw message. Whether the identifier is one, and
     /// whether it still names a message, is the answer's to say ([`NotFound`]) and not an error:
     /// the identifier of a message that has gone since it was printed is what a caller will meet.
