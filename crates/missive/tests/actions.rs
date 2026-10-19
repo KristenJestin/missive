@@ -686,6 +686,7 @@ async fn a_move_on_a_server_with_only_uidplus_copies_then_expunges_only_that_uid
             "SELECT \"INBOX\"",
             "STATUS \"Archive\" (UIDNEXT)",
             "UID COPY 3 \"Archive\"",
+            "UID SEARCH DELETED UID 3",
             "UID STORE 3 +FLAGS.SILENT (\\Deleted)",
             "UID EXPUNGE 3",
         ],
@@ -778,6 +779,7 @@ async fn delete_permanently_from_the_trash_expunges_that_uid_only() {
         from,
         &[
             "SELECT \"Trash\"",
+            "UID SEARCH DELETED UID 1",
             "UID STORE 1 +FLAGS.SILENT (\\Deleted)",
             "UID EXPUNGE 1",
         ],

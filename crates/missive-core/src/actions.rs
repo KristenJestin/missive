@@ -32,7 +32,9 @@
 //! command changes nothing for it, and the next sync removes it from the copy.
 //!
 //! A removal whose `UID EXPUNGE` was refused takes its `\Deleted` back, so that no other
-//! client's `EXPUNGE` removes the message later.
+//! client's `EXPUNGE` removes the message later, but only from the messages that did not have it
+//! before the removal (`UID SEARCH DELETED UID <uids>` asks which): a `\Deleted` another client
+//! set stays.
 //!
 //! A move refused once its `UID COPY` was made leaves the messages in both folders. Nothing is
 //! removed to fix it: the copy shows both, the outcome says so, and the messages are recorded as
@@ -526,7 +528,7 @@ async fn one(
         });
     }
     if action.kind == Kind::DeletePermanently {
-        return Ok(match remove(server, &set).await? {
+        return Ok(match remove(server, &action.uids).await? {
             Done::Ok(_) => {
                 store.applied_delete(action)?;
                 Step::Applied { resync: Vec::new() }
@@ -557,16 +559,23 @@ async fn one(
             Done::Bad => BAD,
         });
     }
-    copy_then_remove(server, store, action, &set, &target_name).await
+    copy_then_remove(server, store, action, &target_name).await
 }
 
 /// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` of the same UIDs. An expunge the
-/// server refused takes the flag back (best effort): left there, another client's `EXPUNGE`
-/// would remove messages the copy shows, once the action is refused.
+/// server refused takes the flag back (best effort), but only from the messages that did not
+/// have it before: left there, another client's `EXPUNGE` would remove messages the copy shows,
+/// once the action is refused, and a `\Deleted` another client set is not ours to clear. Which
+/// ones had it is asked first (`UID SEARCH DELETED UID <set>`); an answer refused means the
+/// removal is not started.
 pub(crate) async fn remove(
     server: &mut Server<'_>,
-    set: &str,
+    uids: &[u32],
 ) -> std::result::Result<Done, SyncError> {
+    let set = sync::uid_set(uids);
+    let Some(marked) = server.search(&format!("DELETED UID {set}")).await? else {
+        return Ok(Done::No { try_create: false });
+    };
     let done = server
         .run_done(
             &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
@@ -579,10 +588,18 @@ pub(crate) async fn remove(
     let done = server
         .run_done(&format!("UID EXPUNGE {set}"), |_| {})
         .await?;
-    if !matches!(done, Done::Ok(_)) {
+    let ours: Vec<u32> = uids
+        .iter()
+        .copied()
+        .filter(|uid| !marked.contains(uid))
+        .collect();
+    if !matches!(done, Done::Ok(_)) && !ours.is_empty() {
         server
             .run_done(
-                &format!("UID STORE {set} -FLAGS.SILENT (\\Deleted)"),
+                &format!(
+                    "UID STORE {} -FLAGS.SILENT (\\Deleted)",
+                    sync::uid_set(&ours)
+                ),
                 |_| {},
             )
             .await?;
@@ -595,7 +612,6 @@ async fn copy_then_remove(
     server: &mut Server<'_>,
     store: &mut Store,
     action: &Action,
-    set: &str,
     target_name: &str,
 ) -> std::result::Result<Step, SyncError> {
     let mut action = action.clone();
@@ -640,7 +656,7 @@ async fn copy_then_remove(
         }
     }
     // Copied: only the removal from the source is left, which can be tried again as it is.
-    Ok(match remove(server, set).await? {
+    Ok(match remove(server, &action.uids).await? {
         Done::Ok(_) => Step::Applied {
             resync: store.applied_move(&action, action.copied.as_ref())?,
         },

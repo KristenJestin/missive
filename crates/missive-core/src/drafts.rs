@@ -300,7 +300,7 @@ async fn one(
             },
         )
     } else {
-        match actions::remove(server, &sync::uid_set(&old)).await? {
+        match actions::remove(server, &old).await? {
             Done::Ok(_) => (old, Left::default()),
             // A removal only is tried again; a new version is in, and the older ones are found
             // again by the next save.

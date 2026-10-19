@@ -869,6 +869,56 @@ async fn a_message_marked_deleted_by_another_client_in_drafts_survives_a_draft_r
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_expunge_takes_back_only_the_deleted_flag_missive_set() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+    // Another client marked that version for removal, and has not expunged it yet.
+    server.set_flags("Drafts", 1, &["\\Draft", "\\Seen", "\\Deleted"]);
+    server.refuse("UID EXPUNGE");
+
+    env.save(&["--draft", &id, "--subject", "Second"]).await;
+
+    drafts_on_server(&server, &["First", "Second"]).await;
+    settled(&env).await;
+    assert!(
+        server
+            .flags("Drafts", 1)
+            .unwrap()
+            .contains(&"\\Deleted".to_owned()),
+        "{:?}",
+        server.flags("Drafts", 1)
+    );
+    // Ours is taken back from the new version's removal only if it had been set: it had not.
+    assert!(
+        !removals(&server).iter().any(|line| line.contains("-FLAGS")),
+        "{:?}",
+        removals(&server)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_expunge_takes_back_the_deleted_flag_it_set_itself() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+    server.refuse("UID EXPUNGE");
+
+    env.save(&["--draft", &id, "--subject", "Second"]).await;
+
+    drafts_on_server(&server, &["First", "Second"]).await;
+    settled(&env).await;
+    assert!(
+        !server
+            .flags("Drafts", 1)
+            .unwrap()
+            .contains(&"\\Deleted".to_owned())
+    );
+}
+
 /// A server whose IMAP side is reached through a relay, an account on it synced once, and the
 /// relay switched off: the daemon returned is offline.
 async fn imap_down() -> (FakeServer, Relay, Env, Daemon) {
