@@ -313,7 +313,11 @@ pub async fn folder(
         .copied()
         .collect();
     if missing.is_empty() {
-        store.settle(folder.row.id)?;
+        // An empty listing is not a complete one: a bridge still syncing answers EXISTS 0, and
+        // what it holds back (a half moved message, a `\Deleted` left) comes back when it fills.
+        if !listing.is_empty() {
+            store.settle(folder.row.id)?;
+        }
         return Ok(Ok(changes));
     }
     // The sizes of what is missing, in commands of a bounded length. A refusal (`NO`) keeps the
