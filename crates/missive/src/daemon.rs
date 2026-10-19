@@ -719,14 +719,20 @@ impl Daemon {
         };
         // Only a draft Missive wrote is replaced: another client's stays on the server as it is,
         // and a new draft, Missive's own, is made from it (`kept`).
-        let (mut draft, message_id, kept) = match &request.draft {
-            None => (Draft::default(), None, None),
+        let (mut draft, message_id, kept, source) = match &request.draft {
+            None => (Draft::default(), None, None, None),
             Some(id) => match store.find_draft(key, id) {
                 Ok(Some(stored)) => match Draft::read(&stored.raw) {
                     Ok(draft) if compose::is_own_draft(&stored.raw) => {
-                        (draft, stored.message_id, None)
+                        (draft, stored.message_id, None, None)
                     }
-                    Ok(draft) => (draft, None, Some(id.clone())),
+                    // Named by its own Message-ID, whichever way the request named it.
+                    Ok(draft) => (
+                        draft,
+                        None,
+                        Some(id.clone()),
+                        Some(stored.message_id.unwrap_or_else(|| id.clone())),
+                    ),
                     Err(why) => return Answer::error(Some(name), "bad-request", why),
                 },
                 Ok(None) => {
@@ -742,33 +748,38 @@ impl Daemon {
                 Err(e) => return failed(e.to_string()),
             },
         };
-        if let Some(id) = &message_id {
-            match store.draft_sending(key, id) {
+        let sending = match (&message_id, &source) {
+            (Some(id), _) => store.draft_sending(key, id),
+            (None, Some(source)) => store.source_sending(key, source),
+            (None, None) => Ok(false),
+        };
+        match sending {
+            Ok(false) => {}
+            Ok(true) => {
+                return Answer::error(
+                    Some(name),
+                    "busy",
+                    "this draft is being sent; missive watch tells when it is",
+                );
+            }
+            Err(e) => return failed(e.to_string()),
+        }
+        // Without UIDPLUS its last version stays in the Drafts folder, listed: sending it again
+        // would send the same message twice.
+        if request.send
+            && let Some(id) = &message_id
+        {
+            match store.already_sent(key, id) {
                 Ok(false) => {}
                 Ok(true) => {
                     return Answer::error(
                         Some(name),
-                        "busy",
-                        "this draft is being sent; missive watch tells when it is",
+                        "already-sent",
+                        "this draft was already sent (its message is in the Sent folder or was \
+                         sent from the outbox); write a new message instead",
                     );
                 }
                 Err(e) => return failed(e.to_string()),
-            }
-            // Without UIDPLUS its last version stays in the Drafts folder, listed: sending it
-            // again would send the same message twice.
-            if request.send {
-                match store.already_sent(key, id) {
-                    Ok(false) => {}
-                    Ok(true) => {
-                        return Answer::error(
-                            Some(name),
-                            "already-sent",
-                            "this draft was already sent (its message is in the Sent folder or \
-                             was sent from the outbox); write a new message instead",
-                        );
-                    }
-                    Err(e) => return failed(e.to_string()),
-                }
             }
         }
         let changed = request.to.is_some()
@@ -847,7 +858,15 @@ impl Daemon {
         // The draft removed once the message is sent: Missive's own only.
         let draft = (save || (request.draft.is_some() && kept.is_none()))
             .then_some(built.message_id.as_str());
-        let outbox = match store.enqueue(key, &built, !account.server_saves_sent, draft) {
+        let sent_copy = !account.server_saves_sent;
+        let queued = match (&source, &request.answers) {
+            (Some(source), answers) => {
+                store.enqueue_kept(key, &built, sent_copy, draft, answers.as_deref(), source)
+            }
+            (None, Some(answers)) => store.enqueue_reply(key, &built, sent_copy, draft, answers),
+            (None, None) => store.enqueue(key, &built, sent_copy, draft),
+        };
+        let outbox = match queued {
             Ok(outbox) => outbox,
             Err(e) => return failed(e.to_string()),
         };
@@ -936,7 +955,7 @@ impl Daemon {
             Ok((
                 key,
                 match &send.answers {
-                    Some(answers) => store.enqueue_reply(key, &built, sent_copy, answers)?,
+                    Some(answers) => store.enqueue_reply(key, &built, sent_copy, None, answers)?,
                     None => store.enqueue(key, &built, sent_copy, None)?,
                 },
             ))

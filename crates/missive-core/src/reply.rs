@@ -21,7 +21,7 @@
 use mail_parser::{DateTime, HeaderValue, MessageParser};
 
 use crate::body;
-use crate::compose::Mailbox;
+use crate::compose::{Attachment, Mailbox};
 
 /// How many identifiers a `References` header keeps: the first, and the latest ones.
 pub const MAX_REFERENCES: usize = 20;
@@ -261,6 +261,57 @@ pub fn forward_name(subject: Option<&str>) -> String {
     } else {
         format!("{name}.eml")
     }
+}
+
+/// What a message answered or forwarded gives a new message: what `missive compose --reply`
+/// and the compose window both start from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Answering {
+    pub to: Vec<Mailbox>,
+    pub cc: Vec<Mailbox>,
+    pub subject: Option<String>,
+    /// The attribution and the quoted text, to put below the user's text.
+    pub quote: Option<String>,
+    pub in_reply_to: Vec<String>,
+    pub references: Vec<String>,
+    /// A forward: the message, to go along as it is.
+    pub attachment: Option<Attachment>,
+    /// A reply: the identifier of the message to mark answered once the reply is sent.
+    pub answers: Option<String>,
+}
+
+/// A reply (`Some(mode)`) or a forward (`None`) to the message `id` of the copy, as the
+/// account whose address is `own` writes it. `subject` is the one the copy shows: a forward
+/// is named after it.
+pub fn answering(
+    id: &str,
+    raw: &[u8],
+    subject: Option<&str>,
+    mode: Option<Mode>,
+    own: &str,
+) -> Result<Answering, String> {
+    let Some(mode) = mode else {
+        return Ok(Answering {
+            subject: Some(forward_subject(subject)),
+            attachment: Some(Attachment {
+                name: forward_name(subject),
+                data: raw.to_vec(),
+            }),
+            ..Answering::default()
+        });
+    };
+    let original = Original::read(raw).map_err(|e| format!("cannot answer {id}: {e}"))?;
+    let reply = reply(&original, mode, own);
+    Ok(Answering {
+        to: reply.to,
+        cc: reply.cc,
+        subject: Some(reply.subject),
+        quote: Some(reply.quote),
+        in_reply_to: reply.in_reply_to,
+        references: reply.references,
+        answers: Some(id.to_owned()),
+        ..Answering::default()
+    })
 }
 
 #[cfg(test)]

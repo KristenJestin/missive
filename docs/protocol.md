@@ -193,8 +193,9 @@ Saves a draft: a new one, or a new version of the draft `draft` names. With `sen
 | `draft` | string, absent for a new draft | the draft to pick up again: its identifier (its `Message-ID`), or the identifier of a message of the account's Drafts folder, as `list` prints it |
 | `to`, `cc`, `bcc`, `subject`, `body`, `attachments` | as for `send`, each absent to keep the draft's own | the fields that replace the draft's; for a new draft, those absent are empty. No recipient is needed |
 | `in_reply_to` | string, absent to keep the draft's own | the `Message-ID`, without angle brackets, of the message the draft answers |
-| `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered, sent or not |
+| `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered unless `answers` names it |
 | `send` | boolean, `false` when absent | send the draft, as it is once changed (at least one recipient then); it is removed from the Drafts folder once the server took the message |
+| `answers` | string, optional | with `send`: the identifier of the message the draft is a reply to, as for `send`; marked answered once the server took the reply |
 
 The daemon saves the draft in the local copy (and, with `send`, puts the message in the outbox),
 and answers: nothing waits for the server. It then writes the draft to the account's Drafts
@@ -207,12 +208,15 @@ it went.
 
 `message_id` is the draft's identifier, its `Message-ID` without angle brackets, the same for
 every version of the draft. With `send`, the answer also has `outbox`, as for `send`. A `draft`
-that names no draft of the account is answered `no-such-message`.
+that names no draft of the account is answered `no-such-message`. A `draft` naming a draft whose
+message still waits in the outbox is answered `busy`: a client that lost the answer to its `send`
+and asks again sends nothing twice.
 
 A `draft` naming a draft another client wrote (one without Missive's `X-Missive-Draft` header)
 does not replace it: the daemon makes a new draft from it, under a new `message_id`, and the
 answer also has `kept`, the `draft` given, which stays on the server as it is (and is not removed
-once the message is sent).
+once the message is sent). It is answered `busy` too while a message sent from it waits in the
+outbox, whether it is named by its identifier in `list` or by its `Message-ID`.
 
 ### `subscribe`
 

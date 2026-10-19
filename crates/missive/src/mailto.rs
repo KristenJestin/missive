@@ -1,6 +1,6 @@
 //! `missive mailto <uri>`: a `mailto:` link, as the system hands it to its default handler, saved
-//! as a draft in the account's Drafts folder (see docs/cli.md). Nothing is opened: the window
-//! that will show the composition does not exist yet.
+//! as a draft in the account's Drafts folder (see docs/cli.md), then, when there is a display,
+//! opened in the compose window.
 
 use clap::Args;
 use missive_core::mailto;
@@ -40,7 +40,7 @@ pub async fn run(args: MailtoArgs) -> Result<(), ActError> {
             .collect()
     };
     let answer = act::ask(Command::Draft(SaveDraft {
-        account,
+        account: account.clone(),
         to: Some(addresses(link.to)),
         cc: Some(addresses(link.cc)),
         bcc: Some(addresses(link.bcc)),
@@ -53,6 +53,8 @@ pub async fn run(args: MailtoArgs) -> Result<(), ActError> {
     let Some(id) = compose::answered(answer)?.message_id else {
         return Err(compose::unreadable());
     };
+    // Saved first: the window shows the draft, and nothing is lost if it cannot start.
+    crate::window::compose(&account, &id);
     if args.json {
         println!("{}", serde_json::to_string(&Saved { id })?);
     } else {

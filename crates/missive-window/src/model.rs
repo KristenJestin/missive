@@ -11,12 +11,15 @@ use std::time::Duration;
 
 use missive_core::account::{AccountStore, Listing};
 use missive_core::body;
-use missive_core::copy::{Copy, FolderRef, List, Listed, NotFound, Person};
+use missive_core::copy::{Copy, FolderRef, List, Listed, MessageId, NotFound, Person};
 use missive_core::events::{ActionEvent, Event};
 use missive_core::protocol::{Answer, Command};
+use missive_core::reply::{self, Mode};
 use missive_core::store::Store;
 use missive_render::message;
 use missive_render::reduce::{Theme, reduce};
+
+use crate::compose::Compose;
 
 /// The most messages a folder lists, the newest first.
 pub const LIMIT: usize = 500;
@@ -795,6 +798,111 @@ impl Model {
             parts: HashMap::new(),
             raw: stored.raw,
         }))
+    }
+}
+
+/// What a compose window starts from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    /// `N`: a new message, from the account of the folder shown.
+    New,
+    /// `R`, `Shift+R`, `F`: an answer to the open message.
+    Reply,
+    ReplyAll,
+    Forward,
+    /// `E`: the draft open, or under the cursor in a Drafts folder, picked up again.
+    Draft,
+}
+
+impl Model {
+    /// The compose window to open for `start`, or `None` when there is nothing to start from;
+    /// what prevents it is said in the notice.
+    pub fn compose(&mut self, start: Start) -> Option<Compose> {
+        if self.modal() {
+            return None;
+        }
+        let accounts: Vec<String> = self.accounts.iter().map(|a| a.id.clone()).collect();
+        let mode = match start {
+            Start::New => {
+                let account = self
+                    .folder
+                    .as_ref()
+                    .map(|key| key.account.clone())
+                    .or_else(|| accounts.first().cloned());
+                let Some(account) = account else {
+                    self.notice = Some(
+                        "No account to write from (missive account add makes one).".to_owned(),
+                    );
+                    return None;
+                };
+                return Some(Compose::new(accounts, account));
+            }
+            Start::Draft => return self.draft_to_edit(accounts),
+            Start::Reply => Some(Mode::Reply),
+            Start::ReplyAll => Some(Mode::ReplyAll),
+            Start::Forward => None,
+        };
+        let Reader::Open(opened) = &self.reader else {
+            return None;
+        };
+        let account = MessageId::parse(&opened.id)?.account;
+        let answering = self
+            .sources
+            .accounts
+            .get(&account)
+            .map_err(|e| format!("the account cannot be read ({e})"))
+            .and_then(|found| found.ok_or_else(|| format!("no account {account}")))
+            .and_then(|found| {
+                reply::answering(
+                    &opened.id,
+                    &opened.raw,
+                    opened.subject.as_deref(),
+                    mode,
+                    &found.address,
+                )
+            });
+        match answering {
+            Ok(answering) => Some(Compose::answering(accounts, account, answering)),
+            Err(e) => {
+                self.notice = Some(format!("Cannot answer: {e}."));
+                None
+            }
+        }
+    }
+
+    /// The draft open in the reader, else the one under the cursor, when it is in a Drafts
+    /// folder: a draft waiting for the server is listed by its Message-ID, and only the copy's
+    /// draft table has it.
+    fn draft_to_edit(&mut self, accounts: Vec<String>) -> Option<Compose> {
+        let (id, account) = match &self.reader {
+            Reader::Open(opened) if opened.folder.role.as_deref() == Some("drafts") => {
+                (opened.id.clone(), MessageId::parse(&opened.id)?.account)
+            }
+            _ => {
+                let listed = self.messages.get(self.cursor?)?;
+                if listed.hit.folder.role.as_deref() != Some("drafts") {
+                    return None;
+                }
+                (listed.hit.id.clone(), listed.hit.account.clone())
+            }
+        };
+        let raw = match self.copy() {
+            Ok(Some(copy)) => copy.draft(&account, &id).map_err(|e| e.to_string()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        };
+        let found = match raw {
+            Ok(Some(raw)) => Compose::draft(accounts, account, id, &raw),
+            Ok(None) => Err("it is no longer in the local copy".to_owned()),
+            Err(e) => Err(e),
+        };
+        match found {
+            Ok(compose) => Some(compose),
+            Err(e) => {
+                self.notice = Some(format!("Cannot pick the draft up again: {e}."));
+                None
+            }
+        }
     }
 }
 

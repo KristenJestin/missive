@@ -4837,6 +4837,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "gpui-kit",
+ "mail-parser",
  "missive-core",
  "missive-render",
  "serde_json",

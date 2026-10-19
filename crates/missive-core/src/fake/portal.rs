@@ -220,3 +220,136 @@ impl OpenUri {
         Ok(request)
     }
 }
+
+/// A private `dbus-daemon` with a fake `org.freedesktop.portal.Desktop` on it, serving
+/// `org.freedesktop.portal.FileChooser.OpenFile`: it shows nothing, records each call
+/// ([`FakeFileChooser::calls`]) and answers on its request object as the test chose
+/// ([`Chosen`]). The bus and the fake stop when it is dropped; it needs a running tokio runtime.
+pub struct FakeFileChooser {
+    // Dropped first: the connection goes before the bus it is on.
+    _connection: Connection,
+    _daemon: Daemon,
+    address: String,
+    calls: Arc<Mutex<Vec<ChooserCall>>>,
+}
+
+/// What the user does in the fake chooser.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Chosen {
+    /// `0`, with these URIs.
+    Files(Vec<String>),
+    /// `1`: the user cancelled.
+    Cancelled,
+    /// `2`: the chooser could not show itself.
+    Failed,
+}
+
+/// One `OpenFile` call, as the chooser received it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChooserCall {
+    pub title: String,
+    pub multiple: bool,
+}
+
+impl FakeFileChooser {
+    pub async fn start(chosen: Chosen) -> Self {
+        let (daemon, address) = Daemon::start();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connection = zbus::connection::Builder::address(address.as_str())
+            .expect("a bus address")
+            .name("org.freedesktop.portal.Desktop")
+            .expect("a bus name")
+            .serve_at(
+                "/org/freedesktop/portal/desktop",
+                FileChooser {
+                    chosen,
+                    calls: calls.clone(),
+                },
+            )
+            .expect("the portal object")
+            .build()
+            .await
+            .expect("a connection to the private bus");
+        FakeFileChooser {
+            _connection: connection,
+            _daemon: daemon,
+            address,
+            calls,
+        }
+    }
+
+    /// The address of the private bus, for `DBUS_SESSION_BUS_ADDRESS`.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Every `OpenFile` call, in order.
+    pub fn calls(&self) -> Vec<ChooserCall> {
+        lock(&self.calls).clone()
+    }
+}
+
+struct FileChooser {
+    chosen: Chosen,
+    calls: Arc<Mutex<Vec<ChooserCall>>>,
+}
+
+#[interface(name = "org.freedesktop.portal.FileChooser")]
+impl FileChooser {
+    async fn open_file(
+        &self,
+        _parent_window: String,
+        title: String,
+        options: HashMap<String, OwnedValue>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<OwnedObjectPath> {
+        let handle_token = options
+            .get("handle_token")
+            .and_then(|token| String::try_from(token.try_clone().ok()?).ok());
+        let multiple = options
+            .get("multiple")
+            .and_then(|multiple| bool::try_from(multiple.try_clone().ok()?).ok())
+            .unwrap_or(false);
+        lock(&self.calls).push(ChooserCall { title, multiple });
+        let sender = header
+            .sender()
+            .map(|name| name.trim_start_matches(':').replace('.', "_"))
+            .unwrap_or_default();
+        let request = OwnedObjectPath::try_from(format!(
+            "/org/freedesktop/portal/desktop/request/{sender}/{}",
+            handle_token.as_deref().unwrap_or("t")
+        ))
+        .map_err(|e| fdo::Error::InvalidArgs(e.to_string()))?;
+        let mut results: HashMap<String, OwnedValue> = HashMap::new();
+        let code = match &self.chosen {
+            Chosen::Files(uris) => {
+                let uris = zbus::zvariant::Value::from(uris.clone());
+                results.insert(
+                    "uris".to_owned(),
+                    uris.try_to_owned().expect("an array of strings"),
+                );
+                0u32
+            }
+            Chosen::Cancelled => 1,
+            Chosen::Failed => 2,
+        };
+        let connection = connection.clone();
+        let destination = header.sender().map(|name| name.to_owned());
+        let path = request.clone();
+        // After the method returned, as a real portal answers.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = connection
+                .emit_signal(
+                    destination,
+                    path,
+                    "org.freedesktop.portal.Request",
+                    "Response",
+                    &(code, results),
+                )
+                .await;
+        });
+        Ok(request)
+    }
+}
