@@ -19,6 +19,9 @@ use tokio::time::Instant;
 /// The exit status when an identifier names no message, as for `missive show`.
 pub const NOT_FOUND: u8 = 3;
 
+/// The exit status of `compose --draft` on a draft that is open in a compose window.
+pub const OPEN_IN_WINDOW: u8 = 6;
+
 /// The exit status of `--wait` when an action is still in the queue.
 pub const QUEUED: u8 = 4;
 

@@ -5,7 +5,8 @@ is a contract read by other programs: fields are only ever added, never renamed,
 removed without a new major version.
 
 Errors go to standard error, prefixed `missive: `, and the exit status is 1 (2 for a usage
-error, 3 for `missive show` of a message that does not exist).
+error, 3 for `missive show` of a message that does not exist, 6 for `missive compose --draft` of a
+draft open in a compose window).
 
 ## Accounts
 
@@ -801,10 +802,18 @@ nothing even with one, for a script that only wants the draft saved.
 
 A draft has **one compose window**, whichever process opened it: a window holds a lock on the draft
 (see `docs/protocol.md`) for as long as it is open, and the lock goes with the process, so a window
-that crashed does not keep its draft shut. `compose --draft` on a draft that is open in a window
-does not open a second one: it saves the draft, and says on standard error that the draft is
-already open (it does not bring the first window forward). The reader's `E` says the same in its
-notice, and `missive-window compose --draft …` run by hand exits with status 1.
+that crashed does not keep its draft shut. The lock follows the draft: when a save makes a new
+draft (another client's draft is kept as it is and the changes go to a new one; a message already
+sent), the window holds the lock of the new draft's `Message-ID`.
+
+`compose --draft` on a draft that is open in a window **refuses**: it saves nothing and sends
+nothing (with or without `--send`, `--no-window` or a display), says so on standard error, and
+exits with **6**. A new version saved from the shell would be unknown to the window, whose next
+save would overwrite it. The draft is named by its `Message-ID` or by the identifier of its
+message in the local copy; either way, it is the draft the window holds. The command never waits for
+the window and never takes its lock, and it does not bring the window forward. The reader's `E`
+says the same in its notice, and `missive-window compose --draft …` run by hand exits with
+status 1.
 
 #### Replying and forwarding
 
@@ -863,7 +872,8 @@ the text above the quote.
 
 The exit status is 1 when the message cannot be written as asked: no recipient (with `--send`),
 an address that is not one, a file that cannot be read, an account that is not configured. It is
-3 when `--draft` names no draft, or `--reply`, `--reply-all` or `--forward` no message.
+3 when `--draft` names no draft, or `--reply`, `--reply-all` or `--forward` no message, and 6 when
+`--draft` names a draft that is open in a compose window (nothing is saved).
 
 #### Drafts
 
