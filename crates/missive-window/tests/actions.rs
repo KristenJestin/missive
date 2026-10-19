@@ -542,6 +542,58 @@ async fn reply_and_forward_start_from_the_cursor_when_no_message_is_open() {
 }
 
 #[tokio::test]
+async fn a_picker_or_a_confirmation_closes_with_the_message_that_is_gone() {
+    let mail = Mail::new(sorted_mailbox()).await;
+    let mut model = mail.model();
+    open(&mut model, "Plan 3");
+    model.pick_folder();
+    assert!(model.picker.is_some());
+
+    mail.server.expunge("INBOX", 3);
+    mail.sync().await;
+    model.refresh();
+    assert_eq!(model.reader, Reader::Gone);
+    assert!(model.picker.is_none(), "no folder picker on a message gone");
+    assert!(!model.modal());
+
+    select(&mut model, "trash");
+    open(&mut model, "Plan 6");
+    model.delete();
+    assert!(model.confirm.is_some());
+    mail.server.expunge("Trash", 1);
+    mail.sync().await;
+    model.refresh();
+    assert_eq!(model.reader, Reader::Gone);
+    assert!(model.confirm.is_none(), "no confirmation on a message gone");
+    assert!(!model.modal());
+}
+
+#[tokio::test]
+async fn clicking_another_folder_closes_the_picker_and_the_confirmation() {
+    let mail = Mail::new(sorted_mailbox()).await;
+    let mut model = mail.model();
+    let archive = model.accounts[0]
+        .folders
+        .iter()
+        .find(|f| f.folder.role.as_deref() == Some("archive"))
+        .unwrap()
+        .folder
+        .id;
+    open(&mut model, "Plan 3");
+    model.pick_folder();
+    model.select_folder(ID, archive);
+    assert!(model.picker.is_none());
+
+    select(&mut model, "trash");
+    open(&mut model, "Plan 6");
+    model.delete();
+    assert!(model.confirm.is_some());
+    model.select_folder(ID, archive);
+    assert!(model.confirm.is_none());
+    assert!(requests(&mut model).is_empty(), "nothing was asked");
+}
+
+#[tokio::test]
 async fn after_the_daemon_stopped_the_next_action_is_still_asked() {
     // The asking starts a daemon again when none answers (`missive_core::client`).
     let mail = Mail::new(sorted_mailbox()).await;

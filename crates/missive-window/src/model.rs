@@ -292,6 +292,22 @@ impl Model {
                 None => self.reader = Reader::Gone,
             }
         }
+        self.drop_stale_dialogs();
+    }
+
+    /// Closes a picker or a confirmation whose message is neither open nor listed any more: it
+    /// would stay on a screen that no longer shows it, and keep the keys from acting.
+    fn drop_stale_dialogs(&mut self) {
+        let message = match (&self.picker, &self.confirm) {
+            (Some(picker), _) => &picker.message,
+            (None, Some(id)) => id,
+            (None, None) => return,
+        };
+        let here = matches!(&self.reader, Reader::Open(opened) if opened.id == *message)
+            || self.messages.iter().any(|m| m.hit.id == *message);
+        if !here {
+            self.dismiss();
+        }
     }
 
     /// Follows one event of the daemon.
@@ -341,6 +357,7 @@ impl Model {
         if self.pane(&key).is_none() {
             return;
         }
+        self.dismiss();
         self.folder = Some(key);
         self.load_messages();
         self.cursor = (!self.messages.is_empty()).then_some(0);
@@ -699,6 +716,7 @@ impl Model {
         if let Reader::Open(opened) = &self.reader {
             let id = opened.id.clone();
             self.reader = self.read(&id);
+            self.drop_stale_dialogs();
         }
     }
 
