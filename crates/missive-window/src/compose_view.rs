@@ -14,7 +14,7 @@ use gpui_kit::{
     SharedString, Window, WindowBounds, WindowHandle, WindowOptions, actions, div, px, size,
 };
 
-use crate::compose::{Compose, Field, State};
+use crate::compose::{self, Compose, Field, State};
 use crate::view::{Asker, Palette, button, is_dark};
 
 actions!(missive_compose, [SendMessage, CloseCompose]);
@@ -214,12 +214,28 @@ impl ComposeWindow {
     fn choose_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let chooser = self.chooser.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let chosen = cx.background_spawn(async move { chooser() }).await;
+            let chosen = cx
+                .background_spawn(async move { chooser().map(compose::load) })
+                .await;
             this.update_in(cx, |this, window, cx| {
                 match chosen {
-                    Ok(paths) => this.model.attach(paths),
+                    Ok(loaded) => this.model.attach(loaded),
                     Err(e) => this.model.notice = Some(format!("No file chooser: {e}.")),
                 }
+                this.changed(window, cx);
+            })
+        })
+        .detach();
+    }
+
+    /// Reads the dropped files off this thread, and attaches them.
+    fn attach_dropped(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move { compose::load(paths) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.model.attach(loaded);
                 this.changed(window, cx);
             })
         })
@@ -285,8 +301,7 @@ impl Render for ComposeWindow {
             .on_action(cx.listener(Self::send))
             .on_action(cx.listener(Self::close))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                this.model.attach(paths.paths().to_vec());
-                this.changed(window, cx);
+                this.attach_dropped(paths.paths().to_vec(), window, cx);
             }))
             .size_full()
             .flex()

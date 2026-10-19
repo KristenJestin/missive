@@ -294,7 +294,7 @@ async fn a_reply_written_in_the_window_arrives_with_its_attachment_and_its_draft
     std::fs::write(&file, "Minutes of the meeting").unwrap();
 
     // Typed, attached, and saved once the typing stopped.
-    compose.attach(vec![file]);
+    compose.attach(missive_window::compose::load(vec![file]));
     let body = format!("Noon works.{}", compose.body);
     compose.edit(Field::Body, body);
     let timer = compose.take_save_timer().unwrap();

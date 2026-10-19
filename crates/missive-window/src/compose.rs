@@ -8,6 +8,7 @@
 //! draft already on its way, so a send asked again never sends twice. Whatever the daemon
 //! answers, what was typed stays in the window until it is saved or sent.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -207,24 +208,21 @@ impl Compose {
         }
     }
 
-    /// Attaches files, read now: they may be gone by the time the message is sent.
-    pub fn attach(&mut self, paths: Vec<PathBuf>) {
+    /// Attaches the files [`load`] read, and says why the others were not.
+    pub fn attach(&mut self, loaded: Vec<Result<Attachment, String>>) {
         if self.state != State::Editing {
+            self.notice = Some("Not attached: the message is being sent.".to_owned());
             return;
         }
         let mut problems = Vec::new();
         let mut added = false;
-        for path in paths {
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned());
-            match (name, std::fs::read(&path)) {
-                (Some(name), Ok(data)) => {
-                    self.attachments.push(Attachment { name, data });
+        for file in loaded {
+            match file {
+                Ok(attachment) => {
+                    self.attachments.push(attachment);
                     added = true;
                 }
-                (None, _) => problems.push(format!("{} names no file", path.display())),
-                (_, Err(e)) => problems.push(format!("{} cannot be read ({e})", path.display())),
+                Err(problem) => problems.push(problem),
             }
         }
         if added {
@@ -427,6 +425,49 @@ impl Compose {
             after: SAVE_AFTER,
         });
     }
+}
+
+/// The most bytes of one attachment: the message is held in memory, sent to the daemon and
+/// written to its copy whole.
+pub const MAX_ATTACHMENT: u64 = 25 * 1024 * 1024;
+
+/// Reads the files to attach, now, as they may be gone by the time the message is sent. It
+/// blocks on the disk: the window calls it off its own thread.
+pub fn load(paths: Vec<PathBuf>) -> Vec<Result<Attachment, String>> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .ok_or_else(|| format!("{} names no file", path.display()))?;
+            let unreadable = |e: std::io::Error| format!("{} cannot be read ({e})", path.display());
+            // Looked at before it is opened: opening a FIFO waits for a writer.
+            let meta = std::fs::metadata(&path).map_err(unreadable)?;
+            if !meta.is_file() {
+                return Err(format!("{} is not a regular file", path.display()));
+            }
+            let too_big = || {
+                format!(
+                    "{} is larger than {} MiB",
+                    path.display(),
+                    MAX_ATTACHMENT >> 20
+                )
+            };
+            if meta.len() > MAX_ATTACHMENT {
+                return Err(too_big());
+            }
+            // One byte more than the cap shows a file that grew since it was looked at.
+            let mut data = Vec::new();
+            std::fs::File::open(&path)
+                .and_then(|file| file.take(MAX_ATTACHMENT + 1).read_to_end(&mut data))
+                .map_err(unreadable)?;
+            if data.len() as u64 > MAX_ATTACHMENT {
+                return Err(too_big());
+            }
+            Ok(Attachment { name, data })
+        })
+        .collect()
 }
 
 /// Recipients as a field shows them, `"Name" <address>` or `address`, comma-separated.

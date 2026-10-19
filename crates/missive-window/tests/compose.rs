@@ -5,7 +5,7 @@ mod common;
 
 use common::{ID, Mail, mailbox};
 use missive_core::protocol::{Answer, Attached, Command, PROTOCOL, SaveDraft};
-use missive_window::compose::{Compose, Field, State, addresses};
+use missive_window::compose::{Compose, Field, MAX_ATTACHMENT, State, addresses, load};
 use missive_window::model::{Model, Start};
 
 fn new_message() -> Compose {
@@ -299,7 +299,7 @@ fn attachments_are_added_and_removed() {
     std::fs::write(&photo, [0xff, 0xd8, 0xff]).unwrap();
     let mut compose = new_message();
 
-    compose.attach(vec![report, photo, folder.path().join("missing.txt")]);
+    compose.attach(load(vec![report, photo, folder.path().join("missing.txt")]));
     assert_eq!(
         compose
             .attachments
@@ -333,6 +333,59 @@ fn attachments_are_added_and_removed() {
     let next = draft(compose.take_request().unwrap());
     assert_eq!(next.attachments.unwrap().len(), 1);
     assert_eq!(compose.attachments[0].name, "photo.jpg");
+}
+
+#[test]
+fn a_file_over_the_cap_and_a_file_that_is_no_regular_file_are_not_attached() {
+    let folder = tempfile::tempdir().unwrap();
+    let small = folder.path().join("small.txt");
+    std::fs::write(&small, "Small").unwrap();
+    // A sparse file: it costs no disk, and reading it whole would cost the memory.
+    let huge = folder.path().join("huge.bin");
+    std::fs::File::create(&huge)
+        .unwrap()
+        .set_len(MAX_ATTACHMENT + 1)
+        .unwrap();
+    // Reading a FIFO waits for a writer that never comes: the window would freeze.
+    let fifo = folder.path().join("pipe");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut compose = new_message();
+
+    compose.attach(load(vec![huge, fifo, small]));
+
+    assert_eq!(
+        compose
+            .attachments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>(),
+        ["small.txt"]
+    );
+    let notice = compose.notice.clone().unwrap();
+    assert!(notice.contains("huge.bin"), "{notice}");
+    assert!(notice.contains("25 MiB"), "{notice}");
+    assert!(notice.contains("pipe"), "{notice}");
+    assert!(notice.contains("not a regular file"), "{notice}");
+}
+
+#[test]
+fn a_file_exactly_at_the_cap_is_attached() {
+    let folder = tempfile::tempdir().unwrap();
+    let exact = folder.path().join("exact.bin");
+    std::fs::File::create(&exact)
+        .unwrap()
+        .set_len(MAX_ATTACHMENT)
+        .unwrap();
+    let mut compose = new_message();
+    compose.attach(load(vec![exact]));
+    assert_eq!(compose.attachments.len(), 1);
+    assert_eq!(compose.notice, None);
 }
 
 #[test]
