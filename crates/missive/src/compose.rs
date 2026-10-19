@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use clap::{ArgGroup, Args};
 use missive_core::account::AccountStore;
+use missive_core::actions::ORIGINAL_GONE;
 use missive_core::compose::{Attachment, Draft, Mailbox};
 use missive_core::copy::MessageId;
 use missive_core::protocol::{Answer, Attached, Command, SaveDraft, Send};
@@ -339,7 +340,7 @@ pub(crate) fn answered(answer: Answer) -> Result<Answer, ActError> {
         )
     });
     Err(match answer.error.as_deref() {
-        Some("no-such-message") => ActError::NotFound(message),
+        Some("no-such-message" | ORIGINAL_GONE) => ActError::NotFound(message),
         _ => ActError::Failed(message),
     })
 }

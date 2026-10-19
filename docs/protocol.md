@@ -62,6 +62,7 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `unknown-request` | the daemon knows no such request |
 | `no-such-account` | the account named is not in the configuration |
 | `no-such-message` | an identifier names no message in the local copy (`message` says which, and why), or a `resend` or `discard` names no message of the outbox |
+| `original-gone` | a `send` or a `draft` whose `answers` or `forwards` is an identifier of a message the local copy no longer holds (moved, deleted, or its folder renumbered since the reply was started): nothing is saved or sent. A client can drop the link and ask again; `message` names the identifier. An `answers` or `forwards` that is no identifier at all stays `no-such-message` |
 | `no-such-folder` | the folder a `move` names is not one of the account's |
 | `no-trash` | a `delete` without `permanently`, in an account that has no trash |
 | `in-trash` | a `delete` without `permanently` of a message already in the trash |
@@ -150,7 +151,7 @@ reached:
 | `attachments` | array, empty when absent | each a file's `name` (no folder) and its content, `data`, in base64 |
 | `in_reply_to` | string, absent for none | the `Message-ID`, without angle brackets, of the message this one answers, written as its `In-Reply-To` header |
 | `references` | array of strings, empty when absent | the thread's `Message-ID`s without angle brackets, written as the `References` header |
-| `answers` | string, absent for none | the identifier of the message this one is a reply to: once the server took the reply (never before), that message is marked answered (`\Answered`), through the queue of actions, and the `action` event `answered` tells it. It must name a message of the local copy now (of any account: a reply may be written from another one), else the request is answered `no-such-message`; a message gone since is not an error |
+| `answers` | string, absent for none | the identifier of the message this one is a reply to: once the server took the reply (never before), that message is marked answered (`\Answered`), through the queue of actions, and the `action` event `answered` tells it. It must name a message of the local copy now (of any account: a reply may be written from another one), else the request is answered `original-gone` (`no-such-message` when it is no identifier); a message gone since the request was accepted is not an error |
 | `forwards` | string, absent for none | the identifier of the message this one forwards: once the server took the forward (never before), that message is marked forwarded (`$Forwarded`), through the queue of actions, and the `action` event `forwarded` tells it; a server whose folder keeps no keywords is not asked, and nothing is said. Checked as `answers` is; a message gone since is not an error |
 
 The daemon builds the message (see `missive compose` in `docs/cli.md`), writes it to the outbox

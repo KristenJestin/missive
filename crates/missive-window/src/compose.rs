@@ -12,6 +12,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use missive_core::actions::ORIGINAL_GONE;
 use missive_core::compose::{self, Attachment, Draft, Followup, Mailbox};
 use missive_core::protocol::{Answer, Attached, Command, SaveDraft};
 use missive_core::reply::{self, Answering, Mode, Original};
@@ -558,15 +559,9 @@ impl Compose {
     }
 
     /// Whether the daemon refused the request because the message it answers or forwards is not
-    /// in the copy: the identifier is in what it says.
+    /// in the copy.
     fn link_lost(&self, answer: &Answer) -> bool {
-        answer.error.as_deref() == Some("no-such-message")
-            && answer.message.as_deref().is_some_and(|message| {
-                self.answers
-                    .iter()
-                    .chain(&self.forwards)
-                    .any(|id| message.contains(id.as_str()))
-            })
+        answer.error.as_deref() == Some(ORIGINAL_GONE)
     }
 
     /// Whether something changed since the last save, and is worth a draft: a new message left

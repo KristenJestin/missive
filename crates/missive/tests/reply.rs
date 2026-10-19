@@ -1119,9 +1119,12 @@ async fn an_identifier_that_names_no_message_is_refused_and_nothing_is_saved_or_
     let unknown = id.replace("/1", "/99");
     assert_ne!(unknown, id);
 
-    for (field, value) in [
-        ("answers", unknown.as_str()),
-        ("forwards", "not an identifier"),
+    // A well-formed identifier of a message that is gone has its own code; one that is no
+    // identifier at all stays `no-such-message`.
+    for (field, value, code) in [
+        ("answers", unknown.as_str(), "original-gone"),
+        ("forwards", unknown.as_str(), "original-gone"),
+        ("forwards", "not an identifier", "no-such-message"),
     ] {
         for send in [false, true] {
             let mut request = serde_json::json!({
@@ -1131,7 +1134,7 @@ async fn an_identifier_that_names_no_message_is_refused_and_nothing_is_saved_or_
             request[field] = value.into();
             let refused = ask(&env, request).await;
             assert_eq!(refused["ok"], false, "{field} {send}: {refused}");
-            assert_eq!(refused["error"], "no-such-message", "{refused}");
+            assert_eq!(refused["error"], code, "{refused}");
             assert!(
                 refused["message"].as_str().unwrap().contains(value),
                 "{refused}"
@@ -1145,7 +1148,7 @@ async fn an_identifier_that_names_no_message_is_refused_and_nothing_is_saved_or_
             }),
         )
         .await;
-        assert_eq!(refused["error"], "no-such-message", "{field}: {refused}");
+        assert_eq!(refused["error"], code, "{field}: {refused}");
     }
     // Both at once: a message answers or forwards another, not both.
     let both = ask(

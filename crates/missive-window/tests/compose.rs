@@ -571,7 +571,7 @@ fn the_message_a_reply_answers_being_gone_the_link_is_dropped_and_the_text_still
     // Moved or deleted since: its identifier names nothing now.
     compose.answered(Ok(Answer::error(
         Some("draft"),
-        "no-such-message",
+        "original-gone",
         "alice/3/1/5: no such message in the local copy",
     )));
     assert_eq!(compose.state, State::Sending, "the send goes on");
@@ -593,7 +593,7 @@ fn a_save_refused_for_the_message_it_answers_is_asked_again_without_the_link() {
     assert_eq!(first.answers.as_deref(), Some("alice/3/1/5"));
     compose.answered(Ok(Answer::error(
         Some("draft"),
-        "no-such-message",
+        "original-gone",
         "alice/3/1/5: no such message in the local copy",
     )));
     let again = draft(compose.take_request().expect("saved again at once"));

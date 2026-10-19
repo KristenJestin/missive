@@ -826,7 +826,9 @@ the text above the quote.
   original (an `X-Missive-Answers` or `X-Missive-Forwards` header of the draft, which the message
   sent never carries): picked up later and sent, from the command line or the window, it marks the
   original all the same. The message answered must be in the local copy when the reply is saved
-  or sent (a message identifier that names none is refused, `no-such-message`).
+  or sent: an identifier of a message that is gone is refused with the error `original-gone` (exit
+  status 3; the window drops the link and asks again), and one that is no identifier at all with
+  `no-such-message`.
 - A message that is odd is answered all the same, and one line on the error output says what was
   changed (counts and kinds, never what the message says): line breaks in its subject (an
   encoded subject can decode to some) become spaces, and the identifiers (`Message-ID`,
