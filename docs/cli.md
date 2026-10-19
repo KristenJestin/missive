@@ -483,6 +483,13 @@ alice/1/1745112/4	u..@	2026-10-17 07:04 UTC	Carol Sender	Plan 4
 
 One message, by the identifier `search` and `list` print (`<account>/<folder id>/<uidvalidity>/<uid>`).
 
+A draft the server does not hold yet is read too, named by its `Message-ID` (what `compose` prints
+and `list --folder drafts` shows as the `id` of a draft waiting for the server, with `uid` `0` and
+`uidvalidity` `null`), with or without angle brackets: the version waiting in the local copy, else
+the message waiting in the outbox. It is shown as a message of the account's Drafts folder; `--raw`
+gives the version as Missive keeps it (its `X-Missive-Draft` and `Bcc` headers included). Once the
+server holds the draft, its identifier is the usual one, and the `Message-ID` finds nothing more.
+
 ```json
 {
   "id": "alice/1/1745112/4",
@@ -572,8 +579,9 @@ With no local copy yet, `show` says so (as the other commands do) and exits with
 any message a window cannot draw well. Until the window exists it is the only view, so
 `--original` changes nothing yet; a program that wants the browser passes it already.
 
-The message is read from the local copy (as `show` does: the same identifiers, the same exit
-status 3 when the identifier names no message), cleaned, and written to a new file
+The message is read from the local copy (as `show` does: the same identifiers, a draft the server
+does not hold yet named by its `Message-ID` included, the same exit status 3 when the identifier
+names no message), cleaned, and written to a new file
 `$XDG_RUNTIME_DIR/missive/original/<random>.html`, readable by the user only (mode 0600, in a
 folder of mode 0700). Without `XDG_RUNTIME_DIR` it refuses: the page is never written to a
 shared folder such as `/tmp`. Pages older than an hour are removed at the next `open`. On success
@@ -725,7 +733,7 @@ whose move waits, an account that is not configured, an action the server cannot
 
 ## Sending
 
-### `missive compose [--account <id>] [--draft <draft id> | --reply <message id> | --reply-all <message id> | --forward <message id>] [--to <address>]… [--cc <address>]… [--bcc <address>]… [--subject <text>] [--body-file <path> | --body <text or ->] [--attach <path>]… [--send] [--json]`
+### `missive compose [--account <id>] [--draft <draft id> | --reply <message id> | --reply-all <message id> | --forward <message id>] [--to <address>]… [--cc <address>]… [--bcc <address>]… [--no-to] [--no-cc] [--no-bcc] [--subject <text>] [--body-file <path> | --body <text or ->] [--attach <path>]… [--no-attach] [--send] [--json]`
 
 Writes a message: saved as a draft, or with `--send` sent. An address is `name@example.org` or
 `Name <name@example.org>` (the name may be in any script; the address is ASCII). `--body -`
@@ -824,14 +832,22 @@ of the draft keeps (so that its versions are found again on the server, and a re
 stays whole); each version gets a new `Date`. `--draft` takes it, or the identifier `list` prints
 for a message of the Drafts folder (`missive list --folder drafts`), which is how a draft written
 by another client is picked up. The fields given replace those of the draft; the others are
-kept, its Bcc recipients and attachments included (`--attach` replaces every attachment). With
+kept, its Bcc recipients and attachments included (`--attach` replaces every attachment).
+`--no-to`, `--no-cc`, `--no-bcc` and `--no-attach` take the recipients of that kind, or every
+attachment, **off** the draft: they need `--draft`, and cannot go with the option that gives the
+field (`--no-cc --cc …` is refused; give `--cc` alone to replace the Cc recipients). A draft
+cleared of every recipient is still a draft, and `--send` refuses it. With
 `--send` the draft is sent as it is then, and it is removed from the Drafts folder **once the
 server took the message**: a message the server refuses (`failed`) or that may not have arrived
 (`uncertain`) keeps its draft. A draft whose message waits in the outbox cannot be changed or sent
 again until it is sent, and a draft whose message was already sent (the Sent folder holds it, or
 the outbox sent it or does not know whether the server took it) cannot be sent again: `--send`
 refuses it with an error, so that a server without UIDPLUS, which keeps the sent draft's last
-version in the Drafts folder, never makes the same message go twice.
+version in the Drafts folder, never makes the same message go twice. The changes given in the
+request that `--send` refuses this way are saved first, as a **new draft** with a new identifier,
+never as a version of the sent one (a later resend of an `uncertain` message would remove it with
+the sent draft): the error says `already sent; your changes are saved as a new draft <id>`, and
+nothing typed is lost with the refusal. A request that changes nothing saves nothing.
 
 Missive only ever replaces or removes a draft it wrote itself: its drafts carry an
 `X-Missive-Draft: 1` header (the message sent from one does not). A draft **another client
@@ -839,8 +855,13 @@ wrote** is never changed or removed: picking it up makes a new draft, Missive's 
 identifier (which `--json` prints), and the original stays in the Drafts folder as it is, with
 `--send` or without; one line on standard error says so, and it is yours to delete there. What is
 picked up of a draft is its recipients, subject, text, attachments and the thread it answers
-(`In-Reply-To` and `References`): an HTML draft becomes text, and its other headers (`Reply-To`…)
-are not kept.
+(`In-Reply-To` and `References`), and its HTML alternative, kept as it was, byte for byte (a draft
+with only HTML gets its text made from it, beside the HTML; with several HTML parts, the first is
+kept): a draft picked up and written again, or sent, still carries its HTML. Its other headers
+(`Reply-To`…) are not kept, nor is an image the HTML draws from a part of the message (it stays an
+attachment). The HTML says what the text says: when `--body` or `--body-file` gives **another
+text**, the HTML part is dropped, so that the draft never says two things, and one line on standard
+error says so; the same text (line ends aside) keeps it.
 
 The draft is saved in the local copy first, and the command returns at once, whether the server
 can be reached or not: `list --folder drafts` shows it at once. The daemon then writes it to the

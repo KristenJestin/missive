@@ -221,6 +221,10 @@ pub struct Answer {
     /// server as it is, beside the new draft `message_id` names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept: Option<String>,
+    /// A `draft` whose text was replaced: the draft had an HTML alternative, which went with the
+    /// old text and is dropped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub html_dropped: bool,
     /// When not `ok`: `bad-request`, `unsupported-protocol`, `unknown-request`,
     /// `no-such-account`, `no-such-message`, `failed`, or why an action was refused
     /// (`docs/protocol.md`).
