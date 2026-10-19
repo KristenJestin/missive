@@ -17,7 +17,7 @@ use missive_core::account::AccountStore;
 use missive_core::compose::{Attachment, Draft, Mailbox};
 use missive_core::copy::MessageId;
 use missive_core::protocol::{Answer, Attached, Command, SaveDraft, Send};
-use missive_core::reply::{self, Mode, Original};
+use missive_core::reply::{self, Answering, Mode};
 use serde::Serialize;
 
 use crate::act::{self, ActError};
@@ -148,8 +148,17 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
     // What the user gives replaces what the message answered suggests.
     let a = answering.unwrap_or_default();
     attachments.splice(0..0, a.attachment);
-    let to = if args.to.is_empty() { a.to } else { args.to };
-    let cc = if args.cc.is_empty() { a.cc } else { args.cc };
+    let texts = |list: Vec<Mailbox>| -> Vec<String> { list.iter().map(Mailbox::to_text).collect() };
+    let to = if args.to.is_empty() {
+        texts(a.to)
+    } else {
+        args.to
+    };
+    let cc = if args.cc.is_empty() {
+        texts(a.cc)
+    } else {
+        args.cc
+    };
     let subject = args.subject.or(a.subject);
     let text = match &a.quote {
         Some(quote) => reply::with_quote(body.as_deref().unwrap_or_default(), quote),
@@ -248,57 +257,24 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
     Ok(())
 }
 
-/// What the message answered or forwarded gives a new message.
-#[derive(Default)]
-struct Answering {
-    to: Vec<String>,
-    cc: Vec<String>,
-    subject: Option<String>,
-    /// The attribution and the quoted text, to put below the user's text.
-    quote: Option<String>,
-    in_reply_to: Vec<String>,
-    references: Vec<String>,
-    /// A forward: the message, to go along as it is.
-    attachment: Option<Attachment>,
-    /// A reply: the message to mark answered once the reply is sent.
-    answers: Option<String>,
-}
-
 /// Works out a reply (`Some(mode)`) or a forward (`None`) to `stored`, written from `account`.
 fn answering(
     account: &str,
     stored: missive_core::copy::Stored,
     mode: Option<Mode>,
 ) -> Result<Answering, ActError> {
-    let Some(mode) = mode else {
-        return Ok(Answering {
-            subject: Some(reply::forward_subject(stored.hit.subject.as_deref())),
-            attachment: Some(Attachment {
-                name: reply::forward_name(stored.hit.subject.as_deref()),
-                data: stored.raw,
-            }),
-            ..Answering::default()
-        });
-    };
     let address = AccountStore::from_env()
         .and_then(|store| store.get(account))
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no account {account} (missive account list shows them)"))?
         .address;
-    let original =
-        Original::read(&stored.raw).map_err(|e| format!("cannot answer {}: {e}", stored.hit.id))?;
-    let reply = reply::reply(&original, mode, &address);
-    let texts = |list: Vec<Mailbox>| list.iter().map(Mailbox::to_text).collect();
-    Ok(Answering {
-        to: texts(reply.to),
-        cc: texts(reply.cc),
-        subject: Some(reply.subject),
-        quote: Some(reply.quote),
-        in_reply_to: reply.in_reply_to,
-        references: reply.references,
-        answers: Some(stored.hit.id),
-        ..Answering::default()
-    })
+    Ok(reply::answering(
+        &stored.hit.id,
+        &stored.raw,
+        stored.hit.subject.as_deref(),
+        mode,
+        &address,
+    )?)
 }
 
 fn mailboxes(list: &[String]) -> Result<Vec<Mailbox>, String> {
