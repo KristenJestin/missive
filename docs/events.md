@@ -185,7 +185,11 @@ An action on messages of several folders is one action per folder, each with its
   messages another client marked deleted), `refused` (the server refused it 5 times, or as
   malformed) or `connection` (it failed 5 times that way). A move or a permanent delete whose
   `UID EXPUNGE` the server refused takes its `\Deleted` flag back on the server, so that another
-  client's `EXPUNGE` does not remove the message later.
+  client's `EXPUNGE` does not remove the message later. An action asked while a move of its messages waited is refused
+  with `moved` when the server moved them without saying their new UIDs (no `COPYUID`, or a copy
+  found again after a lost answer rather than told): nothing is done to them in their new folder.
+  A permanent delete asked while the move of its messages to the trash waited is refused with
+  `not-moved` when that move is refused: the messages never reached the trash.
 
 A move on a server without `MOVE` is a `UID COPY`, then the removal of the messages from their
 folder. When the removal is refused for good (or the folder renumbered) once the copy was made,

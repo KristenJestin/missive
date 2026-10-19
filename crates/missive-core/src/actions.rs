@@ -36,6 +36,13 @@
 //! before the removal (`UID SEARCH DELETED UID <uids>` asks which): a `\Deleted` another client
 //! set stays.
 //!
+//! An action asked while a move of its messages waits is recorded on them as the server still has
+//! them, apart from the messages that are not moving, and follows them to their new UIDs once the
+//! move is applied, but only when the server told those UIDs (`COPYUID`) for exactly those
+//! messages: a delete applied to a UID found by other means could remove another message. Without
+//! them, it is refused. A permanent delete asked after a move to the trash is refused with that
+//! move.
+//!
 //! A move refused once its `UID COPY` was made leaves the messages in both folders. Nothing is
 //! removed to fix it: the copy shows both, the outcome says so, and the messages are recorded as
 //! half moved ([`crate::copy::Copy::half_moved`]) until the user removes one of the two.
@@ -54,7 +61,7 @@ use async_imap::imap_proto::{AttributeValue, MailboxDatum, Response, StatusAttri
 
 use crate::connect::{ConnectError, ImapSession};
 use crate::copy::message_id;
-use crate::store::{Action, Fingerprint, Store};
+use crate::store::{Action, Dropped, Fingerprint, Store};
 use crate::sync::{self, Capabilities, CopyUid, Done, SyncError};
 
 /// How many times an action fails (a `NO`, a cut connection, a timeout…) before it is refused.
@@ -396,11 +403,7 @@ async fn round(
         let Some(action) = store.next_action(account)? else {
             return Ok(());
         };
-        let messages: Vec<String> = action
-            .uids
-            .iter()
-            .map(|uid| message_id(account_id, action.folder.id, action.uidvalidity, *uid))
-            .collect();
+        let messages = messages(account_id, &action);
         let outcome = |result| Outcome {
             action: action.id,
             kind: action.kind,
@@ -419,23 +422,26 @@ async fn round(
                         reason: "connection",
                     }));
                 } else {
-                    let copied = refuse(store, &action, applied)?;
+                    let dropped = refuse(store, &action, applied)?;
                     applied.outcomes.push(outcome(refused(
                         "connection",
                         format!(
                             "it failed {attempts} times: the connection was lost, the server's \
                              answer could not be used, or none came in time"
                         ),
-                        copied,
+                        &dropped,
                     )));
+                    refuse_behind(store, account_id, &dropped.behind, NOT_MOVED, applied)?;
                 }
                 return Err(error);
             }
             Err(error) => return Err(error),
         };
+        let mut behind = (Vec::new(), NOT_MOVED);
         let result = match result {
-            Step::Applied { resync } => {
+            Step::Applied { resync, moved } => {
                 applied.resync.extend(resync);
+                behind = (moved, MOVED);
                 Result::Applied
             }
             Step::No(why) => {
@@ -448,16 +454,18 @@ async fn round(
                     // The actions after it wait, so that they are applied in order.
                     return Ok(());
                 }
-                let copied = refuse(store, &action, applied)?;
+                let dropped = refuse(store, &action, applied)?;
+                behind.0 = dropped.behind.clone();
                 refused(
                     "refused",
                     format!("the server refused it {attempts} times ({why})"),
-                    copied,
+                    &dropped,
                 )
             }
             Step::Refused(reason, message) => {
-                let copied = refuse(store, &action, applied)?;
-                refused(reason, message.to_owned(), copied)
+                let dropped = refuse(store, &action, applied)?;
+                behind.0 = dropped.behind.clone();
+                refused(reason, message.to_owned(), &dropped)
             }
             Step::Skipped => {
                 // The copy took its flag at once: the folder is read again to forget it.
@@ -466,46 +474,99 @@ async fn round(
             }
         };
         applied.outcomes.push(outcome(result));
+        refuse_behind(store, account_id, &behind.0, behind.1, applied)?;
     }
 }
 
+/// The identifiers of an action's messages, as they were when it was asked.
+fn messages(account_id: &str, action: &Action) -> Vec<String> {
+    action
+        .uids
+        .iter()
+        .map(|uid| message_id(account_id, action.folder.id, action.uidvalidity, *uid))
+        .collect()
+}
+
+/// Why an action asked after a move is refused when the move was applied but the server did not
+/// say where its messages went (no COPYUID, or a copy found again rather than told).
+const MOVED: (&str, &str) = (
+    "moved",
+    "a move before it took the messages to another folder, and the server did not tell their \
+     new UIDs (COPYUID): nothing was done to them there",
+);
+
+/// Why a permanent delete asked after a move is refused when that move was.
+const NOT_MOVED: (&str, &str) = (
+    "not-moved",
+    "the move before it was refused, so the messages are not where it was asked: nothing was \
+     deleted",
+);
+
+/// Refuses the actions asked after a move that cannot apply now, each with its outcome.
+fn refuse_behind(
+    store: &mut Store,
+    account_id: &str,
+    ids: &[i64],
+    (reason, why): (&'static str, &str),
+    applied: &mut Applied,
+) -> std::result::Result<(), SyncError> {
+    for id in ids {
+        // A refusal before may have taken it already.
+        let Some(action) = store.action(*id)? else {
+            continue;
+        };
+        // What was asked after it names the same messages: it is in `ids` already.
+        let dropped = refuse(store, &action, applied)?;
+        applied.outcomes.push(Outcome {
+            action: action.id,
+            kind: action.kind,
+            messages: messages(account_id, &action),
+            result: refused(reason, why.to_owned(), &dropped),
+        });
+    }
+    Ok(())
+}
+
 /// Drops an action and takes its change back from the copy; the folder is synced again, and the
-/// target too when the move had copied the messages there. Returns whether it had.
+/// target too when the move had copied the messages there.
 fn refuse(
     store: &mut Store,
     action: &Action,
     applied: &mut Applied,
-) -> std::result::Result<bool, SyncError> {
-    let copied = store.refused(action)?;
+) -> std::result::Result<Dropped, SyncError> {
+    let dropped = store.refused(action)?;
     applied.resync.insert(action.folder.id);
-    if copied && let Some(target) = &action.target {
+    if dropped.copied
+        && let Some(target) = &action.target
+    {
         applied.resync.insert(target.id);
     }
-    Ok(copied)
+    Ok(dropped)
 }
 
 /// What a refused action says, for people: `why`, and for a move that had copied the messages,
 /// where they are now.
-fn refused(reason: &'static str, why: String, copied: bool) -> Result {
-    let message = if copied {
-        format!(
-            "{why}; the server had copied the messages to the target first, so they are in both \
-             folders now: nothing was removed, delete or move one of the two"
-        )
-    } else {
-        why
-    };
+fn refused(reason: &'static str, why: String, dropped: &Dropped) -> Result {
+    let mut message = why;
+    if dropped.copied {
+        message.push_str(
+            "; the server had copied the messages to the target first, so they are in both \
+             folders now: nothing was removed, delete or move one of the two",
+        );
+    }
     Result::Refused {
         reason,
         message,
-        copied,
+        copied: dropped.copied,
     }
 }
 
 /// What one try of an action came to.
 enum Step {
+    /// `moved`: the actions asked after a move that could not follow its messages.
     Applied {
         resync: Vec<i64>,
+        moved: Vec<i64>,
     },
     /// The server answered `NO`; why, for the queue.
     No(&'static str),
@@ -530,6 +591,17 @@ async fn one(
 ) -> std::result::Result<Step, SyncError> {
     if action.folder.uidvalidity != Some(action.uidvalidity) {
         return Ok(RENUMBERED);
+    }
+    if action
+        .target
+        .as_ref()
+        .is_some_and(|t| t.id == action.folder.id)
+    {
+        store.settled(action)?;
+        return Ok(Step::Applied {
+            resync: Vec::new(),
+            moved: Vec::new(),
+        });
     }
     // Refused before anything is sent.
     if let Some(why) = unsupported(action.kind, capabilities.moves, capabilities.uidplus) {
@@ -565,7 +637,10 @@ async fn one(
         return Ok(match done {
             Done::Ok(_) => {
                 store.applied_flags(action, &fetched)?;
-                Step::Applied { resync: Vec::new() }
+                Step::Applied {
+                    resync: Vec::new(),
+                    moved: Vec::new(),
+                }
             }
             Done::No { .. } => Step::No("store"),
             Done::Bad => BAD,
@@ -575,7 +650,10 @@ async fn one(
         return Ok(match remove(server, &action.uids).await? {
             Done::Ok(_) => {
                 store.applied_delete(action)?;
-                Step::Applied { resync: Vec::new() }
+                Step::Applied {
+                    resync: Vec::new(),
+                    moved: Vec::new(),
+                }
             }
             Done::No { .. } => Step::No("expunge"),
             Done::Bad => BAD,
@@ -595,9 +673,11 @@ async fn one(
             })
             .await?;
         return Ok(match done {
-            Done::Ok(tagged) => Step::Applied {
-                resync: store.applied_move(action, untagged.or(tagged).as_ref())?,
-            },
+            Done::Ok(tagged) => {
+                let (resync, moved) =
+                    store.applied_move(action, untagged.or(tagged).as_ref(), true)?;
+                Step::Applied { resync, moved }
+            }
             Done::No { try_create: true } => NO_SUCH_FOLDER,
             Done::No { .. } => Step::No("move"),
             Done::Bad => BAD,
@@ -662,13 +742,15 @@ async fn copy_then_remove(
     if action.state == "copying" {
         match recover_copy(server, store, &action, target_name).await? {
             Recovered::NotCopied => {
-                store.copy_state(action.id, "pending", None, None)?;
+                store.copy_state(action.id, "pending", None, None, false)?;
                 action.state = "pending".to_owned();
             }
             Recovered::Copied(copied) => {
-                store.copy_state(action.id, "copied", None, copied.as_ref())?;
+                // Found again, not told by the server: not proof enough for what follows.
+                store.copy_state(action.id, "copied", None, copied.as_ref(), false)?;
                 action.state = "copied".to_owned();
                 action.copied = copied;
+                action.copyuid = false;
             }
             Recovered::Unknown => return Ok(Step::No("status")),
         }
@@ -685,15 +767,16 @@ async fn copy_then_remove(
         };
         // Written before the COPY is sent: if its answer never comes, the next try knows where
         // to look for what it copied.
-        store.copy_state(action.id, "copying", Some(uidnext), None)?;
+        store.copy_state(action.id, "copying", Some(uidnext), None, false)?;
         match copy(server, &action.uids, target_name).await? {
             Done::Ok(copied) => {
-                store.copy_state(action.id, "copied", None, copied.as_ref())?;
+                store.copy_state(action.id, "copied", None, copied.as_ref(), true)?;
+                action.copyuid = copied.is_some();
                 action.copied = copied;
             }
             Done::No { try_create: true } => return Ok(NO_SUCH_FOLDER),
             Done::No { .. } => {
-                store.copy_state(action.id, "pending", None, None)?;
+                store.copy_state(action.id, "pending", None, None, false)?;
                 return Ok(Step::No("copy"));
             }
             Done::Bad => return Ok(BAD),
@@ -701,9 +784,11 @@ async fn copy_then_remove(
     }
     // Copied: only the removal from the source is left, which can be tried again as it is.
     Ok(match remove(server, &action.uids).await? {
-        Done::Ok(_) => Step::Applied {
-            resync: store.applied_move(&action, action.copied.as_ref())?,
-        },
+        Done::Ok(_) => {
+            let (resync, moved) =
+                store.applied_move(&action, action.copied.as_ref(), action.copyuid)?;
+            Step::Applied { resync, moved }
+        }
         Done::No { .. } => Step::No("expunge"),
         Done::Bad => BAD,
     })
@@ -921,8 +1006,12 @@ mod tests {
 
     #[test]
     fn a_refused_move_that_copied_says_the_messages_are_in_both_folders() {
+        let dropped = Dropped {
+            copied: true,
+            ..Dropped::default()
+        };
         let Result::Refused { message, .. } =
-            refused("refused", "the server said no".to_owned(), true)
+            refused("refused", "the server said no".to_owned(), &dropped)
         else {
             panic!("a refusal")
         };

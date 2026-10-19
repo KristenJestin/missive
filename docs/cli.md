@@ -645,8 +645,13 @@ user.
 
 While a move waits for the server, the message is shown in its new folder, but its identifier
 still names the folder the server has it in; once moved, it has a new identifier there (its UID in
-that folder), as it would if another client had moved it. A message whose move waits takes no
-other action until the server moved it (`busy`).
+that folder), as it would if another client had moved it. An action asked on a message whose move
+waits is applied after the move, to the message in its new folder: the server's `COPYUID` tells
+its new UID there. An action that names messages that are moving and messages that are not is
+recorded as one action for each, each with its number. When the server moved the message without
+telling its new UID, the action is refused (`moved`): a UID found by other means could name
+another message. On a server known to have no `UIDPLUS`, which never tells it, such an action is
+refused when asked (`busy`).
 
 ### `missive mark <message id>… --read | --unread | --flagged | --unflagged [--wait [--timeout <seconds>]] [--json]`
 
