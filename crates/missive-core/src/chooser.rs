@@ -68,3 +68,11 @@ fn local_path(uri: &str) -> Option<PathBuf> {
     let bytes: Vec<u8> = percent_decode_str(path).collect();
     Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
+
+/// [`choose_files`] on the user's own session bus.
+pub async fn choose(title: &str) -> Result<Vec<PathBuf>, String> {
+    let connection = Connection::session()
+        .await
+        .map_err(|e| format!("no session bus for the desktop portal ({e})"))?;
+    choose_files(&connection, title).await
+}

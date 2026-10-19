@@ -385,3 +385,34 @@ fn the_account_is_chosen_only_until_the_draft_is_saved() {
     compose.pick_account("alice");
     assert_eq!(compose.account, "bob");
 }
+
+#[tokio::test]
+async fn the_window_started_on_a_draft_shows_it_and_one_not_in_the_copy_says_so() {
+    let mail = Mail::new(mailbox()).await;
+    let store = missive_core::store::Store::open(&mail.copy_path());
+    let mut store = store.unwrap();
+    let key = store.account(ID).unwrap();
+    store
+        .save_draft(
+            key,
+            "w@example.org",
+            b"X-Missive-Draft: 1\r\nTo: zoe@example.com\r\nSubject: From a link\r\n\
+              Message-ID: <w@example.org>\r\n\r\nHello\r\n",
+        )
+        .unwrap();
+
+    let shown =
+        missive_window::launch::compose(&mail.sources(), ID.to_owned(), "w@example.org".to_owned());
+    assert_eq!(shown.subject, "From a link");
+    assert_eq!(shown.to, "zoe@example.com");
+    assert_eq!(shown.draft.as_deref(), Some("w@example.org"));
+    assert!(shown.notice.is_none());
+
+    let missing = missive_window::launch::compose(
+        &mail.sources(),
+        ID.to_owned(),
+        "gone@example.org".to_owned(),
+    );
+    assert!(missing.notice.unwrap().contains("gone@example.org"));
+    assert_eq!(missing.draft, None);
+}

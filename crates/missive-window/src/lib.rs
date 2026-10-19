@@ -7,6 +7,7 @@ pub mod compose;
 pub mod compose_view;
 pub mod font;
 pub mod images;
+pub mod launch;
 pub mod model;
 pub mod view;
 pub mod watch;
