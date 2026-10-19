@@ -2,7 +2,7 @@
 //! with its change to the copy, and what becomes of it once the server answered. See
 //! [`crate::actions`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -369,6 +369,9 @@ pub(super) fn queue_in(
                 id
             ],
         )?;
+        if kind.moves() {
+            record_fingerprints(transaction, id, group.folder, &group.uids)?;
+        }
         for uid in &group.uids {
             if let Some((flag, add)) = kind.flag() {
                 let flags: String = transaction.query_row(
@@ -667,7 +670,7 @@ impl Store {
             }
         }
         let mut behind = Vec::new();
-        for (id, _, uids) in later(&transaction, action)? {
+        for (id, kind, uids) in later(&transaction, action)? {
             // Asked on messages that were all moving with this one (see `queue_in`).
             let new: BTreeSet<u32> = match copied.filter(|_| copyuid) {
                 Some(copied) => uids
@@ -682,6 +685,11 @@ impl Store {
                 continue;
             }
             let new: Vec<u32> = new.into_iter().collect();
+            if kind.moves() {
+                // The messages are in the target now, under their new UIDs.
+                transaction.execute("DELETE FROM action_fingerprint WHERE action = ?1", [id])?;
+                record_fingerprints(&transaction, id, target.id, &new)?;
+            }
             transaction.execute(
                 "UPDATE action SET folder = ?2, uidvalidity = ?3, uids = ?4 WHERE id = ?1",
                 params![
@@ -752,6 +760,8 @@ impl Store {
     /// with it: it was asked of a message shown in the trash, which the server never moved there.
     pub fn refused(&mut self, action: &Action) -> rusqlite::Result<Dropped> {
         let transaction = self.connection.transaction()?;
+        // Read before the action goes: they leave with it.
+        let recorded = recorded_fingerprints(&transaction, action.id)?;
         let row: Option<(i64, String, Option<String>, Option<String>)> = transaction
             .query_row(
                 "DELETE FROM action WHERE id = ?1
@@ -790,12 +800,19 @@ impl Store {
                 Some((account, state, copied, _)) if state == "copied" => {
                     let copied: Option<CopyUid> =
                         copied.and_then(|c| serde_json::from_str(&c).ok());
-                    half_move(&transaction, account, action, copied.as_ref(), false)?;
+                    half_move(
+                        &transaction,
+                        account,
+                        action,
+                        copied.as_ref(),
+                        false,
+                        &recorded,
+                    )?;
                     dropped.copied = true;
                 }
                 // Whether the copy was made is not known: the target's sync shows it if it was.
                 Some((account, state, _, _)) if state == "copying" => {
-                    half_move(&transaction, account, action, None, true)?;
+                    half_move(&transaction, account, action, None, true, &recorded)?;
                     dropped.maybe_copied = true;
                 }
                 _ => {}
@@ -836,6 +853,7 @@ fn half_move(
     action: &Action,
     copied: Option<&CopyUid>,
     maybe: bool,
+    recorded: &HashMap<u32, Fingerprint>,
 ) -> rusqlite::Result<()> {
     let target = action.target.as_ref().expect("a move has a target");
     let uidvalidity: Option<u32> = transaction.query_row(
@@ -883,11 +901,15 @@ fn half_move(
                 super::insert(transaction, target.id, &source)?;
             }
         }
-        // Under another UIDVALIDITY, the row at that UID is another message.
-        let fingerprint = if source_uidvalidity == Some(action.uidvalidity) {
-            fingerprint(transaction, action.folder.id, *uid)?
-        } else {
-            None
+        // What was taken when the move was recorded still names the message after a renumbering;
+        // an action recorded before that was kept has only the copy, where, under another
+        // UIDVALIDITY, the row at that UID is another message.
+        let fingerprint = match recorded.get(uid) {
+            Some(recorded) => Some(recorded.clone()),
+            None if source_uidvalidity == Some(action.uidvalidity) => {
+                fingerprint(transaction, action.folder.id, *uid)?
+            }
+            None => None,
         };
         transaction.execute(
             "INSERT INTO half_move (account, folder, uidvalidity, uid, target, target_uidvalidity,
@@ -951,6 +973,55 @@ impl Store {
         settle_deleted_left(&transaction, folder, uidvalidity)?;
         transaction.commit()
     }
+}
+
+/// Writes what the copy knows of each of `uids` in `folder` as the fingerprints of `action`
+/// (a UID the copy does not have gets none).
+fn record_fingerprints(
+    connection: &Connection,
+    action: i64,
+    folder: i64,
+    uids: &[u32],
+) -> rusqlite::Result<()> {
+    for uid in uids {
+        if let Some(fingerprint) = fingerprint(connection, folder, *uid)? {
+            connection.execute(
+                "INSERT INTO action_fingerprint (action, uid, message_id, size, internal_date)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    action,
+                    uid,
+                    fingerprint.message_id,
+                    fingerprint.size,
+                    fingerprint.internal_date
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The fingerprints [`record_fingerprints`] wrote for `action`, by UID.
+fn recorded_fingerprints(
+    connection: &Connection,
+    action: i64,
+) -> rusqlite::Result<HashMap<u32, Fingerprint>> {
+    connection
+        .prepare_cached(
+            "SELECT uid, message_id, size, internal_date FROM action_fingerprint
+              WHERE action = ?1",
+        )?
+        .query_map([action], |r| {
+            Ok((
+                r.get(0)?,
+                Fingerprint {
+                    message_id: r.get(1)?,
+                    size: r.get(2)?,
+                    internal_date: r.get(3)?,
+                },
+            ))
+        })?
+        .collect()
 }
 
 /// What the copy knows of the message at `uid` in `folder`, to find it again.
@@ -1927,6 +1998,52 @@ mod tests {
         f.store.apply_listing(f.archive, &[41], &[], None).unwrap();
         f.store.apply_listing(f.inbox, &[3], &[], None).unwrap();
         assert!(half(&f).is_empty());
+    }
+
+    #[test]
+    fn a_move_records_what_tells_its_messages_and_a_later_move_follows_them_to_their_new_uids() {
+        let mut f = fixture();
+        f.queue(&[f.id(f.inbox, 2)], Wanted::Move("archive".to_owned()))
+            .unwrap();
+        // Asked while the first waits (the message is still named by its inbox identifier): it
+        // follows the message to the archive.
+        f.queue(&[f.id(f.inbox, 2)], Wanted::Move("trash".to_owned()))
+            .unwrap();
+        let recorded = |f: &Fixture| -> Vec<(i64, u32, Option<String>)> {
+            f.store
+                .connection
+                .prepare("SELECT action, uid, message_id FROM action_fingerprint ORDER BY action")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let (first, second) = (f.next(), f.store.action(2).unwrap().unwrap());
+        assert_eq!(
+            recorded(&f),
+            [
+                (first.id, 2, Some("2@example.com".to_owned())),
+                (second.id, 2, Some("2@example.com".to_owned())),
+            ]
+        );
+
+        f.store
+            .applied_move(
+                &first,
+                Some(&CopyUid {
+                    uidvalidity: 20,
+                    pairs: vec![(2, 41)],
+                }),
+                true,
+            )
+            .unwrap();
+
+        // The first left with its fingerprints; the second names the message under UID 41.
+        assert_eq!(
+            recorded(&f),
+            [(second.id, 41, Some("2@example.com".to_owned()))]
+        );
     }
 
     #[test]
