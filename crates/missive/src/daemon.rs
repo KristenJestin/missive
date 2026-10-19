@@ -744,7 +744,7 @@ impl Daemon {
         };
         let asked = match self.followup(&store, name, &request.answers, &request.forwards) {
             Ok(asked) => asked,
-            Err(refused) => return refused,
+            Err(refused) => return *refused,
         };
         // Only a draft Missive wrote is replaced: another client's stays on the server as it is,
         // and a new draft, Missive's own, is made from it (`kept`).
@@ -966,7 +966,7 @@ impl Daemon {
         name: &str,
         answers: &Option<String>,
         forwards: &Option<String>,
-    ) -> Result<Followup, Answer> {
+    ) -> Result<Followup, Box<Answer>> {
         let asked = Followup {
             answers: answers.clone(),
             forwards: forwards.clone(),
@@ -975,21 +975,25 @@ impl Daemon {
             match store.check_message(id) {
                 Ok(Ok(())) => {}
                 Ok(Err(refused)) => {
-                    return Err(Answer::error(Some(name), refused.error, refused.message));
+                    return Err(Box::new(Answer::error(
+                        Some(name),
+                        refused.error,
+                        refused.message,
+                    )));
                 }
                 Err(e) => {
                     log!("cannot read the local copy ({e})");
-                    return Err(Answer::error(
+                    return Err(Box::new(Answer::error(
                         Some(name),
                         "failed",
                         format!("the local copy could not be read ({e})"),
-                    ));
+                    )));
                 }
             }
         }
         asked
             .check()
-            .map_err(|why| Answer::error(Some(name), "bad-request", why))?;
+            .map_err(|why| Box::new(Answer::error(Some(name), "bad-request", why)))?;
         Ok(asked)
     }
 
@@ -1068,7 +1072,7 @@ impl Daemon {
             }
         };
         if let Err(refused) = checked {
-            return refused;
+            return *refused;
         }
         let queued = Store::open(&self.store).and_then(|store| {
             let key = store.account(&send.account)?;
