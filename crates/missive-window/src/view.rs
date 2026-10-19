@@ -349,7 +349,7 @@ impl Render for MailWindow {
             (Some(problem), _) => Some(problem.clone()),
             (None, Daemon::Stopped) => Some(
                 "The daemon is not running: this is the local copy as it was last synced \
-                 (missive sync starts it)."
+                 (the next action here, or missive sync, starts it)."
                     .to_owned(),
             ),
             _ => None,
