@@ -28,6 +28,8 @@
 //!    identical byte for byte landed from an `APPEND` whose answer was lost, and is taken as the
 //!    new version instead of a second copy. So cut answers, however many in a row, never add
 //!    more than one copy of a version, with or without UIDPLUS.
+//!    When the version cannot be written to the copy (its UID is unknown, or the copy numbers
+//!    the folder otherwise than the server), the folder is synced at once.
 //! 3. Only then, the older versions are removed: `UID STORE <uids> +FLAGS.SILENT (\Deleted)` and
 //!    `UID EXPUNGE <uids>`, which removes those UIDs and no other message marked deleted; an
 //!    expunge refused takes the flag back. Without UIDPLUS there is no `UID EXPUNGE`: the older
@@ -167,7 +169,9 @@ async fn each(
                 new,
                 left,
             }) => {
-                if draft.raw.is_some() && new.is_none() {
+                // The version is not in the copy when its UID is unknown, or when the copy
+                // numbers the folder otherwise than the server (`draft_written` writes nothing).
+                if draft.raw.is_some() && (new.is_none() || in_copy != Some(uidvalidity)) {
                     written.resync = Some(folder);
                 }
                 Outcome {

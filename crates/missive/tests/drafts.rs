@@ -1230,6 +1230,32 @@ async fn a_non_ascii_message_id_is_not_put_in_a_quoted_search_and_the_draft_sett
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_draft_appended_to_a_folder_the_copy_numbers_otherwise_is_listed_after_a_resync() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    // The server renumbered Drafts; the copy has not heard of it: the UID the APPEND answers
+    // means nothing there.
+    let validity = server.bump_uidvalidity("Drafts");
+
+    env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+
+    drafts_on_server(&server, &["First"]).await;
+    eventually(
+        20,
+        "the draft in the copy, numbered as the server does",
+        || {
+            let listed = block(env.drafts());
+            listed.len() == 1
+                && listed[0]["uid"] == 1
+                && listed[0]["id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains(&validity.to_string()))
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn without_a_drafts_folder_the_draft_stays_local_and_status_says_so() {
     let server = FakeServer::builder()
         .user(USER, PASSWORD)
