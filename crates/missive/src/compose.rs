@@ -81,6 +81,9 @@ pub struct ComposeArgs {
     /// the server took it. Without it the message is saved as a draft.
     #[arg(long)]
     send: bool,
+    /// Open no compose window, even when a display is set: the draft is only saved.
+    #[arg(long)]
+    no_window: bool,
     /// One JSON object on standard output (see docs/cli.md).
     #[arg(long)]
     json: bool,
@@ -276,7 +279,9 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         return queued(outbox, message_id, args.json);
     }
     // Saved first: the window shows the draft, and nothing is lost if it cannot start.
-    crate::window::compose(&account, &message_id);
+    if !args.no_window {
+        crate::window::compose(&account, &message_id);
+    }
     if args.json {
         println!("{}", serde_json::to_string(&Saved { id: message_id })?);
     } else {

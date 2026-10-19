@@ -1525,6 +1525,66 @@ async fn with_a_display_mailto_and_compose_open_the_window_on_the_draft_saved_fi
     assert!(!args.exists(), "no window without a display");
 }
 
+/// `missive` run as a desktop session runs it, a display set and a fake `missive-window` on the
+/// `PATH` (see [`fake_window`]).
+fn with_display(env: &Env, missive: &Path, path: &Path) -> Command {
+    let mut real = Command::new(missive);
+    real.env_clear()
+        .env("HOME", env.home.path())
+        .env("XDG_CONFIG_HOME", env.path("config"))
+        .env("XDG_DATA_HOME", env.path("data"))
+        .env("XDG_STATE_HOME", env.path("state"))
+        .env("XDG_RUNTIME_DIR", env.path("runtime"))
+        .env("DBUS_SESSION_BUS_ADDRESS", env.keyring.address())
+        .env("PATH", path)
+        .env("WAYLAND_DISPLAY", "wayland-fake")
+        .stdin(Stdio::null());
+    real
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_window_saves_the_draft_and_opens_nothing_even_with_a_display() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let (missive, path, args) = fake_window(&env);
+
+    for command in [
+        vec!["compose", "--json", "--to", RECIPIENT, "--no-window"],
+        vec![
+            "mailto",
+            "--json",
+            "--no-window",
+            "mailto:zoe@example.com?subject=Linked",
+        ],
+    ] {
+        let output = with_display(&env, &missive, &path)
+            .args(&command)
+            .output()
+            .await
+            .unwrap();
+        succeeded(&output);
+        let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let id = saved["id"].as_str().unwrap();
+        // The draft is saved all the same.
+        let listed = env.drafts().await;
+        assert!(
+            listed.iter().any(|d| d["id"] == id),
+            "{command:?}: {listed:?}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!args.exists(), "a script that saves a draft gets no window");
+
+    // Without the flag, the same display opens it.
+    let output = with_display(&env, &missive, &path)
+        .args(["compose", "--json", "--to", RECIPIENT])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    eventually(10, "the window started", || written(&args)).await;
+}
+
 // ---- #73: a draft the server does not hold yet, cleared fields, the HTML part ----
 
 /// `show` and `open` of an unsent draft read it from the copy, named by its Message-ID.

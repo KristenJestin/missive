@@ -18,6 +18,9 @@ pub struct MailtoArgs {
     /// The account to write from, by identifier [default: the only account].
     #[arg(long)]
     account: Option<String>,
+    /// Open no compose window, even when a display is set: the draft is only saved.
+    #[arg(long)]
+    no_window: bool,
     /// One JSON object on standard output (see docs/cli.md).
     #[arg(long)]
     json: bool,
@@ -54,7 +57,9 @@ pub async fn run(args: MailtoArgs) -> Result<(), ActError> {
         return Err(compose::unreadable());
     };
     // Saved first: the window shows the draft, and nothing is lost if it cannot start.
-    crate::window::compose(&account, &id);
+    if !args.no_window {
+        crate::window::compose(&account, &id);
+    }
     if args.json {
         println!("{}", serde_json::to_string(&Saved { id })?);
     } else {
