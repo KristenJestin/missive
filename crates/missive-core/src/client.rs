@@ -94,10 +94,33 @@ fn start(program: &Path, log: &Path) -> Result<std::process::Child, String> {
 /// a daemon that stays silent longer is stuck.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The same for a request that carries a message to record (`send`, and `draft` with `send`): the
+/// daemon may take long to write a large one while a sync holds the copy, and it has no guard
+/// against the same message being sent twice, so a client must not give up on it early.
+pub const QUEUING_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long to wait for the answer to `command`.
+pub fn answer_timeout(command: &Command) -> Duration {
+    if queues_a_message(command) {
+        QUEUING_TIMEOUT
+    } else {
+        ANSWER_TIMEOUT
+    }
+}
+
+fn queues_a_message(command: &Command) -> bool {
+    match command {
+        Command::Send(_) => true,
+        Command::Draft(draft) => draft.send,
+        _ => false,
+    }
+}
+
 /// Sends one request to the daemon on `socket`, starting `program daemon` when none answers, and
-/// reads its answer, for at most [`ANSWER_TIMEOUT`].
+/// reads its answer, for at most [`answer_timeout`].
 pub async fn ask(socket: &Path, program: &Path, command: Command) -> Result<Answer, String> {
-    ask_within(socket, program, command, ANSWER_TIMEOUT).await
+    let timeout = answer_timeout(&command);
+    ask_within(socket, program, command, timeout).await
 }
 
 async fn ask_within(
@@ -106,6 +129,7 @@ async fn ask_within(
     command: Command,
     timeout: Duration,
 ) -> Result<Answer, String> {
+    let queues = queues_a_message(&command);
     let stream = connect(socket, program).await?;
     let (read, mut write) = stream.into_split();
     let mut line = serde_json::to_string(&Request {
@@ -122,10 +146,18 @@ async fn ask_within(
     tokio::time::timeout(timeout, BufReader::new(read).read_line(&mut line))
         .await
         .map_err(|_| {
-            format!(
-                "the daemon did not answer within {} seconds",
-                timeout.as_secs().max(1)
-            )
+            let waited = timeout.as_secs().max(1);
+            if queues {
+                // The message may well be in the outbox: "not sent" would be a lie, and a retry
+                // would send it twice.
+                format!(
+                    "the daemon did not answer within {waited} seconds: the message may have been \
+                     queued; check `missive status` (or the outbox notice of the window) before \
+                     sending it again"
+                )
+            } else {
+                format!("the daemon did not answer within {waited} seconds")
+            }
         })?
         .map_err(|e| e.to_string())?;
     serde_json::from_str(&line)
@@ -182,6 +214,88 @@ mod tests {
         assert!(error.contains("did not answer"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
         silent.abort();
+    }
+
+    /// A daemon that accepts, reads the request and never answers.
+    fn silent(socket: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream);
+            let mut request = String::new();
+            lines.read_line(&mut request).await.unwrap();
+            std::future::pending::<()>().await;
+        })
+    }
+
+    fn send() -> Command {
+        Command::Send(crate::protocol::Send::default())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_queues_a_message_waits_much_longer_than_an_action() {
+        for (command, waited) in [
+            (send(), QUEUING_TIMEOUT),
+            (
+                Command::Draft(crate::protocol::SaveDraft {
+                    send: true,
+                    ..Default::default()
+                }),
+                QUEUING_TIMEOUT,
+            ),
+            (
+                Command::Draft(crate::protocol::SaveDraft::default()),
+                ANSWER_TIMEOUT,
+            ),
+            (
+                Command::Mark {
+                    messages: Vec::new(),
+                    mark_as: "read".to_owned(),
+                },
+                ANSWER_TIMEOUT,
+            ),
+        ] {
+            let folder = tempfile::tempdir().unwrap();
+            let socket = folder.path().join("daemon.sock");
+            let daemon = silent(&socket);
+            let started = tokio::time::Instant::now();
+            let asked = ask(&socket, Path::new("missive-is-not-started"), command).await;
+            assert!(asked.is_err());
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= waited && elapsed < waited + Duration::from_secs(1),
+                "{elapsed:?} for {waited:?}"
+            );
+            daemon.abort();
+        }
+        assert_eq!(QUEUING_TIMEOUT.as_secs(), 120);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_error_on_a_message_that_may_be_queued_says_so_and_never_says_not_sent() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("daemon.sock");
+        let daemon = silent(&socket);
+        let error = ask(&socket, Path::new("missive-is-not-started"), send())
+            .await
+            .unwrap_err();
+        assert!(error.contains("may have been queued"), "{error}");
+        assert!(error.contains("missive status"), "{error}");
+        assert!(error.contains("before sending it again"), "{error}");
+        assert!(!error.contains("not sent"), "{error}");
+        daemon.abort();
+
+        let socket = folder.path().join("other.sock");
+        let daemon = silent(&socket);
+        let error = ask(
+            &socket,
+            Path::new("missive-is-not-started"),
+            Command::Subscribe,
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.contains("queued"), "{error}");
+        daemon.abort();
     }
 
     #[tokio::test]
