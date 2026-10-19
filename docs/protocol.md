@@ -143,6 +143,7 @@ reached:
 | `in_reply_to` | string, absent for none | the `Message-ID`, without angle brackets, of the message this one answers, written as its `In-Reply-To` header |
 | `references` | array of strings, empty when absent | the thread's `Message-ID`s without angle brackets, written as the `References` header |
 | `answers` | string, absent for none | the identifier of the message this one is a reply to: once the server took the reply (never before), that message is marked answered (`\Answered`), through the queue of actions, and the `action` event `answered` tells it. A message gone since is not an error |
+| `forwards` | string, absent for none | the identifier of the message this one forwards: once the server took the forward (never before), that message is marked forwarded (`$Forwarded`), through the queue of actions, and the `action` event `forwarded` tells it; a server whose folder keeps no keywords is not asked, and nothing is said. A message gone since is not an error |
 
 The daemon builds the message (see `missive compose` in `docs/cli.md`), writes it to the outbox
 in the local copy, and answers: nothing waits for the server.
@@ -197,6 +198,7 @@ Saves a draft: a new one, or a new version of the draft `draft` names. With `sen
 | `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered unless `answers` names it |
 | `send` | boolean, `false` when absent | send the draft, as it is once changed (at least one recipient then); it is removed from the Drafts folder once the server took the message |
 | `answers` | string, optional | with `send`: the identifier of the message the draft is a reply to, as for `send`; marked answered once the server took the reply |
+| `forwards` | string, optional | with `send`: the identifier of the message the draft forwards, as for `send`; marked forwarded once the server took the forward |
 
 The daemon saves the draft in the local copy (and, with `send`, puts the message in the outbox),
 and answers: nothing waits for the server. It then writes the draft to the account's Drafts

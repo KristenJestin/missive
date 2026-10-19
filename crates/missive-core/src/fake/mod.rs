@@ -25,7 +25,7 @@
 //! `UID FETCH`, `SEARCH` and `UID SEARCH` (`HEADER` included), `IDLE`, CONDSTORE
 //! (`HIGHESTMODSEQ`, `MODSEQ`, `CHANGEDSINCE`) unless [`Builder::without_condstore`] is used, and
 //! what changes messages in a folder selected read-write: `STORE` and `UID STORE`, `UID COPY`,
-//! `UID MOVE` (RFC 6851) unless [`Builder::without_move`], UIDPLUS (`COPYUID`, `APPENDUID`,
+//! `UID MOVE` (RFC 6851) unless [`Builder::without_move`], keywords (`\*` in `PERMANENTFLAGS`) unless [`Builder::without_keywords`], UIDPLUS (`COPYUID`, `APPENDUID`,
 //! `UID EXPUNGE`, RFC 4315) unless [`Builder::without_uidplus`], and `APPEND` (flags, no date). Anything else, a bare `EXPUNGE`
 //! among them, is answered `BAD` (and logged), so a client using more than this fails loudly
 //! rather than silently.
@@ -209,6 +209,7 @@ pub struct Builder {
     folders: Vec<Folder>,
     without_condstore: bool,
     without_move: bool,
+    without_keywords: bool,
     without_uidplus: bool,
     imap_login_no: Option<String>,
     smtp_login_only: bool,
@@ -242,6 +243,13 @@ impl Builder {
     /// Serves without `MOVE` (RFC 6851): `UID MOVE` is an unknown command.
     pub fn without_move(mut self) -> Self {
         self.without_move = true;
+        self
+    }
+
+    /// Serves folders that keep no keywords: no `\*` in `PERMANENTFLAGS` (RFC 3501, 6.3.1), as a
+    /// server that cannot store `$Forwarded` says.
+    pub fn without_keywords(mut self) -> Self {
+        self.without_keywords = true;
         self
     }
 
@@ -391,6 +399,7 @@ impl Builder {
             changes: watch::channel(()).0,
             condstore: !self.without_condstore,
             moves: !self.without_move,
+            keywords: !self.without_keywords,
             uidplus: !self.without_uidplus,
             imap_login_no: self.imap_login_no,
             smtp_login_only: self.smtp_login_only,
@@ -685,6 +694,7 @@ struct Shared {
     changes: watch::Sender<()>,
     condstore: bool,
     moves: bool,
+    keywords: bool,
     uidplus: bool,
     imap_login_no: Option<String>,
     smtp_login_only: bool,

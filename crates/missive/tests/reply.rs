@@ -19,6 +19,7 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
 const USER: &str = "alice@example.org";
+const BOB: &str = "bob@example.net";
 const PASSWORD: &str = "Recognisable-Pa55word-4c1d";
 
 /// How the test account reaches its servers.
@@ -68,10 +69,16 @@ impl Env {
 
     /// Adds the account `alice`, with its password in the keyring.
     async fn add_account(&self, setup: &Setup) {
+        self.add_account_as("alice", "Alice Example", USER, setup)
+            .await;
+    }
+
+    /// Adds an account, with its password in the keyring.
+    async fn add_account_as(&self, id: &str, name: &str, address: &str, setup: &Setup) {
         let account = Account {
-            name: "Alice Example".to_owned(),
-            address: USER.to_owned(),
-            user: USER.to_owned(),
+            name: name.to_owned(),
+            address: address.to_owned(),
+            user: address.to_owned(),
             imap: Server {
                 host: "127.0.0.1".to_owned(),
                 port: setup.imap,
@@ -85,7 +92,7 @@ impl Env {
             server_saves_sent: setup.server_saves_sent,
         };
         AccountStore::new(self.path("config").join("missive"))
-            .save("alice", &account, setup.certificate.as_ref())
+            .save(id, &account, setup.certificate.as_ref())
             .unwrap();
         let connection = zbus::connection::Builder::address(self.keyring.address())
             .unwrap()
@@ -95,7 +102,7 @@ impl Env {
         Keyring::open_on(connection)
             .await
             .unwrap()
-            .store("alice", &Password::new(PASSWORD.to_owned()))
+            .store(id, &Password::new(PASSWORD.to_owned()))
             .await
             .unwrap();
     }
@@ -177,13 +184,18 @@ impl Env {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
-    /// Waits until the account's first sync ended.
+    /// Waits until the account `alice`'s first sync ended.
     async fn ready(&self) {
+        self.ready_as("alice").await;
+    }
+
+    /// Waits until the account's first sync ended.
+    async fn ready_as(&self, id: &str) {
         eventually(20, "the account ready", || {
             Connection::open_with_flags(self.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .ok()
                 .and_then(|copy| {
-                    copy.query_row("SELECT state FROM account WHERE id = 'alice'", [], |r| {
+                    copy.query_row("SELECT state FROM account WHERE id = ?1", [id], |r| {
                         r.get::<_, String>(0)
                     })
                     .ok()
@@ -274,9 +286,14 @@ async fn took(server: &FakeServer, count: usize) {
 
 /// INBOX with one message (UID 1), a Sent folder and a Drafts folder.
 fn mailbox() -> missive_core::fake::Builder {
+    mailbox_of(ORIGINAL)
+}
+
+/// [`mailbox`], with `original` as its message.
+fn mailbox_of(original: &str) -> missive_core::fake::Builder {
     FakeServer::builder()
         .user(USER, PASSWORD)
-        .folder(Folder::new("INBOX").message(Message::new(ORIGINAL)))
+        .folder(Folder::new("INBOX").message(Message::new(original)))
         .folder(Folder::new("Sent").special_use(SpecialUse::Sent))
         .folder(Folder::new("Drafts").special_use(SpecialUse::Drafts))
 }
@@ -623,4 +640,243 @@ async fn a_reply_draft_sent_twice_is_sent_once_marks_the_original_and_leaves_dra
     })
     .await;
     eventually(30, "the draft removed", || server.uids("Drafts").is_empty()).await;
+}
+
+/// An original that is odd: a subject that decodes to line breaks, an identifier with a space in
+/// it and another that is longer than a line.
+fn odd_original(long: &str) -> String {
+    format!(
+        "From: Zoé Ça <zoe@example.com>\r\n\
+         To: Alice Example <alice@example.org>\r\n\
+         Subject: =?utf-8?Q?Lunch=0D=0ASecret?= =?utf-8?Q?=0D=0A=3F?=\r\n\
+         Message-ID: <lunch@example.com>\r\n\
+         References: <root@example.com> <bad id@example.com> <{long}@example.com>\r\n\
+         Date: Sat, 17 Oct 2026 07:30:00 +0200\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         \r\n\
+         Are you free?\r\n"
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_odd_original_is_answered_all_the_same_and_the_command_says_what_it_changed() {
+    let server = mailbox_of(&odd_original("l")).start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+
+    let output = env.run(&["compose", "--reply", &id, "--send"]).await;
+    succeeded(&output);
+    took(&server, 1).await;
+
+    let data = server.smtp_messages()[0].data.clone();
+    let parsed = MessageParser::default().parse(&data).unwrap();
+    assert_eq!(parsed.subject(), Some("Re: Lunch Secret ?"));
+    assert_eq!(ids(parsed.in_reply_to()), ["lunch@example.com"]);
+    assert_eq!(
+        ids(parsed.references()),
+        ["root@example.com", "l@example.com", "lunch@example.com"]
+    );
+    // One line, kinds and counts: nothing the mail says.
+    let said = stderr(&output);
+    assert_eq!(said.lines().count(), 1, "{said}");
+    assert_eq!(
+        said.trim(),
+        "The original message is odd: line breaks in its subject were replaced by spaces, \
+         1 message identifier was left out."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_of_an_odd_original_is_made_too() {
+    let server = mailbox_of(&odd_original("l")).start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+
+    let output = env
+        .run(&[
+            "compose",
+            "--forward",
+            &id,
+            "--to",
+            "ina@example.net",
+            "--send",
+        ])
+        .await;
+    succeeded(&output);
+    took(&server, 1).await;
+
+    let data = server.smtp_messages()[0].data.clone();
+    let parsed = MessageParser::default().parse(&data).unwrap();
+    assert_eq!(parsed.subject(), Some("Fwd: Lunch Secret ?"));
+    assert_eq!(
+        stderr(&output).trim(),
+        "The original message is odd: line breaks in its subject were replaced by spaces."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_very_long_identifier_is_left_out_of_the_references_and_no_line_is_too_long() {
+    let long = "x".repeat(1500);
+    let server = mailbox_of(&odd_original(&long)).start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+
+    succeeded(&env.run(&["compose", "--reply", &id, "--send"]).await);
+    took(&server, 1).await;
+
+    let data = &server.smtp_messages()[0].data;
+    assert!(
+        data.split(|b| *b == b'\n').all(|line| line.len() <= 998),
+        "a line is longer than RFC 5322 allows"
+    );
+    let parsed = MessageParser::default().parse(data).unwrap();
+    assert_eq!(
+        ids(parsed.references()),
+        ["root@example.com", "lunch@example.com"]
+    );
+}
+
+/// Alice's server holds the original; Bob's account, on another server, sends from `bob`.
+async fn alice_and_bob(original: &str) -> (FakeServer, FakeServer, Env, Daemon) {
+    let alice = mailbox_of(original).start().await;
+    let bob = FakeServer::builder()
+        .user(BOB, PASSWORD)
+        .folder(Folder::new("Sent").special_use(SpecialUse::Sent))
+        .folder(Folder::new("Drafts").special_use(SpecialUse::Drafts))
+        .start()
+        .await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&alice)).await;
+    env.add_account_as("bob", "Bob Example", BOB, &Setup::of(&bob))
+        .await;
+    let daemon = env.daemon().await;
+    env.ready_as("alice").await;
+    env.ready_as("bob").await;
+    (alice, bob, env, daemon)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_all_sent_from_another_account_leaves_out_that_accounts_address() {
+    // Bob is among the recipients of Alice's message, in the place of Carl.
+    let (_alice, bob, env, _daemon) =
+        alice_and_bob(&ORIGINAL.replace("carl@example.net", BOB)).await;
+    let id = original(&env).await;
+
+    let output = env
+        .run(&["compose", "--account", "bob", "--reply-all", &id, "--send"])
+        .await;
+    succeeded(&output);
+    took(&bob, 1).await;
+
+    // Alice's address is a recipient, as she is not the sender; Bob's is not.
+    let sent = &bob.smtp_messages()[0];
+    assert_eq!(sent.from, BOB);
+    assert_eq!(
+        sent.to,
+        ["zoe@example.com", "alice@example.org", "dana@example.net"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_sent_from_another_account_marks_the_original_without_waiting_for_a_pass() {
+    let (alice, bob, env, _daemon) = alice_and_bob(ORIGINAL).await;
+    let id = original(&env).await;
+
+    succeeded(
+        &env.run(&["compose", "--account", "bob", "--reply", &id, "--send"])
+            .await,
+    );
+    took(&bob, 1).await;
+
+    // The daemon's check interval is an hour: only a nudge of Alice's worker gets there.
+    eventually(30, "the original marked answered on its server", || {
+        flags(&alice).contains(&"\\Answered".to_owned())
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_marks_the_original_forwarded_once_it_is_sent_and_not_answered() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+
+    // Saved as a draft, it marks nothing.
+    succeeded(
+        &env.run(&["compose", "--forward", &id, "--to", "ina@example.net"])
+            .await,
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!flags(&server).contains(&"$Forwarded".to_owned()));
+
+    succeeded(
+        &env.run(&[
+            "compose",
+            "--forward",
+            &id,
+            "--to",
+            "ina@example.net",
+            "--send",
+        ])
+        .await,
+    );
+    took(&server, 1).await;
+
+    eventually(30, "the original marked forwarded", || {
+        flags(&server).contains(&"$Forwarded".to_owned())
+    })
+    .await;
+    assert!(
+        server
+            .imap_log()
+            .iter()
+            .any(|line| line == "UID STORE 1 +FLAGS ($Forwarded)"),
+        "{:?}",
+        server.imap_log()
+    );
+    assert!(!flags(&server).contains(&"\\Answered".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_keeps_no_keywords_is_not_asked_to_and_nothing_is_said() {
+    let server = mailbox().without_keywords().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+
+    succeeded(
+        &env.run(&[
+            "compose",
+            "--forward",
+            &id,
+            "--to",
+            "ina@example.net",
+            "--send",
+        ])
+        .await,
+    );
+    took(&server, 1).await;
+    // The queue is empty again: the action was dropped, not left to fail.
+    eventually(30, "the action dropped", || {
+        let copy =
+            Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        copy.query_row("SELECT count(*) FROM action", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+            == 0
+    })
+    .await;
+
+    assert!(
+        !server
+            .imap_log()
+            .iter()
+            .any(|line| line.contains("Forwarded")),
+        "{:?}",
+        server.imap_log()
+    );
+    assert!(!flags(&server).contains(&"$Forwarded".to_owned()));
+    // The copy does not keep the flag it showed meanwhile.
+    let shown = env.run(&["show", "--json", &id]).await;
+    succeeded(&shown);
+    assert!(!String::from_utf8_lossy(&shown.stdout).contains("Forwarded"));
+    assert!(!env.logs().contains("refused"), "{}", env.logs());
 }

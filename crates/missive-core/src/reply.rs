@@ -15,13 +15,16 @@
 //! - The quote is the original's text (its HTML reduced to text when it has none), every line
 //!   prefixed by `> `, below an attribution line. The date in it is written in the original's
 //!   own offset, in a form that does not depend on any language.
+//! - An odd original is answered all the same: line breaks of its subject become spaces, and the
+//!   identifiers that cannot be written back (whitespace in them, or longer than a line holds)
+//!   are left out. [`Cleaned`] counts what was changed, so that it can be said.
 //! - **Forward** has a `Fwd: ` subject, no threading header, and the original goes along as a
 //!   `message/rfc822` attachment, byte for byte.
 
 use mail_parser::{DateTime, HeaderValue, MessageParser};
 
 use crate::body;
-use crate::compose::{Attachment, Mailbox};
+use crate::compose::{Attachment, Mailbox, is_identifier};
 
 /// How many identifiers a `References` header keeps: the first, and the latest ones.
 pub const MAX_REFERENCES: usize = 20;
@@ -48,6 +51,33 @@ pub struct Original {
     pub date: Option<DateTime>,
     /// The text people read: its text, else its HTML reduced to text.
     pub text: String,
+    /// What reading it changed.
+    pub cleaned: Cleaned,
+}
+
+/// What was changed in an original to answer it, counts and kinds only: its content is private.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cleaned {
+    /// Line breaks in the subject, replaced by spaces.
+    pub subject: bool,
+    /// Identifiers (`Message-ID`, `In-Reply-To`, `References`) left out.
+    pub identifiers: usize,
+}
+
+impl Cleaned {
+    /// One line telling what was changed; `None` when nothing was.
+    pub fn notice(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.subject {
+            parts.push("line breaks in its subject were replaced by spaces".to_owned());
+        }
+        match self.identifiers {
+            0 => {}
+            1 => parts.push("1 message identifier was left out".to_owned()),
+            n => parts.push(format!("{n} message identifiers were left out")),
+        }
+        (!parts.is_empty()).then(|| format!("The original message is odd: {}.", parts.join(", ")))
+    }
 }
 
 /// The fields of a reply.
@@ -96,19 +126,56 @@ impl Original {
                 _ => Vec::new(),
             }
         };
+        let mut left_out = 0;
+        let mut usable = |ids: Vec<String>| -> Vec<String> {
+            ids.into_iter()
+                .filter(|id| {
+                    let usable = is_identifier(id);
+                    left_out += usize::from(!usable);
+                    usable
+                })
+                .collect()
+        };
+        let in_reply_to = usable(ids(parsed.in_reply_to()));
+        let references = usable(ids(parsed.references()));
+        let message_id = usable(parsed.message_id().map(str::to_owned).into_iter().collect())
+            .into_iter()
+            .next();
+        let (subject, one_line_subject) = one_line(parsed.subject());
+        let cleaned = Cleaned {
+            subject: one_line_subject,
+            identifiers: left_out,
+        };
         Ok(Original {
             from: mailboxes(parsed.from())?,
             reply_to: mailboxes(parsed.reply_to())?,
             to: mailboxes(parsed.to())?,
             cc: mailboxes(parsed.cc())?,
-            subject: parsed.subject().map(str::to_owned),
-            message_id: parsed.message_id().map(str::to_owned),
-            in_reply_to: ids(parsed.in_reply_to()),
-            references: ids(parsed.references()),
+            subject,
+            message_id,
+            in_reply_to,
+            references,
             date: parsed.date().cloned(),
             text: body::read(raw).readable,
+            cleaned,
         })
     }
+}
+
+/// `subject` on one line, and whether it was not: its line breaks (an encoded word can decode to
+/// them) become spaces, as a subject written with them would be refused.
+fn one_line(subject: Option<&str>) -> (Option<String>, bool) {
+    let Some(subject) = subject else {
+        return (None, false);
+    };
+    if !subject.contains(['\r', '\n']) {
+        return (Some(subject.to_owned()), false);
+    }
+    let lines: Vec<&str> = subject
+        .split(['\r', '\n'])
+        .filter(|line| !line.is_empty())
+        .collect();
+    (Some(lines.join(" ")), true)
 }
 
 /// The reply to `original` that the account whose address is `own` writes.
@@ -278,6 +345,10 @@ pub struct Answering {
     pub attachment: Option<Attachment>,
     /// A reply: the identifier of the message to mark answered once the reply is sent.
     pub answers: Option<String>,
+    /// A forward: the identifier of the message to mark forwarded once the forward is sent.
+    pub forwards: Option<String>,
+    /// What had to be changed in the original to answer it, in a line to tell the user.
+    pub notice: Option<String>,
 }
 
 /// A reply (`Some(mode)`) or a forward (`None`) to the message `id` of the copy, as the
@@ -291,12 +362,19 @@ pub fn answering(
     own: &str,
 ) -> Result<Answering, String> {
     let Some(mode) = mode else {
+        let (subject, one_line_subject) = one_line(subject);
+        let cleaned = Cleaned {
+            subject: one_line_subject,
+            ..Cleaned::default()
+        };
         return Ok(Answering {
-            subject: Some(forward_subject(subject)),
+            subject: Some(forward_subject(subject.as_deref())),
             attachment: Some(Attachment {
-                name: forward_name(subject),
+                name: forward_name(subject.as_deref()),
                 data: raw.to_vec(),
             }),
+            forwards: Some(id.to_owned()),
+            notice: cleaned.notice(),
             ..Answering::default()
         });
     };
@@ -310,6 +388,7 @@ pub fn answering(
         in_reply_to: reply.in_reply_to,
         references: reply.references,
         answers: Some(id.to_owned()),
+        notice: original.cleaned.notice(),
         ..Answering::default()
     })
 }
@@ -577,5 +656,146 @@ mod tests {
     fn an_original_with_an_address_missive_cannot_send_to_is_refused() {
         let raw = "From: zoé@example.com\r\nSubject: Hi\r\n\r\nx\r\n";
         assert!(Original::read(raw.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_subject_that_decodes_to_line_breaks_is_put_on_one_line_and_said() {
+        let raw = PLAIN.replace(
+            "Subject: Lunch?",
+            "Subject: =?utf-8?Q?Lunch=0D=0A=0D=0A?= =?utf-8?Q?now=3F?=",
+        );
+
+        let original = original(&raw);
+        let reply = reply(&original, Mode::Reply, OWN);
+
+        assert_eq!(reply.subject, "Re: Lunch now?");
+        assert!(original.cleaned.subject);
+        assert_eq!(original.cleaned.identifiers, 0);
+        let notice = original.cleaned.notice().unwrap();
+        assert!(notice.contains("subject"), "{notice}");
+        assert!(!notice.contains("Lunch"), "{notice}");
+    }
+
+    #[test]
+    fn an_identifier_with_whitespace_is_left_out_and_the_others_kept() {
+        let raw = PLAIN.replace(
+            "Subject:",
+            "References: <root@example.com> <bad id@example.com> <middle@example.com>\r\n\
+                 In-Reply-To: <worse\tid@example.com>\r\nSubject:",
+        );
+
+        let original = original(&raw);
+        let reply = reply(&original, Mode::Reply, OWN);
+
+        assert_eq!(
+            reply.references,
+            [
+                "root@example.com",
+                "middle@example.com",
+                "lunch@example.com"
+            ]
+        );
+        assert_eq!(reply.in_reply_to, ["lunch@example.com"]);
+        assert_eq!(original.cleaned.identifiers, 2);
+        assert_eq!(
+            original.cleaned.notice().unwrap(),
+            "The original message is odd: 2 message identifiers were left out."
+        );
+    }
+
+    #[test]
+    fn a_message_id_with_whitespace_leaves_the_reply_without_a_parent() {
+        let raw = PLAIN
+            .replace("<lunch@example.com>", "<lunch @example.com>")
+            .replace("Subject:", "References: <root@example.com>\r\nSubject:");
+
+        let original = original(&raw);
+        let reply = reply(&original, Mode::Reply, OWN);
+
+        assert!(reply.in_reply_to.is_empty());
+        assert_eq!(reply.references, ["root@example.com"].map(String::from));
+        assert_eq!(original.cleaned.identifiers, 1);
+        assert_eq!(
+            original.cleaned.notice().unwrap(),
+            "The original message is odd: 1 message identifier was left out."
+        );
+    }
+
+    #[test]
+    fn an_identifier_longer_than_a_line_is_left_out() {
+        let long = format!("<{}@example.com>", "x".repeat(1200));
+        let raw = PLAIN.replace(
+            "Subject:",
+            &format!("References: {long} <root@example.com>\r\nSubject:"),
+        );
+
+        let original = original(&raw);
+        let reply = reply(&original, Mode::Reply, OWN);
+
+        assert_eq!(reply.references, ["root@example.com", "lunch@example.com"]);
+        assert_eq!(original.cleaned.identifiers, 1);
+    }
+
+    #[test]
+    fn an_ordinary_original_has_nothing_to_tell() {
+        let original = original(PLAIN);
+        assert_eq!(original.cleaned, Cleaned::default());
+        assert_eq!(original.cleaned.notice(), None);
+    }
+
+    #[test]
+    fn a_forward_of_a_subject_with_line_breaks_is_put_on_one_line_and_said() {
+        let forwarded = answering(
+            "alice/1/2/3",
+            PLAIN.as_bytes(),
+            Some("Lunch\r\n?"),
+            None,
+            OWN,
+        )
+        .unwrap();
+
+        assert_eq!(forwarded.subject.as_deref(), Some("Fwd: Lunch ?"));
+        assert_eq!(forwarded.attachment.unwrap().name, "Lunch ?.eml");
+        assert!(forwarded.notice.unwrap().contains("subject"));
+    }
+
+    #[test]
+    fn a_forward_names_the_message_to_mark_forwarded_and_a_reply_the_one_to_mark_answered() {
+        let forwarded =
+            answering("alice/1/2/3", PLAIN.as_bytes(), Some("Lunch?"), None, OWN).unwrap();
+        assert_eq!(forwarded.forwards.as_deref(), Some("alice/1/2/3"));
+        assert_eq!(forwarded.answers, None);
+
+        let replied = answering(
+            "alice/1/2/3",
+            PLAIN.as_bytes(),
+            Some("Lunch?"),
+            Some(Mode::Reply),
+            OWN,
+        )
+        .unwrap();
+        assert_eq!(replied.answers.as_deref(), Some("alice/1/2/3"));
+        assert_eq!(replied.forwards, None);
+    }
+
+    #[test]
+    fn a_reply_all_leaves_out_the_address_of_the_account_that_sends_it() {
+        // Alice's message, answered from Bob's account: Bob's address is the one to leave out,
+        // Alice's stays among the recipients.
+        let raw = PLAIN
+            .replace("carl@example.net", "bob@example.net")
+            .replace("From: Zoé Ça <zoe@example.com>", "From: zoe@example.com");
+
+        let as_bob = reply(&original(&raw), Mode::ReplyAll, "bob@example.net");
+        assert_eq!(
+            addresses(&as_bob.to),
+            ["zoe@example.com", "alice@example.org"]
+        );
+
+        let as_alice = reply(&original(&raw), Mode::ReplyAll, OWN);
+        assert_eq!(
+            addresses(&as_alice.to),
+            ["zoe@example.com", "bob@example.net"]
+        );
     }
 }
