@@ -1324,7 +1324,14 @@ impl Worker {
         loop {
             self.take_requests();
             if password.is_none() {
-                match self.password().await {
+                // A keyring that asks for a passphrase holds the read until someone types it:
+                // a stop does not wait for it.
+                let mut stop = self.stop.clone();
+                let read = tokio::select! {
+                    read = self.password() => read,
+                    _ = stopped(&mut stop) => return,
+                };
+                match read {
                     Some(found) => password = Some(found),
                     None => {
                         self.settle("no-login");
@@ -1620,6 +1627,9 @@ impl Worker {
                         .await
                 );
                 let left = next_check.saturating_duration_since(Instant::now());
+                // A copy for Sent due again wakes the worker, which tries it at the top of this
+                // loop: it would otherwise wait for a request or the next check.
+                let left = left.min(self.copy_due().unwrap_or(left));
                 let wake = match (capabilities.idle && !self.idle_refused, inbox) {
                     (true, Some(inbox)) => {
                         let changes = check!(self.folder(&mut session, &mut folders[inbox]).await)
@@ -1644,7 +1654,9 @@ impl Worker {
                     _ => match self.wait(Some(left), true).await {
                         Waited::Stop => Wake::Stop,
                         Waited::Actions => Wake::Actions,
-                        Waited::Sync | Waited::Timeout => Wake::Sync,
+                        Waited::Sync => Wake::Sync,
+                        // The check of every folder is made only when it is due.
+                        Waited::Timeout => Wake::Renew,
                     },
                 };
                 match wake {
@@ -1656,6 +1668,21 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// How long until the earliest copy for Sent may be tried again. `None` when none waits, or
+    /// when its time is past: it was not tried at this pass (no Sent folder yet, say), so a timer
+    /// would only fire again at once, and the next pass or wake takes it.
+    fn copy_due(&self) -> Option<Duration> {
+        let next_at = match self.store.next_copy_at(self.key) {
+            Ok(next_at) => next_at?,
+            Err(e) => {
+                log!("account {}: cannot read the outbox ({e})", self.key);
+                return None;
+            }
+        };
+        let late = u64::try_from(next_at.checked_sub(outbox::now())?).ok()?;
+        (late > 0).then(|| Duration::from_millis(late))
     }
 
     /// Applies the account's queue on the server, tells what became of each action, and syncs
@@ -1774,6 +1801,13 @@ impl Worker {
             .iter()
             .any(|outcome| matches!(outcome.result, actions::Result::Retried { .. }));
         self.queue_failed = result.is_err();
+        if applied.taken_back > 0 {
+            log!(
+                "account {}: took back the \\Deleted flag a refused action left on {} messages",
+                self.key,
+                applied.taken_back
+            );
+        }
         for outcome in &applied.outcomes {
             self.tell_outcome(outcome);
         }

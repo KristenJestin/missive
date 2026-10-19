@@ -67,7 +67,7 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `in-trash` | a `delete` without `permanently` of a message already in the trash |
 | `not-in-trash` | a `delete` with `permanently` of a message outside the trash, in an account that has one |
 | `unsupported` | a `move`, `delete` or `delete` with `permanently` the account's server cannot apply safely: it has neither `MOVE` nor `UIDPLUS` (a move), or no `UIDPLUS` (a permanent delete). Known from the server's capabilities, recorded at each connection; before the first one, the action is recorded, and refused when tried (`docs/events.md`) |
-| `busy` | a message whose move waits for the server: it takes no other action until then; or a `draft` naming a draft whose message waits in the outbox |
+| `busy` | a message whose move waits for the server, which is known not to tell its new UID (no `UIDPLUS`): it takes no other action until then; or a `draft` naming a draft whose message waits in the outbox |
 | `already-sent` | a `draft` with `send` naming a draft whose message was already sent (the Sent folder holds it, or the outbox sent it or does not know whether the server took it): nothing is sent twice |
 | `uncertain` | a `resend` without `yes` of an `uncertain` message: the server may have taken it already |
 | `not-failed` | a `resend` or a `discard` of a message that is neither `failed` nor `uncertain` (`message` says its state) |

@@ -660,7 +660,8 @@ async fn an_account_not_yet_in_the_copy_is_never_synced_and_a_removed_one_is_not
             "skipped": [],
             "outbox": [],
             "drafts": [],
-            "half_moved": []
+            "half_moved": [],
+            "deleted_left": []
         }])
     );
     let unread = json(&env.read(&["unread", "--json"]).await);
@@ -738,7 +739,8 @@ async fn with_no_copy_yet_the_commands_say_so_and_give_zeros_and_create_nothing(
         json(&status),
         json!({ "daemon": "stopped", "accounts": [
             { "id": "alice", "state": null, "syncing": false, "last_sync": null, "messages": 0,
-              "skipped": [], "outbox": [], "drafts": [], "half_moved": [] }
+              "skipped": [], "outbox": [], "drafts": [], "half_moved": [],
+              "deleted_left": [] }
         ]})
     );
     assert!(

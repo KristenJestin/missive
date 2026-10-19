@@ -197,6 +197,9 @@ struct AccountStatus {
     /// The messages a move refused after their copy left in two folders, until the user removes
     /// one of the two.
     half_moved: Vec<HalfMoved>,
+    /// The messages a refused action left marked `\Deleted` on the server, until Missive takes
+    /// the flag back at the next connection.
+    deleted_left: Vec<String>,
     #[serde(skip)]
     in_copy: bool,
 }
@@ -211,19 +214,20 @@ pub fn status(json: bool) -> Result<()> {
     };
     let mut accounts = Vec::new();
     for id in configured {
-        let (outbox, drafts, half_moved) = match &copy {
+        let (outbox, drafts, half_moved, deleted_left) = match &copy {
             Some(copy) => (
                 copy.outbox(&id).map_err(|e| e.to_string())?,
                 copy.drafts(&id).map_err(|e| e.to_string())?,
                 copy.half_moved(&id).map_err(|e| e.to_string())?,
+                copy.deleted_left(&id).map_err(|e| e.to_string())?,
             ),
-            None => (Vec::new(), Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
-        accounts.push((id, outbox, drafts, half_moved));
+        accounts.push((id, outbox, drafts, half_moved, deleted_left));
     }
     let accounts: Vec<AccountStatus> = accounts
         .into_iter()
-        .map(|(id, outbox, drafts, half_moved)| {
+        .map(|(id, outbox, drafts, half_moved, deleted_left)| {
             let Some(row) = rows.iter().find(|row| row.id == id) else {
                 return AccountStatus {
                     id,
@@ -235,6 +239,7 @@ pub fn status(json: bool) -> Result<()> {
                     outbox,
                     drafts,
                     half_moved,
+                    deleted_left,
                     in_copy: false,
                 };
             };
@@ -251,6 +256,7 @@ pub fn status(json: bool) -> Result<()> {
                 outbox,
                 drafts,
                 half_moved,
+                deleted_left,
                 in_copy: true,
             }
         })
@@ -363,6 +369,12 @@ pub fn status(json: bool) -> Result<()> {
                 "\thalf moved: {} is in both {} and {}, since the server refused to remove it \
                  after copying it; delete or move one of the two",
                 half.message, half.folder, half.target
+            );
+        }
+        for message in &account.deleted_left {
+            println!(
+                "\tstill marked \\Deleted: {message}, by an action that was then refused; \
+                 Missive takes the flag back at the next connection"
             );
         }
     }
