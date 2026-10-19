@@ -789,12 +789,9 @@ async fn one(
                 if let Some(copy) = sync::copy_uid(response) {
                     untagged = Some(match untagged.take() {
                         None => Ok(copy),
-                        Some(Ok(mut all)) if all.uidvalidity == copy.uidvalidity => {
-                            all.pairs.extend(copy.pairs);
-                            Ok(all)
-                        }
                         // Parts that disagree tell nothing to be trusted.
-                        Some(_) => Err(()),
+                        Some(Ok(all)) => sync::merged(all, copy).ok_or(()),
+                        Some(Err(())) => Err(()),
                     });
                 }
             })

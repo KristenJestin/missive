@@ -567,6 +567,31 @@ pub(crate) fn appended(done: &Done) -> Option<(u32, u32)> {
     }
 }
 
+/// Two parts of the `COPYUID` of one command as one, when they can be trusted together: of the
+/// same UIDVALIDITY, within [`COPYUID_MAX`] together, and without a UID twice. A server that tells
+/// two new UIDs for one message tells nothing to be trusted.
+pub(crate) fn merged(all: CopyUid, part: CopyUid) -> Option<CopyUid> {
+    if all.uidvalidity != part.uidvalidity || all.pairs.len() + part.pairs.len() > COPYUID_MAX {
+        return None;
+    }
+    let mut pairs = all.pairs;
+    pairs.extend(part.pairs);
+    unique(CopyUid {
+        uidvalidity: all.uidvalidity,
+        pairs,
+    })
+}
+
+/// `copy`, unless it names a UID twice, in the source or in the target.
+fn unique(copy: CopyUid) -> Option<CopyUid> {
+    let mut from = BTreeSet::new();
+    let mut to = BTreeSet::new();
+    copy.pairs
+        .iter()
+        .all(|(old, new)| from.insert(*old) && to.insert(*new))
+        .then_some(copy)
+}
+
 fn copy_uid_code(code: &ResponseCode<'_>) -> Option<CopyUid> {
     // One message is appended at a time: its UID, as a pair from UID 0, which no message has.
     if let ResponseCode::AppendUid(uidvalidity, set) = code {
@@ -600,7 +625,10 @@ fn copy_uid_code(code: &ResponseCode<'_>) -> Option<CopyUid> {
     };
     let (from, to) = (expand(from)?, expand(to)?);
     // Two sets of different lengths pair nothing for sure.
-    (from.len() == to.len()).then(|| CopyUid {
+    if from.len() != to.len() {
+        return None;
+    }
+    unique(CopyUid {
         uidvalidity: *uidvalidity,
         pairs: from.into_iter().zip(to).collect(),
     })
@@ -1114,5 +1142,64 @@ mod tests {
         assert_eq!(uid_sets(&[3, 4, 5, 6, 7, 8, 9, 10], 3), ["3:10"]);
         assert_eq!(uid_sets(&[9, 1, 2, 7], 100), ["1:2,7,9"]);
         assert!(uid_sets(&[], 100).is_empty());
+    }
+
+    #[test]
+    fn copyuid_parts_are_merged_when_they_agree() {
+        let all = CopyUid {
+            uidvalidity: 7,
+            pairs: vec![(2, 10)],
+        };
+        let part = CopyUid {
+            uidvalidity: 7,
+            pairs: vec![(3, 11)],
+        };
+        assert_eq!(
+            merged(all, part),
+            Some(CopyUid {
+                uidvalidity: 7,
+                pairs: vec![(2, 10), (3, 11)],
+            })
+        );
+    }
+
+    #[test]
+    fn copyuid_parts_over_the_limit_together_are_not_trusted() {
+        let half = COPYUID_MAX as u32 / 2 + 1;
+        let all = CopyUid {
+            uidvalidity: 7,
+            pairs: (1..=half).map(|uid| (uid, uid)).collect(),
+        };
+        let part = CopyUid {
+            uidvalidity: 7,
+            pairs: (half + 1..=2 * half).map(|uid| (uid, uid)).collect(),
+        };
+        assert_eq!(merged(all, part), None);
+    }
+
+    #[test]
+    fn a_source_uid_in_two_copyuid_parts_is_not_trusted() {
+        let all = CopyUid {
+            uidvalidity: 7,
+            pairs: vec![(2, 10), (3, 11)],
+        };
+        let part = CopyUid {
+            uidvalidity: 7,
+            pairs: vec![(3, 12)],
+        };
+        assert_eq!(merged(all, part), None);
+    }
+
+    #[test]
+    fn copyuid_parts_of_two_uidvalidities_are_not_trusted() {
+        let all = CopyUid {
+            uidvalidity: 7,
+            pairs: vec![(2, 10)],
+        };
+        let part = CopyUid {
+            uidvalidity: 8,
+            pairs: vec![(3, 11)],
+        };
+        assert_eq!(merged(all, part), None);
     }
 }
