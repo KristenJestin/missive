@@ -847,7 +847,11 @@ impl Daemon {
             if request.send && !sent_already {
                 draft.check()?;
             }
-            compose::write(&account, &draft, now(), message_id.as_deref())
+            // Under the sent message's own Message-ID the edit would be one more version of a
+            // message that is gone: removed with it when a resend goes through, and never
+            // sendable. A new draft keeps it.
+            let version_of = message_id.as_deref().filter(|_| !sent_already);
+            compose::write(&account, &draft, now(), version_of)
         })();
         let built = match fields {
             Ok(built) => built,
@@ -867,19 +871,25 @@ impl Daemon {
             let _ = worker.send(Request::Actions);
         }
         if sent_already {
-            return Answer::error(
-                Some(name),
-                "already-sent",
-                format!(
+            let mut answer = if save {
+                Answer::error(
+                    Some(name),
+                    "already-sent",
+                    format!(
+                        "already sent; your changes are saved as a new draft {}",
+                        built.message_id
+                    ),
+                )
+            } else {
+                Answer::error(
+                    Some(name),
+                    "already-sent",
                     "this draft was already sent (its message is in the Sent folder or was sent \
-                     from the outbox); write a new message instead{}",
-                    if save {
-                        " (the changes given are saved in the draft)"
-                    } else {
-                        ""
-                    }
-                ),
-            );
+                     from the outbox); write a new message instead",
+                )
+            };
+            answer.message_id = save.then_some(built.message_id);
+            return answer;
         }
         if !request.send {
             return Answer {

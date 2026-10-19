@@ -844,8 +844,10 @@ again until it is sent, and a draft whose message was already sent (the Sent fol
 the outbox sent it or does not know whether the server took it) cannot be sent again: `--send`
 refuses it with an error, so that a server without UIDPLUS, which keeps the sent draft's last
 version in the Drafts folder, never makes the same message go twice. The changes given in the
-request that `--send` refuses this way are saved first, as a new version of the draft (the error
-says so): nothing typed is lost with the refusal.
+request that `--send` refuses this way are saved first, as a **new draft** with a new identifier,
+never as a version of the sent one (a later resend of an `uncertain` message would remove it with
+the sent draft): the error says `already sent; your changes are saved as a new draft <id>`, and
+nothing typed is lost with the refusal. A request that changes nothing saves nothing.
 
 Missive only ever replaces or removes a draft it wrote itself: its drafts carry an
 `X-Missive-Draft: 1` header (the message sent from one does not). A draft **another client

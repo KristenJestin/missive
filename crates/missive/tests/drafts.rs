@@ -1906,3 +1906,60 @@ async fn a_send_refused_as_already_sent_saves_the_changes_of_the_request_first()
     assert!(!stderr(&output).contains("saved"), "{}", stderr(&output));
     drafts_on_server(&server, &["First", "Edited"]).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_to_a_draft_whose_send_is_uncertain_survives_its_resend_as_a_new_draft() {
+    let server = mailbox().start().await;
+    server.smtp_cut_after_data();
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+
+    // The connection is cut after the end of data: the outbox does not know whether it went.
+    let output = env
+        .run(&["compose", "--json", "--draft", &id, "--send"])
+        .await;
+    succeeded(&output);
+    let queued: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let outbox = queued["outbox"].to_string();
+    eventually(20, "the message uncertain", || {
+        block(env.status())["accounts"][0]["outbox"][0]["state"] == "uncertain"
+    })
+    .await;
+    server.heal();
+
+    let output = env
+        .run(&["compose", "--draft", &id, "--subject", "Edited", "--send"])
+        .await;
+
+    failed(&output);
+    let said = stderr(&output);
+    let new = said
+        .split("saved as a new draft ")
+        .nth(1)
+        .map(|rest| {
+            rest.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .unwrap_or_default();
+    assert!(said.contains("already sent") && !new.is_empty(), "{said}");
+    assert_ne!(new, id, "{said}");
+    assert!(!said.contains("in the draft"), "{said}");
+
+    // The user sends the uncertain message again, and it goes: X is removed, the edit is not.
+    succeeded(&env.run(&["outbox", "resend", &outbox, "--yes"]).await);
+    took(&server, 2).await;
+    settled(&env).await;
+    drafts_on_server(&server, &["Edited"]).await;
+    let held = server_drafts(&server);
+    assert_eq!(held[0].2.as_deref(), Some(new.as_str()), "{held:?}");
+    assert_eq!(
+        block(env.drafts())
+            .iter()
+            .filter(|d| d["subject"] == "Edited")
+            .count(),
+        1
+    );
+}
