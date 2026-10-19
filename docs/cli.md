@@ -924,7 +924,9 @@ recipients got never names them. A server that saves sent mail itself keeps what
 without them. An account without a Sent folder gets no copy (the `sent` event says so): Missive
 never creates a folder. Appending is tried again when it fails, up to five times, then given up
 with a `sent-copy-failed` event; every try after the first (an append whose answer was lost, or
-one a killed daemon left) first looks for the message in Sent by its `Message-ID`.
+one a killed daemon left) first looks for the message in Sent by its `Message-ID`. Two counted
+tries (an append started, or a look in Sent that failed) are at least a minute apart: the syncs
+in between count none, so that a server that refuses for a minute does not use the five up.
 
 ### `missive mailto <uri> [--account <id>] [--json]`
 

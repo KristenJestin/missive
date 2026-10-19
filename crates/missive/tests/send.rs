@@ -182,12 +182,25 @@ impl Env {
         command
     }
 
-    /// Starts `missive daemon` in the foreground and waits until it answers on its socket.
+    /// Starts `missive daemon` in the foreground and waits until it answers on its socket. It
+    /// counts a try of a copy for Sent at each pass: the tests that want the minutes between two
+    /// tries ask for them with [`Env::daemon_spaced`].
     async fn daemon(&self) -> Daemon {
+        self.daemon_spaced(0).await
+    }
+
+    /// The same, the counted tries of a copy for Sent `spacing_ms` apart.
+    async fn daemon_spaced(&self, spacing_ms: u64) -> Daemon {
         let n = self.logs.fetch_add(1, Ordering::Relaxed);
         let log = std::fs::File::create(self.home.path().join(format!("daemon-{n}.log"))).unwrap();
         let child = self
-            .command(&["daemon", "--check-interval", "3600"])
+            .command(&[
+                "daemon",
+                "--check-interval",
+                "3600",
+                "--copy-spacing",
+                &spacing_ms.to_string(),
+            ])
             .stdout(Stdio::null())
             .stderr(log)
             .kill_on_drop(true)
@@ -1681,4 +1694,110 @@ async fn a_claim_without_a_claim_time_is_not_called_stuck() {
     let output = env.run(&["status"]).await;
     succeeded(&output);
     assert!(!stdout(&output).contains("stuck"), "{}", stdout(&output));
+}
+
+/// A number of the outbox's first row, `None` while there is no row.
+fn first_row(env: &Env, column: &str) -> Option<i64> {
+    Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap()
+        .query_row(&format!("SELECT {column} FROM outbox"), [], |r| r.get(0))
+        .ok()
+}
+
+/// What the minutes between two tries would have brought: the spacing is over.
+fn spacing_over(env: &Env) {
+    Connection::open(env.copy_path())
+        .unwrap()
+        .execute("UPDATE outbox SET copy_next_at = 0", [])
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_syncs_within_the_spacing_count_one_failed_append_of_the_copy() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    let _daemon = env.daemon_spaced(60_000).await;
+    env.ready().await;
+    let mut watcher = env.watch().await;
+    server.refuse("APPEND");
+    succeeded(&env.compose(&["--body", BODY]).await);
+    watcher.next("sent").await;
+    eventually(20, "the first try counted", || {
+        first_row(&env, "copy_attempts") == Some(1)
+    })
+    .await;
+
+    // Each sync runs the copy step twice, and a wake runs it too: within the spacing none counts.
+    for _ in 0..5 {
+        succeeded(&env.run(&["sync"]).await);
+    }
+    assert_eq!(first_row(&env, "copy_attempts"), Some(1));
+
+    // The spacing over, the next pass counts the next try, and only one.
+    spacing_over(&env);
+    succeeded(&env.run(&["sync"]).await);
+    assert_eq!(first_row(&env, "copy_attempts"), Some(2));
+    succeeded(&env.run(&["sync"]).await);
+    assert_eq!(first_row(&env, "copy_attempts"), Some(2));
+    assert!(server.uids("Sent").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_syncs_within_the_spacing_count_one_failed_search_of_sent() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    let _daemon = env.daemon_spaced(60_000).await;
+    env.ready().await;
+    appended_without_an_answer(&server, &env).await;
+    spacing_over(&env);
+    server.cut("UID SEARCH", 0);
+
+    // The cut search ends the connection: these syncs say `unreachable`.
+    for _ in 0..5 {
+        env.run(&["sync"]).await;
+    }
+
+    assert_eq!(first_row(&env, "copy_search_failures"), Some(1));
+    // The copy that is in Sent stays the only one, and the message is not given up.
+    assert_eq!(first_row(&env, "copy_attempts"), Some(1));
+    assert_eq!(server.uids("Sent").len(), 1);
+    assert_eq!(env.outbox().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_does_not_wait_for_a_keyring_read_during_the_wait_after_a_refused_login() {
+    let server = mailbox()
+        .smtp_answer("AUTH", "535 5.7.8 authentication failed")
+        .start()
+        .await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    let mut daemon = env.daemon().await;
+    env.ready().await;
+    succeeded(&env.compose(&["--body", BODY]).await);
+    eventually(20, "two refused logins", || {
+        env.outbox()
+            .first()
+            .is_some_and(|(_, _, attempts)| *attempts >= 2)
+    })
+    .await;
+    // The keyring waits for a passphrase nobody types; a sync makes the worker look at it.
+    env.keyring.stall_secret_reads();
+    succeeded(&env.run(&["sync"]).await);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let stopping = Instant::now();
+    daemon.stop(15).await;
+
+    assert!(
+        stopping.elapsed() < Duration::from_secs(3),
+        "the stop waited {:?}",
+        stopping.elapsed()
+    );
+    assert!(
+        !env.logs().contains("did not stop in time"),
+        "a worker was cut off"
+    );
 }

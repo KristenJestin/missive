@@ -73,6 +73,16 @@ const IDLE_RENEWAL: Duration = Duration::from_secs(25 * 60);
 const IDLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a worker in the middle of a sync is given to finish it when the daemon stops.
 const STOP_GRACE: Duration = Duration::from_secs(3);
+/// How long the daemon waits for its workers once it stops: the longest of the graces a worker
+/// is given (a sync's, the outbox record's), and a second for it to end. Derived from them, so
+/// that the record always fits inside the wait.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(
+    (if STOP_GRACE.as_secs() > outbox::RECORD_GRACE.as_secs() {
+        STOP_GRACE.as_secs()
+    } else {
+        outbox::RECORD_GRACE.as_secs()
+    }) + 1,
+);
 /// The longest wait between two connections to an unreachable server.
 const BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 /// How many events a watcher may be behind by before it misses some: a few minutes of a busy
@@ -94,6 +104,8 @@ pub struct Options {
     pub batch_size: usize,
     /// How long the server is given to answer each command of an action.
     pub action_timeout: Duration,
+    /// The least time between two counted tries of a copy for Sent.
+    pub copy_spacing: Duration,
 }
 
 macro_rules! log {
@@ -185,10 +197,7 @@ pub async fn run(options: Options) -> Result<(), String> {
     let _ = stop.send(true);
     let mut tasks = std::mem::take(&mut *locked(&daemon.tasks));
     let all = async { while tasks.join_next().await.is_some() {} };
-    if tokio::time::timeout(STOP_GRACE + Duration::from_secs(3), all)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(JOIN_TIMEOUT, all).await.is_err() {
         log!("a worker did not stop in time and was cut off");
     }
     drop(listener);
@@ -1573,6 +1582,7 @@ impl Worker {
             &mut self.store,
             self.key,
             self.options.action_timeout,
+            self.options.copy_spacing,
         )
         .await;
         for copy in &copies.copied {
@@ -2117,14 +2127,7 @@ impl SmtpWorker {
     /// The account's password from the keyring, read as the IMAP worker reads it. `&mut`
     /// although only read: the copy is not `Sync`, and the future must be `Send`.
     async fn password(&mut self) -> Option<Password> {
-        let found = match Keyring::open().await {
-            Ok(keyring) => keyring.password(&self.id).await,
-            Err(e) => Err(e),
-        };
-        found.unwrap_or_else(|_| {
-            log!("account {}: the keyring cannot be read", self.key);
-            None
-        })
+        read_password(&self.id, self.key).await
     }
 
     /// Waits for `timeout`, or for a message written to (or put back in) the outbox. `false`
@@ -2158,7 +2161,10 @@ impl SmtpWorker {
                     }
                 }
                 _ = self.recheck.notified(), if refused.is_some() => {
-                    let now = self.password().await;
+                    let now = tokio::select! {
+                        now = read_password(&self.id, self.key) => now,
+                        _ = stopped(&mut self.stop) => return false,
+                    };
                     if let (Some(now), Some(refused)) = (now, refused)
                         && now.expose() != refused.expose()
                     {
@@ -2259,6 +2265,19 @@ impl SmtpWorker {
     }
 }
 
+/// The SMTP worker's read of the keyring, apart from the worker so that a stop can be raced
+/// against it: a keyring that asks for a passphrase holds the read until someone types it.
+async fn read_password(id: &str, key: i64) -> Option<Password> {
+    let found = match Keyring::open().await {
+        Ok(keyring) => keyring.password(id).await,
+        Err(e) => Err(e),
+    };
+    found.unwrap_or_else(|_| {
+        log!("account {key}: the keyring cannot be read");
+        None
+    })
+}
+
 const UNCERTAIN_LEFT: &str = "the daemon stopped while the message was being sent: it may have \
                               been sent, so it is not sent again";
 
@@ -2275,4 +2294,15 @@ pub async fn connect() -> Result<UnixStream, String> {
     let socket = socket_path().map_err(|e| e.to_string())?;
     let program = std::env::current_exe().map_err(|e| e.to_string())?;
     client::connect(&socket, &program).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wait_for_the_workers_leaves_the_record_all_its_grace_and_a_second() {
+        assert!(JOIN_TIMEOUT >= outbox::RECORD_GRACE + Duration::from_secs(1));
+        assert!(JOIN_TIMEOUT >= STOP_GRACE + Duration::from_secs(1));
+    }
 }

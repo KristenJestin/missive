@@ -38,6 +38,8 @@ pub struct SentCopy {
     /// How many times appending it was started so far: a try a killed daemon left without its
     /// answer counts.
     pub attempts: u32,
+    /// The time, in milliseconds since the epoch, before which a counted try is not made again.
+    pub next_at: i64,
 }
 
 /// What became of a [`Store::resend`] or a [`Store::discard`].
@@ -380,7 +382,7 @@ impl Store {
     pub fn sent_copies(&self, account: i64) -> rusqlite::Result<Vec<SentCopy>> {
         self.connection
             .prepare(
-                "SELECT id, message_id, bcc_header, raw, copy_attempts
+                "SELECT id, message_id, bcc_header, raw, copy_attempts, copy_next_at
                    FROM outbox WHERE account = ?1 AND state = 'sent' ORDER BY id",
             )?
             .query_map([account], |r| {
@@ -391,6 +393,7 @@ impl Store {
                     message_id: r.get(1)?,
                     raw,
                     attempts: r.get(4)?,
+                    next_at: r.get(5)?,
                 })
             })?
             .collect()
@@ -398,23 +401,23 @@ impl Store {
 
     /// A copy about to be appended; returns how many times appending it was started, this one
     /// included. Counted before the `APPEND`, so that a daemon killed during it leaves the next
-    /// one to look in Sent first.
-    pub fn copy_trying(&self, id: i64) -> rusqlite::Result<u32> {
+    /// one to look in Sent first. The next counted try is not before `next_at`.
+    pub fn copy_trying(&self, id: i64, next_at: i64) -> rusqlite::Result<u32> {
         self.connection.query_row(
-            "UPDATE outbox SET copy_attempts = copy_attempts + 1 WHERE id = ?1
-             RETURNING copy_attempts",
-            [id],
+            "UPDATE outbox SET copy_attempts = copy_attempts + 1, copy_next_at = ?2
+              WHERE id = ?1 RETURNING copy_attempts",
+            params![id, next_at],
             |r| r.get(0),
         )
     }
 
     /// Looking for a copy in Sent failed; returns how many times it did so far, this one
-    /// included.
-    pub fn copy_search_failed(&self, id: i64) -> rusqlite::Result<u32> {
+    /// included. The next counted try is not before `next_at`.
+    pub fn copy_search_failed(&self, id: i64, next_at: i64) -> rusqlite::Result<u32> {
         self.connection.query_row(
-            "UPDATE outbox SET copy_search_failures = copy_search_failures + 1 WHERE id = ?1
-             RETURNING copy_search_failures",
-            [id],
+            "UPDATE outbox SET copy_search_failures = copy_search_failures + 1, copy_next_at = ?2
+              WHERE id = ?1 RETURNING copy_search_failures",
+            params![id, next_at],
             |r| r.get(0),
         )
     }
@@ -647,7 +650,7 @@ mod tests {
             copies[0].raw,
             b"Bcc: <hidden@example.net>\r\nSubject: 1\r\n\r\nHello\r\n"
         );
-        assert_eq!(store.copy_trying(one).unwrap(), 1);
+        assert_eq!(store.copy_trying(one, 0).unwrap(), 1);
         assert_eq!(store.sent_copies(account).unwrap()[0].attempts, 1);
         store.copy_done(one).unwrap();
         assert!(states(&store).is_empty());

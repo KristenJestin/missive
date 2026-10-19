@@ -51,6 +51,8 @@ struct Lock {
     answer: PromptAnswer,
     /// How many times a secret was read (`GetSecret`).
     secret_reads: AtomicUsize,
+    /// Whether `GetSecret` is held for ever, as a prompt nobody answers holds it.
+    stalled: AtomicBool,
 }
 
 impl Lock {
@@ -84,6 +86,7 @@ impl FakeKeyring {
             locked: AtomicBool::new(false),
             answer: PromptAnswer::Accept,
             secret_reads: AtomicUsize::new(0),
+            stalled: AtomicBool::new(false),
         })
         .await
     }
@@ -94,6 +97,7 @@ impl FakeKeyring {
             locked: AtomicBool::new(true),
             answer,
             secret_reads: AtomicUsize::new(0),
+            stalled: AtomicBool::new(false),
         })
         .await
     }
@@ -144,6 +148,12 @@ impl FakeKeyring {
     /// How many times a client read a secret (`GetSecret`), whichever entry it was.
     pub fn secret_reads(&self) -> usize {
         self.lock.secret_reads.load(Ordering::SeqCst)
+    }
+
+    /// From now on a client that reads a secret (`GetSecret`) is never answered: a keyring that
+    /// waits for someone to type a passphrase.
+    pub fn stall_secret_reads(&self) {
+        self.lock.stalled.store(true, Ordering::SeqCst);
     }
 
     /// Every entry, in the order they were created.
@@ -368,11 +378,14 @@ struct Item {
 
 #[interface(name = "org.freedesktop.Secret.Item")]
 impl Item {
-    fn get_secret(
+    async fn get_secret(
         &self,
         session: OwnedObjectPath,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> fdo::Result<Secret> {
+        if self.lock.stalled.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         self.lock.refuse_if_locked()?;
         self.lock.secret_reads.fetch_add(1, Ordering::SeqCst);
         let me = header.path().map(|p| p.as_str().to_owned());
