@@ -39,8 +39,10 @@
 //! A removal records the `\Deleted` it sets itself before it sets it: when the connection is lost
 //! before the flag is taken back, the next try still knows it is its own. An action refused for
 //! good that leaves it there keeps it in [`Store::deleted_left`], and it is taken back at once,
-//! then at the next connection, unless the folder was renumbered or deleted since. Until then, a move of those messages is refused: `UID MOVE` and
-//! `UID COPY` keep the flags, and the copy in the target would keep a `\Deleted` nothing records.
+//! then at the next connection, unless the folder was renumbered or deleted since, or a sync of
+//! the folder shows the flag cleared or the message gone. Until then, a move of those messages
+//! is refused: `UID MOVE` and `UID COPY` keep the flags, and the copy in the target would keep a
+//! `\Deleted` nothing records.
 //!
 //! An action asked while a move of its messages waits is recorded on them as the server still has
 //! them, apart from the messages that are not moving, and follows them to their new UIDs once the
@@ -600,7 +602,8 @@ fn refused(reason: &'static str, why: String, dropped: &Dropped) -> Result {
 
 /// Takes back the `\Deleted` flags refused actions left on the server ([`Store::deleted_left`]),
 /// unless the folder was renumbered since: its UIDs then name other messages. One the server
-/// refuses now is tried again at the next connection.
+/// refuses now is tried again at the next connection, and its refusals counted: past
+/// [`MAX_ATTEMPTS`], `missive status` says the flag may stay until it is cleared elsewhere.
 async fn take_back(
     server: &mut Server<'_>,
     store: &mut Store,
@@ -642,6 +645,8 @@ async fn take_back(
         if matches!(done, Done::Ok(_)) {
             store.taken_back(left.id)?;
             applied.taken_back += left.uids.len();
+        } else {
+            store.take_back_refused(left.id)?;
         }
     }
     Ok(())

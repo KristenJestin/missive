@@ -192,7 +192,7 @@ An action on messages of several folders is one action per folder, each with its
   client's `EXPUNGE` does not remove the message later. When the connection is lost before the
   flag could be taken back, and the action is then refused, its `message` says how many messages
   keep it: Missive takes it back at the next connection, and `missive status` lists them
-  (`deleted_left`) until then. A folder the
+  (`deleted_left`) until then, or until a sync shows the flag cleared elsewhere. A folder the
   server will not select is taken for deleted only when `LIST` lists the inbox but not it: a
   server that lists nothing at all (a bridge still syncing) keeps the flag recorded. An action asked while a move of its messages waited is refused
   with `moved` when the server moved them without saying their new UIDs (no `COPYUID`, or a copy

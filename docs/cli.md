@@ -208,9 +208,10 @@ the daemon runs.
         { "message": "alice/1/1745112/4", "copy": "alice/2/1745113/9", "folder": "inbox",
           "target": "archive", "maybe": false }
       ],
-      "deleted_left": [] },
+      "deleted_left": [], "deleted_refused": [] },
     { "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0,
-      "skipped": [], "outbox": [], "drafts": [], "half_moved": [], "deleted_left": [] }
+      "skipped": [], "outbox": [], "drafts": [], "half_moved": [], "deleted_left": [],
+      "deleted_refused": [] }
   ]
 }
 ```
@@ -246,7 +247,8 @@ the daemon runs.
 | `accounts[].half_moved[].copy` | string or `null` | the identifier of its copy in the target; `null` when the server did not tell its UID (the copy is in the target all the same) |
 | `accounts[].half_moved[].folder`, `.target` | string | the folder it was to leave and its target: their roles, else their names |
 | `accounts[].half_moved[].maybe` | boolean | `true` when the message may only be in both: the move was refused while the server's answer to its copy was lost, so whether the target has it is not known (`copy` is then `null`) until the next complete sync of the target looks for it there; `false` in a copy written before this field existed |
-| `accounts[].deleted_left` | array of strings | the messages an action refused for good, or the removal of a draft's older versions, left marked `\Deleted` on the server, by their identifiers: Missive set the flag itself and could not take it back (the connection was lost, or the server refused). It takes it back at the next connection, or lets it go once the folder was renumbered or deleted on the server (no message is left to take it from); `[]` when none |
+| `accounts[].deleted_left` | array of strings | the messages an action refused for good, or the removal of a draft's older versions, left marked `\Deleted` on the server, by their identifiers: Missive set the flag itself and could not take it back (the connection was lost, or the server refused). It takes it back at the next connection, or lets it go once the folder was renumbered or deleted on the server (no message is left to take it from), or once a complete sync of the folder shows the flag cleared or the message gone; `[]` when none |
+| `accounts[].deleted_refused` | array of strings | those of `deleted_left` whose flag the server refused to take back 5 times or more (a folder made read-only, say): the flag may stay until another client clears it or removes the message, which the next sync of the folder sees. Missive still tries at each connection, and a move of them is still refused (`deleted-left`); `[]` when none, and in a copy written before this field existed |
 
 `ready` does not mean the copy is complete: a folder the server refuses is skipped, the others are
 synced, and the account is `ready` all the same. `skipped` is what keeps that from being silent. It
@@ -290,7 +292,9 @@ and stays listed. A `maybe` is settled the same way at the next complete sync of
 copy found there, it is listed as in both; found nowhere, it leaves. A copy written before this
 field existed says `[]`. Each message of `deleted_left` has a line too:
 `	still marked \Deleted: alice/1/1745112/4, by an action that was then refused or the removal
-of a draft's older version; Missive takes the flag back at the next connection`.
+of a draft's older version; Missive takes the flag back at the next connection`, or, for one of
+`deleted_refused`, `…; the server refused to take it back many times, so the flag may stay: clear
+it in another client, or remove the message, and Missive lets it go at the next sync`.
 
 ### `missive unread [--json]`
 

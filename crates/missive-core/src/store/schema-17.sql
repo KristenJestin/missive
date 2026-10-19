@@ -10,3 +10,7 @@ UPDATE half_move SET (message_id, size, internal_date) = (
       FROM message JOIN folder ON folder.id = message.folder
      WHERE message.folder = half_move.folder AND message.uid = half_move.uid
        AND folder.uidvalidity = half_move.uidvalidity);
+
+-- How many times in a row the server refused to take the flag back: past the limit of an action,
+-- `missive status` says the flag may stay until it is cleared elsewhere.
+ALTER TABLE deleted_left ADD COLUMN refusals INTEGER NOT NULL DEFAULT 0;

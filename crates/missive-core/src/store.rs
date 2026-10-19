@@ -111,7 +111,8 @@
 #![doc = include_str!("store/schema-16.sql")]
 //! ```
 //!
-//! Version 17 finds a half-moved message again after a renumbering:
+//! Version 17 finds a half-moved message again after a renumbering, and counts the refusals to
+//! take a `\Deleted` back:
 //!
 //! ```sql
 #![doc = include_str!("store/schema-17.sql")]

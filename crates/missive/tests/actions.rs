@@ -2794,3 +2794,62 @@ async fn a_deleted_flag_left_is_kept_while_the_server_lists_no_folder_at_all() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_the_server_never_takes_back_is_said_and_leaves_once_cleared_elsewhere() {
+    let (server, env, _daemon) = started(
+        mailbox()
+            .without_move()
+            .refuse("UID EXPUNGE")
+            .refuse("UID STORE 3 -FLAGS"),
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(server.flags("INBOX", 3), flags(&["\\Deleted"]));
+    let status = env.status_of_alice().await;
+    assert_eq!(status["deleted_left"], serde_json::json!([three]));
+    assert_eq!(status["deleted_refused"], serde_json::json!([]));
+
+    // Taking it back is refused at each pass: after the limit, `status` says so.
+    let started = Instant::now();
+    while env.status_of_alice().await["deleted_refused"] != serde_json::json!([three]) {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "a flag the server never takes back is not said"
+        );
+        succeeded(&sync_soon(&env).await);
+    }
+    let text = stdout(&env.act(&["status"]).await);
+    assert!(text.contains("refused to take it back"), "{text}");
+
+    // Another client clears it: the next sync of the folder sees it gone, and the row leaves.
+    server.set_flags("INBOX", 3, &[]);
+    succeeded(&sync_soon(&env).await);
+    let started = Instant::now();
+    loop {
+        let status = env.status_of_alice().await;
+        if status["deleted_left"] == serde_json::json!([])
+            && status["deleted_refused"] == serde_json::json!([])
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "a flag cleared elsewhere is still listed: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Nothing holds a move of the message back any more.
+    server.heal();
+    succeeded(&env.act(&["move", &three, "--to", PRIVATE_FOLDER]).await);
+    eventually(20, "the message moved", || {
+        server.uids(PRIVATE_FOLDER) == [1, 2]
+    })
+    .await;
+    assert_eq!(server.flags(PRIVATE_FOLDER, 2), Some(Vec::new()));
+}

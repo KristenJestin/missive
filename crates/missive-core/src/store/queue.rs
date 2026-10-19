@@ -547,6 +547,15 @@ impl Store {
         Ok(false)
     }
 
+    /// The server refused to take back the flags of a [`Store::deleted_left`] row once more.
+    pub fn take_back_refused(&self, id: i64) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE deleted_left SET refusals = refusals + 1 WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     /// The flags of [`Store::deleted_left`] taken back, or that name other messages now.
     pub fn taken_back(&self, id: i64) -> rusqlite::Result<()> {
         self.connection
@@ -906,6 +915,9 @@ impl Store {
     /// without COPYUID), finds its message again by its fingerprint; found nowhere, it is gone.
     /// Without a fingerprint, nothing tells: the row stays. A renumbering alone never deletes a
     /// row: it empties the folder in the copy, and only a complete sync after it tells.
+    ///
+    /// A `\Deleted` left whose message no longer has it, or no longer is there, has nothing left
+    /// to take back: another client cleared it or removed the message.
     pub fn settle(&mut self, folder: i64) -> rusqlite::Result<()> {
         let transaction = self.connection.transaction()?;
         let uidvalidity: Option<u32> = transaction.query_row(
@@ -918,6 +930,7 @@ impl Store {
         };
         settle_sources(&transaction, folder, uidvalidity)?;
         settle_targets(&transaction, folder, uidvalidity)?;
+        settle_deleted_left(&transaction, folder, uidvalidity)?;
         transaction.commit()
     }
 }
@@ -1101,6 +1114,44 @@ fn settle_targets(
             Found::Gone => transaction.execute("DELETE FROM half_move WHERE id = ?1", [id])?,
             Found::Unknown => 0,
         };
+    }
+    Ok(())
+}
+
+/// [`Store::settle`] for the `\Deleted` flags left in `folder`. A row of another UIDVALIDITY is
+/// left to [`Store::taken_back`], at the next connection.
+fn settle_deleted_left(
+    transaction: &Transaction,
+    folder: i64,
+    uidvalidity: u32,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String)> = transaction
+        .prepare_cached("SELECT id, uids FROM deleted_left WHERE folder = ?1 AND uidvalidity = ?2")?
+        .query_map(params![folder, uidvalidity], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, uids) in rows {
+        let uids: Vec<u32> = serde_json::from_str(&uids).unwrap_or_default();
+        let mut left = Vec::new();
+        for uid in &uids {
+            let flags: Option<String> = transaction
+                .query_row(
+                    "SELECT flags FROM message WHERE folder = ?1 AND uid = ?2",
+                    params![folder, uid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if flags.is_some_and(|flags| has_flag(&flags, "\\Deleted")) {
+                left.push(*uid);
+            }
+        }
+        if left.is_empty() {
+            transaction.execute("DELETE FROM deleted_left WHERE id = ?1", [id])?;
+        } else if left != uids {
+            transaction.execute(
+                "UPDATE deleted_left SET uids = ?2 WHERE id = ?1",
+                params![id, serde_json::to_string(&left).expect("numbers serialize")],
+            )?;
+        }
     }
     Ok(())
 }
