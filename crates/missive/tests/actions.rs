@@ -725,11 +725,13 @@ async fn a_server_without_move_or_uidplus_refuses_the_move_and_nothing_changes()
     );
     assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
     assert!(server.uids("Archive").is_empty());
-    let logs = env.logs();
-    assert!(
-        logs.contains("refused: the server has neither MOVE nor UIDPLUS"),
-        "{logs}"
-    );
+    // The queue is empty once the row left; the daemon logs the refusal around that, and a log
+    // read in between holds the line cut short.
+    eventually(10, "the refusal in the log", || {
+        env.logs()
+            .contains("refused: the server has neither MOVE nor UIDPLUS")
+    })
+    .await;
     // A permanent delete is refused the same way.
     succeeded(
         &env.act(&["delete", "--permanently", &env.id("Trash", 1)])
