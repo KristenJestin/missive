@@ -1983,7 +1983,8 @@ impl SmtpWorker {
                 }
             };
             // A login that failed fails for every message: the worker waits too, so as not to log
-            // in once per message.
+            // in once per message, and a message written meanwhile does not cut the wait short:
+            // a wrong password would be tried again at each one.
             let login_failed = match &tried {
                 Tried::Login { error, .. } => {
                     if *error == ConnectError::AuthRefused {
@@ -1998,7 +1999,7 @@ impl SmtpWorker {
                 }
             };
             self.tell(tried);
-            if login_failed && !self.wait(Some(backoff.next())).await {
+            if login_failed && !self.pause(backoff.next()).await {
                 return;
             }
         }
@@ -2030,6 +2031,23 @@ impl SmtpWorker {
             woken = self.wake.recv() => woken.is_some(),
             _ = sleep => true,
             _ = stopped(&mut self.stop) => false,
+        }
+    }
+
+    /// Waits the whole of `timeout`: a message written meanwhile is for later. `false` when the
+    /// daemon stops or the account was removed.
+    async fn pause(&mut self, timeout: Duration) -> bool {
+        let until = tokio::time::Instant::now() + timeout;
+        loop {
+            tokio::select! {
+                woken = self.wake.recv() => {
+                    if woken.is_none() {
+                        return false;
+                    }
+                }
+                _ = tokio::time::sleep_until(until) => return true,
+                _ = stopped(&mut self.stop) => return false,
+            }
         }
     }
 

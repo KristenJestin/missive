@@ -1246,3 +1246,33 @@ async fn a_sent_copy_refused_five_times_is_given_up_with_an_event() {
     assert!(env.outbox().is_empty());
     assert!(server.uids("Sent").is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_message_does_not_cut_short_the_wait_after_a_refused_login() {
+    let server = mailbox()
+        .smtp_answer("AUTH", "535 5.7.8 authentication failed")
+        .start()
+        .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    succeeded(&env.compose(&["--body", "first"]).await);
+    // The second refusal starts a wait of 2 seconds.
+    eventually(20, "two refused logins", || {
+        env.outbox()
+            .first()
+            .is_some_and(|(_, _, attempts)| *attempts >= 2)
+    })
+    .await;
+
+    succeeded(&env.compose(&["--body", "second"]).await);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let outbox = env.outbox();
+    assert_eq!(outbox.len(), 2, "{outbox:?}");
+    assert_eq!(
+        outbox[1].2, 0,
+        "the new message logged in again: {outbox:?}"
+    );
+    // Waiting is not losing: both go once the server takes the login.
+    server.heal();
+    took(&server, 2).await;
+}
