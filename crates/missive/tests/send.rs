@@ -1338,6 +1338,31 @@ async fn a_daemon_stopped_while_a_sent_message_is_recorded_finishes_recording_it
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_stopped_during_the_record_gives_it_all_its_tries() {
+    let server = mailbox().start().await;
+    let (env, mut daemon) = started(&Setup::of(&server)).await;
+    let (copy, answers_at) = blocked_at_the_answer(&server, &env).await;
+    // The record tries at 0, 1, 2, 3 and 4 seconds after the answer; the daemon stops just after
+    // the first, and the copy is writable again between the fourth and the fifth.
+    tokio::time::sleep_until((answers_at + Duration::from_millis(300)).into()).await;
+    let stopping = tokio::spawn(async move {
+        tokio::time::sleep_until((answers_at + Duration::from_millis(3500)).into()).await;
+        lift(&copy);
+    });
+
+    daemon.stop(15).await;
+    stopping.await.unwrap();
+
+    assert_eq!(server.smtp_messages().len(), 1);
+    let outbox = env.outbox();
+    assert_eq!(
+        outbox.iter().map(|m| m.1.as_str()).collect::<Vec<_>>(),
+        ["sent"],
+        "{outbox:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_stopped_while_the_record_cannot_be_written_still_stops() {
     let server = mailbox().start().await;
     let (env, mut daemon) = started(&Setup::of(&server)).await;

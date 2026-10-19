@@ -58,6 +58,10 @@ use crate::sync::{self, Done, SyncError};
 /// copy is busy: each try already waits for the copy as long as its busy timeout says.
 const RECORD_TRIES: u32 = 5;
 const RECORD_PAUSE: Duration = Duration::from_secs(1);
+/// How long a daemon that stops is to give the record: the pauses between all its tries, and a
+/// second for the last one, so that a stop never takes away tries the record would have had.
+pub const RECORD_GRACE: Duration =
+    Duration::from_secs(RECORD_PAUSE.as_secs() * (RECORD_TRIES as u64 - 1) + 1);
 
 /// How long a message stays `claimed` before `status` calls it stuck, in milliseconds: more than
 /// a submission can take (each command waits at most 5 minutes, the data 10).

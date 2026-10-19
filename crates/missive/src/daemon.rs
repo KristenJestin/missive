@@ -1975,14 +1975,15 @@ impl SmtpWorker {
                 Ok(Some(submission)) => {
                     // The server's answer is known only here: a stop does not drop it, or the
                     // message it took would stay `sending`, then `uncertain`. It is a few local
-                    // writes, given a little time, not all the time a broken disk takes.
+                    // writes, given the time of all its tries, not all the time a broken disk
+                    // takes.
                     let record = outbox::record(&mut self.store, self.key, submission);
                     tokio::pin!(record);
                     tokio::select! {
                         tried = &mut record => tried.map(Some),
                         _ = async {
                             stopped(&mut self.stop).await;
-                            tokio::time::sleep(STOP_GRACE).await;
+                            tokio::time::sleep(outbox::RECORD_GRACE).await;
                         } => {
                             log!(
                                 "account {}: the daemon stopped before the outbox could be \
