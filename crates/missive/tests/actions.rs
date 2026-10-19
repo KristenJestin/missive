@@ -1709,6 +1709,7 @@ async fn a_move_refused_after_its_copy_says_the_message_is_in_both_folders_and_r
         env.status_of_alice().await["half_moved"],
         serde_json::json!([{
             "message": three, "copy": copy, "folder": "inbox", "target": "archive",
+            "maybe": false,
         }])
     );
     let text = stdout(&env.act(&["status"]).await);
@@ -1734,6 +1735,47 @@ async fn a_move_refused_after_its_copy_says_the_message_is_in_both_folders_and_r
         env.status_of_alice().await["half_moved"],
         serde_json::json!([])
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_refused_while_its_copy_is_unknown_says_the_message_may_be_in_both_folders() {
+    // The copy is made, but its answer is lost; then the target cannot be read to find it.
+    let (server, env, _daemon) = started(mailbox().without_move().cut("UID COPY", 0)).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    eventually(10, "the copy", || tries(&server, "UID COPY") == 1).await;
+    server.heal();
+    server.refuse("STATUS");
+    let event = loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            break event;
+        }
+        succeeded(&sync_soon(&env).await);
+    };
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(event["maybe_copied"], true, "{event}");
+    assert_eq!(event.get("copied"), None, "{event}");
+    let message = event["message"].as_str().unwrap();
+    assert!(message.contains("may be in both folders"), "{message}");
+
+    // It was copied: the message is in both folders, and nothing was removed.
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(server.uids("Archive"), [1]);
+    eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
+    assert_eq!(env.shown_uids("INBOX"), [1, 2, 3, 4]);
+
+    // `status` says so, as a maybe.
+    assert_eq!(
+        env.status_of_alice().await["half_moved"],
+        serde_json::json!([{
+            "message": three, "copy": null, "folder": "inbox", "target": "archive",
+            "maybe": true,
+        }])
+    );
+    let text = stdout(&env.act(&["status"]).await);
+    assert!(text.contains("may be in both inbox and archive"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -65,6 +65,9 @@ const SENT_SEARCH_VERSION: i64 = 12;
 /// The first schema version that keeps the `\Deleted` flags a refused action left.
 const DELETED_LEFT_VERSION: i64 = 15;
 
+/// The first schema version that tells a half move that is only a maybe.
+const MAYBE_HALF_MOVE_VERSION: i64 = 16;
+
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,6 +212,9 @@ pub struct HalfMoved {
     /// The folder it was to leave and its target: their roles, else their names.
     pub folder: String,
     pub target: String,
+    /// Whether it may only be in both: the move was refused while the answer to its copy was
+    /// unknown.
+    pub maybe: bool,
 }
 
 /// A folder of an account.
@@ -536,12 +542,18 @@ impl Copy {
         let mut statement = self.connection.prepare_cached(&format!(
             "SELECT half_move.folder, half_move.uidvalidity, half_move.uid, half_move.target,
                     half_move.target_uidvalidity, half_move.target_uid,
-                    coalesce(source.role, source.name), coalesce(target.role, target.name)
+                    coalesce(source.role, source.name), coalesce(target.role, target.name),
+                    {maybe}
                FROM half_move JOIN account ON account.key = half_move.account
                     JOIN folder AS source ON source.id = half_move.folder
                     JOIN folder AS target ON target.id = half_move.target
               WHERE account.id = ?1 AND {HALF_MOVE_LEFT}
-              ORDER BY half_move.id"
+              ORDER BY half_move.id",
+            maybe = if self.version < MAYBE_HALF_MOVE_VERSION {
+                "0"
+            } else {
+                "half_move.maybe"
+            }
         ))?;
         let rows = statement.query_map([account], |r| {
             let copy = match (r.get::<_, Option<u32>>(4)?, r.get::<_, Option<u32>>(5)?) {
@@ -555,6 +567,7 @@ impl Copy {
                 copy,
                 folder: r.get(6)?,
                 target: r.get(7)?,
+                maybe: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

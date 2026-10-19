@@ -52,6 +52,8 @@ pub struct Action {
 pub struct Dropped {
     /// A move refused once its messages were copied: they are in both folders.
     pub copied: bool,
+    /// A move refused while the answer to its copy was unknown: they may be in both folders.
+    pub maybe_copied: bool,
     /// How many messages keep the `\Deleted` the action set, until the next connection.
     pub deleted_left: usize,
     /// The actions asked after it on its messages that cannot apply without it, to refuse too.
@@ -658,7 +660,8 @@ impl Store {
     ///
     /// A move refused once the server had copied its messages (without MOVE) leaves them in both
     /// folders: each is recorded as half moved, and its copy written to the target in the copy
-    /// when its new UID is known.
+    /// when its new UID is known. One refused while the answer to its copy was unknown may have:
+    /// each is recorded as maybe half moved.
     ///
     /// The `\Deleted` the action set itself and could not take back is kept, to be taken back at
     /// the next connection. A permanent delete asked after a move on its messages is refused
@@ -699,12 +702,19 @@ impl Store {
                 .filter(|(_, kind, _)| *kind == Kind::DeletePermanently)
                 .map(|(id, _, _)| id)
                 .collect();
-            if let Some((account, state, copied, _)) = row
-                && state == "copied"
-            {
-                let copied: Option<CopyUid> = copied.and_then(|c| serde_json::from_str(&c).ok());
-                half_move(&transaction, account, action, copied.as_ref())?;
-                dropped.copied = true;
+            match row {
+                Some((account, state, copied, _)) if state == "copied" => {
+                    let copied: Option<CopyUid> =
+                        copied.and_then(|c| serde_json::from_str(&c).ok());
+                    half_move(&transaction, account, action, copied.as_ref(), false)?;
+                    dropped.copied = true;
+                }
+                // Whether the copy was made is not known: the target's sync shows it if it was.
+                Some((account, state, _, _)) if state == "copying" => {
+                    half_move(&transaction, account, action, None, true)?;
+                    dropped.maybe_copied = true;
+                }
+                _ => {}
             }
         }
         transaction.commit()?;
@@ -723,7 +733,8 @@ pub(crate) const HALF_MOVE_LEFT: &str = "
                      WHERE message.folder = half_move.target AND message.uid = half_move.target_uid
                        AND folder.uidvalidity = half_move.target_uidvalidity))";
 
-/// Records the messages of a move refused after their copy as half moved, and writes each copy
+/// Records the messages of a move refused after their copy as half moved (`maybe`: refused while
+/// whether it copied them was unknown), and writes each copy
 /// whose UID `copied` gives to the target in the copy (unless the target has another
 /// UIDVALIDITY there, or a message at that UID already, or the source folder has another
 /// UIDVALIDITY than the action's: its UIDs then name other messages, and the next sync of the
@@ -733,6 +744,7 @@ fn half_move(
     account: i64,
     action: &Action,
     copied: Option<&CopyUid>,
+    maybe: bool,
 ) -> rusqlite::Result<()> {
     let target = action.target.as_ref().expect("a move has a target");
     let uidvalidity: Option<u32> = transaction.query_row(
@@ -787,8 +799,8 @@ fn half_move(
         }
         transaction.execute(
             "INSERT INTO half_move (account, folder, uidvalidity, uid, target, target_uidvalidity,
-                                    target_uid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    target_uid, maybe)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 account,
                 action.folder.id,
@@ -796,7 +808,8 @@ fn half_move(
                 uid,
                 target.id,
                 new.and(copied.map(|c| c.uidvalidity)),
-                new
+                new,
+                maybe
             ],
         )?;
     }

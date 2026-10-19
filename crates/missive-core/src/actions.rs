@@ -51,7 +51,8 @@
 //!
 //! A move refused once its `UID COPY` was made leaves the messages in both folders. Nothing is
 //! removed to fix it: the copy shows both, the outcome says so, and the messages are recorded as
-//! half moved ([`crate::copy::Copy::half_moved`]) until the user removes one of the two.
+//! half moved ([`crate::copy::Copy::half_moved`]) until the user removes one of the two. A move
+//! refused while the answer to its `UID COPY` is unknown is recorded the same way, as a maybe.
 //!
 //! A `UID COPY` whose answer was never read (the connection was cut) may or may not have
 //! copied: before copying again, the target's UIDNEXT tells whether anything arrived there since,
@@ -255,10 +256,13 @@ pub enum Result {
     /// `no-such-folder`, `unsupported`, `deleted-left`, `refused` or `connection` (it failed that way
     /// [`MAX_ATTEMPTS`] times). `copied`: a move the server refused once it had copied the
     /// messages, which are in both folders now; nothing is removed to fix it but by the user.
+    /// `maybe_copied`: a move refused while the answer to its copy was unknown, whose messages
+    /// may be in both folders.
     Refused {
         reason: &'static str,
         message: String,
         copied: bool,
+        maybe_copied: bool,
     },
 }
 
@@ -552,7 +556,7 @@ fn refuse(
 ) -> std::result::Result<Dropped, SyncError> {
     let dropped = store.refused(action)?;
     applied.resync.insert(action.folder.id);
-    if dropped.copied
+    if (dropped.copied || dropped.maybe_copied)
         && let Some(target) = &action.target
     {
         applied.resync.insert(target.id);
@@ -570,6 +574,12 @@ fn refused(reason: &'static str, why: String, dropped: &Dropped) -> Result {
              folders now: nothing was removed, delete or move one of the two",
         );
     }
+    if dropped.maybe_copied {
+        message.push_str(
+            "; the server's answer to the copy to the target was lost, so the messages may be in \
+             both folders now: nothing was removed, look in the target",
+        );
+    }
     if dropped.deleted_left > 0 {
         message.push_str(&format!(
             "; {} of them keep the \\Deleted flag Missive set on the server, which it takes \
@@ -581,6 +591,7 @@ fn refused(reason: &'static str, why: String, dropped: &Dropped) -> Result {
         reason,
         message,
         copied: dropped.copied,
+        maybe_copied: dropped.maybe_copied,
     }
 }
 

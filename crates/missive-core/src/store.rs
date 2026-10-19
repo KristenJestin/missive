@@ -105,7 +105,7 @@
 //! ```
 //!
 //! Version 16 keeps the `\Deleted` flags the removal of a draft's older versions set, as an
-//! action's:
+//! action's, and tells a move that may have left its messages in both folders:
 //!
 //! ```sql
 #![doc = include_str!("store/schema-16.sql")]
