@@ -874,7 +874,7 @@ impl Daemon {
                         data: a.data,
                     })
                     .collect();
-                html_dropped |= draft.set_attachments(attachments);
+                draft.set_attachments(attachments);
             }
             if let Some(id) = request.in_reply_to {
                 draft.in_reply_to = vec![id];
@@ -1063,6 +1063,7 @@ impl Daemon {
                 subject: send.subject,
                 body: send.body,
                 html: None,
+                inline: Vec::new(),
                 attachments: send
                     .attachments
                     .into_iter()

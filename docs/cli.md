@@ -883,12 +883,12 @@ picked up of a draft is its recipients, subject, text, attachments and the threa
 (`In-Reply-To` and `References`), and its HTML alternative, kept as it was, byte for byte (a draft
 with only HTML gets its text made from it, beside the HTML; with several HTML parts, the first is
 kept): a draft picked up and written again, or sent, still carries its HTML. Its other headers
-(`Reply-To`…) are not kept, nor is an image the HTML draws from a part of the message (it stays an
-attachment). The HTML says what the text says: when `--body` or `--body-file` gives **another
-text**, the HTML part is dropped, so that the draft never says two things; it is dropped too when
-`--no-attach` or `--attach` takes an attachment off while the HTML draws an image from a part of
-the message (`cid:`), which would leave a broken image. One line on standard
-error says so; the same text (line ends aside) keeps it.
+(`Reply-To`…) are not kept. A part of the message that the HTML draws from (`cid:`: a logo, say) is
+not an attachment: it stays with the HTML, whatever is attached or taken off (`--no-attach`,
+`--attach`), and is written again as a `multipart/related` part. The HTML says what the text says:
+when `--body` or `--body-file` gives **another text**, the HTML part is dropped (and the parts it
+drew from with it), so that the draft never says two things. One line on standard error says so;
+the same text (line ends aside) keeps it.
 
 The draft is saved in the local copy first, and the command returns at once, whether the server
 can be reached or not: `list --folder drafts` shows it at once. The daemon then writes it to the

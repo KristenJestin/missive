@@ -190,6 +190,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         subject,
         body: text,
         html: None,
+        inline: Vec::new(),
         attachments,
         in_reply_to: a.in_reply_to,
         references: a.references,
@@ -268,10 +269,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         );
     }
     if answer.html_dropped {
-        eprintln!(
-            "The draft had an HTML part, which is dropped: the text you gave replaces it, or an \
-             attachment it draws from was taken off."
-        );
+        eprintln!("The draft had an HTML part, which is dropped: the text you gave replaces it.");
     }
     if args.send {
         let Some(outbox) = answer.outbox else {

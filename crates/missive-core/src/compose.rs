@@ -16,6 +16,7 @@
 use mail_builder::MessageBuilder;
 use mail_builder::headers::Header;
 use mail_builder::headers::address::Address;
+use mail_builder::mime::MimePart;
 use mail_parser::{HeaderValue, MessageParser, MimeHeaders, PartType};
 
 use crate::account::Account;
@@ -97,6 +98,16 @@ pub struct Attachment {
     pub data: Vec<u8>,
 }
 
+/// A part of the message that its HTML draws from (`cid:`), not a file the user attached: a
+/// logo, a picture of a signature. It stays with the HTML it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inline {
+    /// The part's `Content-ID`, without angle brackets.
+    pub content_id: String,
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+
 /// What the user wrote.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Draft {
@@ -108,6 +119,9 @@ pub struct Draft {
     /// The HTML alternative of the text, kept as it was written by the client that made it: a
     /// draft read back and written again carries it unchanged. Only [`Draft::set_body`] drops it.
     pub html: Option<String>,
+    /// The parts [`Draft::html`] draws from: kept as long as it is, and left out of
+    /// [`Draft::attachments`], so that taking an attachment off never breaks an image.
+    pub inline: Vec<Inline>,
     pub attachments: Vec<Attachment>,
     /// The message it answers, and its thread: Message-IDs without angle brackets.
     pub in_reply_to: Vec<String>,
@@ -231,17 +245,10 @@ impl Draft {
 }
 
 impl Draft {
-    /// Gives the draft these attachments. Its HTML alternative may draw an image from one of
-    /// them (`cid:`): taking an attachment off would leave a broken image, so the HTML part is
-    /// dropped when one goes and the HTML refers to the message's own parts. Whether it was.
-    pub fn set_attachments(&mut self, attachments: Vec<Attachment>) -> bool {
-        let removed = self
-            .attachments
-            .iter()
-            .any(|old| !attachments.contains(old));
+    /// Gives the draft these attachments. The parts its HTML draws from are not among them
+    /// ([`Draft::inline`]): taking an attachment off leaves the HTML whole.
+    pub fn set_attachments(&mut self, attachments: Vec<Attachment>) {
         self.attachments = attachments;
-        let draws = |html: &str| html.to_ascii_lowercase().contains("cid:");
-        removed && self.html.as_deref().is_some_and(draws) && self.html.take().is_some()
     }
 
     /// Gives the draft this text. Its HTML alternative stays when the text is the one it has
@@ -254,6 +261,8 @@ impl Draft {
         if same {
             return false;
         }
+        // Nothing draws the images of an HTML part that is gone.
+        self.inline.clear();
         self.html.take().is_some()
     }
 
@@ -286,8 +295,38 @@ impl Draft {
                 _ => Vec::new(),
             }
         };
+        // `body_html` makes a page of a message that has only text: only a real HTML part counts.
+        let html = parsed.html_part(0).and_then(|part| match &part.body {
+            PartType::Html(html) => Some(html.to_string()),
+            _ => None,
+        });
+        let lowered = html.as_deref().map(str::to_ascii_lowercase);
+        let mut inline = Vec::new();
         let mut attachments = Vec::new();
         for (index, part) in parsed.attachments().enumerate() {
+            // A part with a Content-ID that the HTML names is drawn by it, not attached.
+            let drawn = part
+                .content_id()
+                .map(|id| id.trim_matches(['<', '>']))
+                .filter(|id| {
+                    lowered
+                        .as_deref()
+                        .is_some_and(|html| crate::body::references(html, &id.to_ascii_lowercase()))
+                });
+            if let Some(content_id) = drawn {
+                inline.push(Inline {
+                    content_id: content_id.to_owned(),
+                    media_type: part
+                        .content_type()
+                        .map(|t| match t.subtype() {
+                            Some(subtype) => format!("{}/{subtype}", t.ctype()),
+                            None => t.ctype().to_owned(),
+                        })
+                        .unwrap_or_else(|| "application/octet-stream".to_owned()),
+                    data: part.contents().to_vec(),
+                });
+                continue;
+            }
             attachments.push(Attachment {
                 name: part
                     .attachment_name()
@@ -295,11 +334,6 @@ impl Draft {
                 data: part.contents().to_vec(),
             });
         }
-        // `body_html` makes a page of a message that has only text: only a real HTML part counts.
-        let html = parsed.html_part(0).and_then(|part| match &part.body {
-            PartType::Html(html) => Some(html.to_string()),
-            _ => None,
-        });
         Ok(Draft {
             to: mailboxes(parsed.to())?,
             cc: mailboxes(parsed.cc())?,
@@ -310,6 +344,7 @@ impl Draft {
                 .map(|text| text.into_owned())
                 .unwrap_or_default(),
             html,
+            inline,
             attachments,
             in_reply_to: ids(parsed.in_reply_to()),
             references: ids(parsed.references()),
@@ -398,20 +433,21 @@ pub fn write(
     if !draft.references.is_empty() {
         message = message.references(draft.references.as_slice());
     }
-    message = message.text_body(crlf(&draft.body));
-    if let Some(html) = &draft.html {
-        message = message.html_body(html.as_str());
-    }
-    for attachment in &draft.attachments {
-        let media_type = mime_guess::from_path(&attachment.name)
-            .first_or_octet_stream()
-            .essence_str()
-            .to_owned();
-        message = message.attachment(
-            media_type,
-            attachment.name.as_str(),
-            attachment.data.as_slice(),
-        );
+    match draft.html.as_deref().filter(|_| !draft.inline.is_empty()) {
+        Some(html) => message = message.body(related(draft, html)),
+        None => {
+            message = message.text_body(crlf(&draft.body));
+            if let Some(html) = &draft.html {
+                message = message.html_body(html.as_str());
+            }
+            for attachment in &draft.attachments {
+                message = message.attachment(
+                    media_type(&attachment.name),
+                    attachment.name.as_str(),
+                    attachment.data.as_slice(),
+                );
+            }
+        }
     }
     let mut raw = message
         .write_to_vec()
@@ -442,6 +478,46 @@ pub fn write(
         raw,
         bcc_header,
     })
+}
+
+/// The media type a file is attached with, guessed from its name.
+fn media_type(name: &str) -> String {
+    mime_guess::from_path(name)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_owned()
+}
+
+/// The body of a draft whose HTML draws from parts of the message: the text and the HTML as
+/// alternatives, together with the parts they draw from (`multipart/related`), and the files
+/// attached beside them.
+fn related<'x>(draft: &'x Draft, html: &'x str) -> MimePart<'x> {
+    let mut together = vec![MimePart::new(
+        "multipart/alternative",
+        vec![
+            MimePart::new("text/plain", crlf(&draft.body)),
+            MimePart::new("text/html", html),
+        ],
+    )];
+    for part in &draft.inline {
+        together.push(
+            MimePart::new(part.media_type.as_str(), part.data.as_slice())
+                .inline()
+                .cid(part.content_id.as_str()),
+        );
+    }
+    let together = MimePart::new("multipart/related", together);
+    if draft.attachments.is_empty() {
+        return together;
+    }
+    let mut parts = vec![together];
+    for attachment in &draft.attachments {
+        parts.push(
+            MimePart::new(media_type(&attachment.name), attachment.data.as_slice())
+                .attachment(attachment.name.as_str()),
+        );
+    }
+    MimePart::new("multipart/mixed", parts)
 }
 
 fn list(mailboxes: &[Mailbox]) -> Address<'_> {
@@ -679,6 +755,7 @@ mod tests {
             subject: Some("Réunion ☕".to_owned()),
             body: "Bonjour,\r\nà demain.\r\n".to_owned(),
             html: Some("<p>Bonjour,<br>à <b>demain</b>.</p>".to_owned()),
+            inline: Vec::new(),
             attachments: vec![Attachment {
                 name: "notes é.txt".to_owned(),
                 data: b"some notes".to_vec(),
@@ -843,51 +920,80 @@ mod tests {
         assert!(!draft.set_body("Again something else".to_owned()));
     }
 
-    #[test]
-    fn taking_off_an_attachment_the_html_may_draw_from_drops_the_html_part() {
-        let logo = Attachment {
-            name: "logo.png".to_owned(),
-            data: b"png".to_vec(),
-        };
-        let notes = Attachment {
-            name: "notes.txt".to_owned(),
-            data: b"notes".to_vec(),
-        };
-        let drawing = "<p>Hi <img src=\"cid:logo@example.org\"></p>";
-        let draft = |html: &str| Draft {
-            body: "Hi".to_owned(),
-            html: Some(html.to_owned()),
-            attachments: vec![logo.clone(), notes.clone()],
-            ..Draft::default()
-        };
+    /// A draft whose HTML draws a logo from a part of the message, beside a file attached.
+    const WITH_A_LOGO: &[u8] = b"From: a@example.org\r\nSubject: Logo\r\nMIME-Version: 1.0\r\n\
+        Content-Type: multipart/mixed; boundary=\"m\"\r\n\r\n\
+        --m\r\nContent-Type: multipart/related; boundary=\"r\"\r\n\r\n\
+        --r\r\nContent-Type: multipart/alternative; boundary=\"a\"\r\n\r\n\
+        --a\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHi\r\n\
+        --a\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+        <p>Hi <img src=\"cid:logo@example.org\"></p>\r\n--a--\r\n\
+        --r\r\nContent-Type: image/png; name=\"logo.png\"\r\n\
+        Content-Disposition: inline; filename=\"logo.png\"\r\n\
+        Content-ID: <logo@example.org>\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+        iVBORw0KGgo=\r\n--r--\r\n\
+        --m\r\nContent-Type: text/plain; name=\"notes.txt\"\r\n\
+        Content-Disposition: attachment; filename=\"notes.txt\"\r\n\r\nnotes\r\n--m--\r\n";
 
-        // Everything off: the image the HTML draws is gone, and so is the HTML.
-        let mut all_off = draft(drawing);
-        assert!(all_off.set_attachments(Vec::new()));
-        assert_eq!((all_off.html, all_off.attachments), (None, Vec::new()));
-        // Any attachment off may be the one it draws from.
-        let mut one_off = draft(drawing);
-        assert!(one_off.set_attachments(vec![logo.clone()]));
-        assert_eq!(one_off.html, None);
-        // Nothing taken off (the same ones, one more, another order): the HTML stays.
-        let mut kept = draft(drawing);
-        assert!(!kept.set_attachments(vec![notes.clone(), logo.clone()]));
-        let extra = Attachment {
-            name: "more.txt".to_owned(),
-            data: Vec::new(),
-        };
-        assert!(!kept.set_attachments(vec![logo.clone(), notes.clone(), extra]));
-        assert!(kept.html.is_some());
-        // An HTML that draws from no part has nothing to lose.
-        let mut plain = draft("<p>Hi <img src=\"https://images.example.org/a.png\"></p>");
-        assert!(!plain.set_attachments(Vec::new()));
-        assert!(plain.html.is_some());
-        // A text draft has no HTML to drop.
-        let mut text = Draft {
-            attachments: vec![logo],
-            ..Draft::default()
-        };
-        assert!(!text.set_attachments(Vec::new()));
+    #[test]
+    fn taking_attachments_off_keeps_the_html_and_the_parts_it_draws_from() {
+        let mut draft = Draft::read(WITH_A_LOGO).unwrap();
+        // The image the HTML draws is a part of the message, not a file the user attached.
+        assert_eq!(draft.attachments.len(), 1);
+        assert_eq!(draft.attachments[0].name, "notes.txt");
+        assert_eq!(draft.inline.len(), 1);
+        assert_eq!(draft.inline[0].content_id, "logo@example.org");
+        assert_eq!(draft.inline[0].media_type, "image/png");
+
+        // With a file attached beside them, they are written and read back the same.
+        let twice = Draft::read(&write(&account(), &draft, 0, None).unwrap().raw).unwrap();
+        assert_eq!(
+            (&twice.inline, &twice.attachments),
+            (&draft.inline, &draft.attachments)
+        );
+
+        // Everything attached goes: the HTML and its image stay.
+        draft.set_attachments(Vec::new());
+        assert!(
+            draft
+                .html
+                .as_deref()
+                .unwrap()
+                .contains("cid:logo@example.org")
+        );
+        assert_eq!(draft.inline.len(), 1);
+
+        // Written and read back, the image is still the part the HTML names.
+        let built = write(&account(), &draft, 0, None).unwrap();
+        let again = Draft::read(&built.raw).unwrap();
+        assert_eq!(again.inline, draft.inline);
+        assert!(again.attachments.is_empty());
+        assert_eq!(again.html, draft.html);
+        let raw = String::from_utf8_lossy(&built.raw).to_lowercase();
+        assert!(raw.contains("content-id: <logo@example.org>"), "{raw}");
+        assert!(raw.contains("multipart/related"), "{raw}");
+
+        // A text that replaces the HTML takes the image with it: nothing draws it any more.
+        assert!(draft.set_body("Another text".to_owned()));
+        assert_eq!((draft.html, draft.inline), (None, Vec::new()));
+    }
+
+    #[test]
+    fn a_part_with_a_content_id_the_html_does_not_draw_stays_an_attachment() {
+        let raw = String::from_utf8(WITH_A_LOGO.to_vec()).unwrap().replace(
+            "cid:logo@example.org",
+            "https://images.example.org/logo.png",
+        );
+        let draft = Draft::read(raw.as_bytes()).unwrap();
+        assert!(draft.inline.is_empty());
+        assert_eq!(
+            draft
+                .attachments
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["logo.png", "notes.txt"]
+        );
     }
 
     #[test]

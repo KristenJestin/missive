@@ -165,7 +165,7 @@ pub fn has_attachments(message: &Message) -> bool {
 
 /// Whether lowercased `html` holds `cid:<cid>` as a whole reference, not as the start of a
 /// longer one.
-fn references(html: &str, cid: &str) -> bool {
+pub(crate) fn references(html: &str, cid: &str) -> bool {
     let needle = format!("cid:{cid}");
     html.match_indices(&needle).any(|(at, _)| {
         html[at + needle.len()..]

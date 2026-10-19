@@ -228,8 +228,9 @@ a new `Message-ID`, never as a version of the sent one: the answer then also has
 new draft's identifier (the `message` says so). That new draft keeps no link to the message the sent one answered or forwarded (no `answers` or `forwards`), which was marked with it. Without changes, nothing is saved and there is no
 `message_id`.
 
-When `body` replaced the text of a draft that had an HTML alternative, or `attachments` took one off that the HTML draws from, and the HTML is dropped with it, the
-answer also has `"html_dropped": true` (absent otherwise).
+When `body` replaced the text of a draft that had an HTML alternative, and the HTML is dropped
+with it, the answer also has `"html_dropped": true` (absent otherwise). `attachments` never drops
+it: the parts the HTML draws from (`cid:`) are not among the attachments, and stay with it.
 
 A `draft` naming a draft another client wrote (one without Missive's `X-Missive-Draft` header)
 does not replace it: the daemon makes a new draft from it, under a new `message_id`, and the

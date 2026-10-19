@@ -2178,7 +2178,8 @@ fn foreign_html_with_a_logo() -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn taking_the_attachments_off_a_draft_whose_html_draws_from_one_drops_the_html_too() {
+async fn taking_the_attachments_off_a_draft_whose_html_draws_from_one_keeps_the_html_and_its_image()
+{
     let server = with_drafts(
         Folder::new("Drafts")
             .special_use(SpecialUse::Drafts)
@@ -2188,27 +2189,19 @@ async fn taking_the_attachments_off_a_draft_whose_html_draws_from_one_drops_the_
     .await;
     let (env, _daemon) = started(&Setup::of(&server)).await;
     let id = env.drafts().await[0]["id"].as_str().unwrap().to_owned();
-    // Picked up as it is, the logo and the HTML that draws it stay together.
-    env.save(&["--draft", &id, "--subject", "Kept"]).await;
-    let kept = newest_draft(&server, 2).await;
-    assert!(html_of(&kept).unwrap().contains("cid:logo@example.org"));
-    assert_eq!(
-        MessageParser::default()
-            .parse(&kept)
-            .unwrap()
-            .attachment_count(),
-        1
-    );
-
     let output = env.run(&["compose", "--draft", &id, "--no-attach"]).await;
 
     succeeded(&output);
-    assert!(stderr(&output).contains("HTML part"), "{}", stderr(&output));
-    eventually(30, "the new version", || server_drafts(&server).len() == 3).await;
-    let raw = newest_draft(&server, 3).await;
+    assert!(!stderr(&output).contains("HTML"), "{}", stderr(&output));
+    eventually(30, "the new version", || server_drafts(&server).len() == 2).await;
+    let raw = newest_draft(&server, 2).await;
     let parsed = MessageParser::default().parse(&raw).unwrap();
-    assert_eq!(html_of(&raw), None, "no image left to draw");
-    assert_eq!(parsed.attachment_count(), 0);
-    assert!(!String::from_utf8_lossy(&raw).contains("cid:"));
+    assert!(html_of(&raw).unwrap().contains("cid:logo@example.org"));
+    let logo = parsed
+        .attachments()
+        .next()
+        .expect("the logo is still there");
+    assert_eq!(logo.content_id(), Some("logo@example.org"));
+    assert_eq!(parsed.attachment_count(), 1);
     assert!(parsed.body_text(0).unwrap().contains(BODY));
 }
