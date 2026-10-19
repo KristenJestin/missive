@@ -9,7 +9,7 @@ use clap::{Args, ValueEnum};
 use missive_core::account::{AccountStore, Listing};
 use missive_core::body::{self, Attachment};
 use missive_core::copy::{
-    Copy, FolderRef, HalfMoved, Hit, List, NotFound, Outgoing, Person, Search, Stored,
+    Copy, FolderRef, HalfMoved, Hit, List, MessageId, NotFound, Outgoing, Person, Search, Stored,
     WaitingDraft, local_time,
 };
 use missive_core::protocol::pid_path;
@@ -637,8 +637,28 @@ pub fn message(id: &str) -> std::result::Result<Stored, ShowError> {
     }
 }
 
+/// What `show` and `open` read: the message an identifier names, else a draft or a message
+/// waiting in the outbox that a Message-ID names (it is not on the server yet, so it has no
+/// identifier of a message).
+pub fn shown(id: &str) -> std::result::Result<Stored, ShowError> {
+    if MessageId::parse(id).is_some() {
+        return message(id);
+    }
+    let configured = configured()?;
+    let waiting = match open()? {
+        Some(copy) => copy.waiting(id)?,
+        None => None,
+    };
+    match waiting {
+        Some(stored) if configured.contains(&stored.hit.account) => Ok(stored),
+        // A Message-ID has an `@`: it names a draft that is not there; else it names nothing.
+        _ if id.contains('@') => Err(ShowError::NotFound(NotFound::Unknown.to_string())),
+        _ => Err(ShowError::NotFound(NotFound::Invalid.to_string())),
+    }
+}
+
 pub fn show(args: ShowArgs) -> std::result::Result<(), ShowError> {
-    let stored = message(&args.id)?;
+    let stored = shown(&args.id)?;
     if args.raw {
         std::io::stdout().write_all(&stored.raw)?;
         return Ok(());

@@ -9,7 +9,8 @@ use crate::read::{self, ShowError};
 
 #[derive(Args)]
 pub struct OpenArgs {
-    /// The message's identifier, as `search` and `list` print it.
+    /// The message's identifier, as `search` and `list` print it; or the identifier (Message-ID)
+    /// of a draft the server does not hold yet.
     #[arg(value_name = "MESSAGE ID")]
     id: String,
     /// The original message, cleaned, in the default browser. It is the only view until the
@@ -21,7 +22,7 @@ pub struct OpenArgs {
 pub async fn run(args: OpenArgs) -> Result<(), ShowError> {
     // Without the window, the original is the only view: `--original` changes nothing yet.
     let OpenArgs { id, original: _ } = args;
-    let stored = read::message(&id)?;
+    let stored = read::shown(&id)?;
     let path = opener::open_original(&stored.raw).await?;
     println!("{}", path.display());
     Ok(())

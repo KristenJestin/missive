@@ -790,20 +790,15 @@ impl Daemon {
             Err(e) => return failed(e.to_string()),
         }
         // Without UIDPLUS its last version stays in the Drafts folder, listed: sending it again
-        // would send the same message twice.
+        // would send the same message twice. The refusal comes once the request's own changes
+        // are saved: they are not lost with it.
+        let mut sent_already = false;
         if request.send
             && let Some(id) = &message_id
         {
             match store.already_sent(key, id) {
                 Ok(false) => {}
-                Ok(true) => {
-                    return Answer::error(
-                        Some(name),
-                        "already-sent",
-                        "this draft was already sent (its message is in the Sent folder or was \
-                         sent from the outbox); write a new message instead",
-                    );
-                }
+                Ok(true) => sent_already = true,
                 Err(e) => return failed(e.to_string()),
             }
         }
@@ -817,6 +812,7 @@ impl Daemon {
         let mailboxes = |list: &[String]| -> Result<Vec<Mailbox>, String> {
             list.iter().map(|text| Mailbox::parse(text)).collect()
         };
+        let mut html_dropped = false;
         let fields = (|| {
             if let Some(to) = &request.to {
                 draft.to = mailboxes(to)?;
@@ -831,7 +827,7 @@ impl Daemon {
                 draft.subject = Some(subject);
             }
             if let Some(body) = request.body {
-                draft.body = body;
+                html_dropped = draft.set_body(body);
             }
             if let Some(attachments) = request.attachments {
                 draft.attachments = attachments
@@ -848,7 +844,7 @@ impl Daemon {
             if !request.references.is_empty() {
                 draft.references = request.references;
             }
-            if request.send {
+            if request.send && !sent_already {
                 draft.check()?;
             }
             compose::write(&account, &draft, now(), message_id.as_deref())
@@ -870,6 +866,21 @@ impl Daemon {
             );
             let _ = worker.send(Request::Actions);
         }
+        if sent_already {
+            return Answer::error(
+                Some(name),
+                "already-sent",
+                format!(
+                    "this draft was already sent (its message is in the Sent folder or was sent \
+                     from the outbox); write a new message instead{}",
+                    if save {
+                        " (the changes given are saved in the draft)"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
         if !request.send {
             return Answer {
                 protocol: PROTOCOL,
@@ -877,6 +888,7 @@ impl Daemon {
                 ok: true,
                 message_id: Some(built.message_id),
                 kept,
+                html_dropped,
                 ..Answer::default()
             };
         }
@@ -911,6 +923,7 @@ impl Daemon {
             outbox: Some(outbox),
             message_id: Some(built.message_id),
             kept,
+            html_dropped,
             ..Answer::default()
         }
     }
@@ -961,6 +974,7 @@ impl Daemon {
                 bcc: mailboxes(&send.bcc)?,
                 subject: send.subject,
                 body: send.body,
+                html: None,
                 attachments: send
                     .attachments
                     .into_iter()

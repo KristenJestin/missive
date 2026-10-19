@@ -54,6 +54,15 @@ pub struct ComposeArgs {
     /// A recipient in blind copy: the server is told, the message sent does not name them.
     #[arg(long, value_name = "ADDRESS")]
     bcc: Vec<String>,
+    /// With --draft: takes every recipient (To) off the draft.
+    #[arg(long, requires = "draft", conflicts_with = "to")]
+    no_to: bool,
+    /// With --draft: takes every recipient in copy off the draft.
+    #[arg(long, requires = "draft", conflicts_with = "cc")]
+    no_cc: bool,
+    /// With --draft: takes every recipient in blind copy off the draft.
+    #[arg(long, requires = "draft", conflicts_with = "bcc")]
+    no_bcc: bool,
     #[arg(long)]
     subject: Option<String>,
     /// The text of the message, from a file (UTF-8).
@@ -65,6 +74,9 @@ pub struct ComposeArgs {
     /// A file to attach; its media type is guessed from its name.
     #[arg(long, value_name = "PATH")]
     attach: Vec<PathBuf>,
+    /// With --draft: takes every attachment off the draft.
+    #[arg(long, requires = "draft", conflicts_with = "attach")]
+    no_attach: bool,
     /// Send the message (through the outbox, offline included); a draft picked up is removed once
     /// the server took it. Without it the message is saved as a draft.
     #[arg(long)]
@@ -173,6 +185,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         bcc: mailboxes(&args.bcc)?,
         subject,
         body: text,
+        html: None,
         attachments,
         in_reply_to: a.in_reply_to,
         references: a.references,
@@ -212,21 +225,26 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         .await;
     }
 
-    // Picking a draft up again, only what was given changes; a new draft is all that is given.
-    let given = |list: Vec<String>| (args.draft.is_none() || !list.is_empty()).then_some(list);
+    // Picking a draft up again, only what was given changes (an empty list takes the field off:
+    // `--no-cc`…); a new draft is all that is given.
+    let given = |list: Vec<String>, cleared: bool| match (cleared, &args.draft) {
+        (true, _) => Some(Vec::new()),
+        (false, None) => Some(list),
+        (false, Some(_)) => (!list.is_empty()).then_some(list),
+    };
     let answer = act::ask(Command::Draft(SaveDraft {
         account: account.clone(),
         draft: args.draft.clone(),
-        to: given(to),
-        cc: given(cc),
-        bcc: given(args.bcc),
+        to: given(to, args.no_to),
+        cc: given(cc, args.no_cc),
+        bcc: given(args.bcc, args.no_bcc),
         subject: draft.subject,
         body: if args.draft.is_none() {
             Some(draft.body)
         } else {
             body
         },
-        attachments: (args.draft.is_none() || !args.attach.is_empty())
+        attachments: (args.draft.is_none() || !args.attach.is_empty() || args.no_attach)
             .then(|| attached(draft.attachments)),
         in_reply_to: draft.in_reply_to.first().cloned(),
         references: draft.references,
@@ -243,6 +261,12 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         eprintln!(
             "Draft {kept} was written by another client: it is kept as it is in the Drafts \
              folder, beside the new one (delete it yourself if you no longer want it)."
+        );
+    }
+    if answer.html_dropped {
+        eprintln!(
+            "The draft had an HTML part: the text you gave replaces it, so the HTML part is \
+             dropped."
         );
     }
     if args.send {
