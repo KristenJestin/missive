@@ -664,7 +664,7 @@ async fn listed(
     let done = server
         .run_done(&format!("LIST \"\" {quoted}"), |response| {
             if let Response::MailboxData(MailboxDatum::List(list)) = response
-                && sync::unescape(&list.name) == name
+                && same_folder(&sync::unescape(&list.name), name)
                 && !list.name_attributes.iter().any(|a| {
                     matches!(a, NameAttribute::Extension(e) if e.eq_ignore_ascii_case("\\NonExistent"))
                 })
@@ -674,6 +674,12 @@ async fn listed(
         })
         .await?;
     Ok(matches!(done, Done::Ok(_)).then_some(found))
+}
+
+/// Whether the server's name for a folder is the one asked for: INBOX is the one name that is
+/// not case-sensitive (RFC 3501, 5.1), and a server may answer it as `Inbox`.
+fn same_folder(listed: &str, name: &str) -> bool {
+    listed == name || (name.eq_ignore_ascii_case("INBOX") && listed.eq_ignore_ascii_case("INBOX"))
 }
 
 /// What one try of an action came to.
@@ -1153,6 +1159,15 @@ async fn uid_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_inbox_is_listed_under_any_case_and_other_folders_only_as_asked() {
+        assert!(same_folder("Inbox", "INBOX"));
+        assert!(same_folder("INBOX", "inbox"));
+        assert!(same_folder("Archive", "Archive"));
+        assert!(!same_folder("archive", "Archive"));
+        assert!(!same_folder("Inbox/Archive", "INBOX"));
+    }
 
     #[test]
     fn an_append_is_given_a_timeout_that_grows_with_its_size_up_to_a_bound() {
