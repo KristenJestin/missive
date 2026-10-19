@@ -200,6 +200,9 @@ struct AccountStatus {
     /// The messages a refused action left marked `\Deleted` on the server, until Missive takes
     /// the flag back at the next connection.
     deleted_left: Vec<String>,
+    /// Those of `deleted_left` the server refused to take back too many times: the flag may stay
+    /// until another client clears it or removes the message.
+    deleted_refused: Vec<String>,
     #[serde(skip)]
     in_copy: bool,
 }
@@ -214,52 +217,64 @@ pub fn status(json: bool) -> Result<()> {
     };
     let mut accounts = Vec::new();
     for id in configured {
-        let (outbox, drafts, half_moved, deleted_left) = match &copy {
+        let (outbox, drafts, half_moved, deleted_left, deleted_refused) = match &copy {
             Some(copy) => (
                 copy.outbox(&id).map_err(|e| e.to_string())?,
                 copy.drafts(&id).map_err(|e| e.to_string())?,
                 copy.half_moved(&id).map_err(|e| e.to_string())?,
                 copy.deleted_left(&id).map_err(|e| e.to_string())?,
+                copy.deleted_refused(&id).map_err(|e| e.to_string())?,
             ),
-            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
-        accounts.push((id, outbox, drafts, half_moved, deleted_left));
+        accounts.push((
+            id,
+            outbox,
+            drafts,
+            half_moved,
+            deleted_left,
+            deleted_refused,
+        ));
     }
     let accounts: Vec<AccountStatus> = accounts
         .into_iter()
-        .map(|(id, outbox, drafts, half_moved, deleted_left)| {
-            let Some(row) = rows.iter().find(|row| row.id == id) else {
-                return AccountStatus {
+        .map(
+            |(id, outbox, drafts, half_moved, deleted_left, deleted_refused)| {
+                let Some(row) = rows.iter().find(|row| row.id == id) else {
+                    return AccountStatus {
+                        id,
+                        state: None,
+                        syncing: false,
+                        last_sync: None,
+                        messages: 0,
+                        skipped: Vec::new(),
+                        outbox,
+                        drafts,
+                        half_moved,
+                        deleted_left,
+                        deleted_refused,
+                        in_copy: false,
+                    };
+                };
+                // A daemon killed mid-sync leaves `syncing` behind: it only means something while a
+                // daemon lives.
+                let syncing = row.state == "syncing";
+                AccountStatus {
                     id,
-                    state: None,
-                    syncing: false,
-                    last_sync: None,
-                    messages: 0,
-                    skipped: Vec::new(),
+                    state: (!syncing || running).then(|| row.state.clone()),
+                    syncing: syncing && running,
+                    last_sync: row.last_sync,
+                    messages: row.messages,
+                    skipped: row.skipped.clone(),
                     outbox,
                     drafts,
                     half_moved,
                     deleted_left,
-                    in_copy: false,
-                };
-            };
-            // A daemon killed mid-sync leaves `syncing` behind: it only means something while a
-            // daemon lives.
-            let syncing = row.state == "syncing";
-            AccountStatus {
-                id,
-                state: (!syncing || running).then(|| row.state.clone()),
-                syncing: syncing && running,
-                last_sync: row.last_sync,
-                messages: row.messages,
-                skipped: row.skipped.clone(),
-                outbox,
-                drafts,
-                half_moved,
-                deleted_left,
-                in_copy: true,
-            }
-        })
+                    deleted_refused,
+                    in_copy: true,
+                }
+            },
+        )
         .collect();
     let daemon = if running { "running" } else { "stopped" };
     if json {
@@ -381,11 +396,20 @@ pub fn status(json: bool) -> Result<()> {
             }
         }
         for message in &account.deleted_left {
-            println!(
-                "\tstill marked \\Deleted: {message}, by an action that was then refused or \
-                 the removal of a draft's older version; Missive takes the flag back at the next \
-                 connection"
-            );
+            if account.deleted_refused.contains(message) {
+                println!(
+                    "\tstill marked \\Deleted: {message}, by an action that was then refused or \
+                     the removal of a draft's older version; the server refused to take it back \
+                     many times, so the flag may stay: clear it in another client, or remove the \
+                     message, and Missive lets it go at the next sync"
+                );
+            } else {
+                println!(
+                    "\tstill marked \\Deleted: {message}, by an action that was then refused or \
+                     the removal of a draft's older version; Missive takes the flag back at the \
+                     next connection"
+                );
+            }
         }
     }
     Ok(())

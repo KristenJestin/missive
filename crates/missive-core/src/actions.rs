@@ -39,8 +39,10 @@
 //! A removal records the `\Deleted` it sets itself before it sets it: when the connection is lost
 //! before the flag is taken back, the next try still knows it is its own. An action refused for
 //! good that leaves it there keeps it in [`Store::deleted_left`], and it is taken back at once,
-//! then at the next connection, unless the folder was renumbered or deleted since. Until then, a move of those messages is refused: `UID MOVE` and
-//! `UID COPY` keep the flags, and the copy in the target would keep a `\Deleted` nothing records.
+//! then at the next connection, unless the folder was renumbered or deleted since, or a sync of
+//! the folder shows the flag cleared or the message gone. Until then, a move of those messages
+//! is refused: `UID MOVE` and `UID COPY` keep the flags, and the copy in the target would keep a
+//! `\Deleted` nothing records.
 //!
 //! An action asked while a move of its messages waits is recorded on them as the server still has
 //! them, apart from the messages that are not moving, and follows them to their new UIDs once the
@@ -604,7 +606,8 @@ fn refused(reason: &'static str, why: String, dropped: &Dropped) -> Result {
 
 /// Takes back the `\Deleted` flags refused actions left on the server ([`Store::deleted_left`]),
 /// unless the folder was renumbered since: its UIDs then name other messages. One the server
-/// refuses now is tried again at the next connection.
+/// refuses now is tried again at the next connection, and its refusals counted: past
+/// [`MAX_ATTEMPTS`], `missive status` says the flag may stay until it is cleared elsewhere.
 async fn take_back(
     server: &mut Server<'_>,
     store: &mut Store,
@@ -619,7 +622,11 @@ async fn take_back(
         match server.select(&left.folder.name).await? {
             None => {
                 // A folder deleted since has none of its messages left to take the flag from.
-                if listed(server, &left.folder.name).await? == Some(false) {
+                // But a server that lists nothing at all, not even the inbox every account has
+                // (a bridge still syncing), does not tell that it is gone.
+                if listed(server, &left.folder.name).await? == Some(false)
+                    && listed(server, "INBOX").await? == Some(true)
+                {
                     store.taken_back(left.id)?;
                 }
                 continue;
@@ -642,6 +649,8 @@ async fn take_back(
         if matches!(done, Done::Ok(_)) {
             store.taken_back(left.id)?;
             applied.taken_back += left.uids.len();
+        } else {
+            store.take_back_refused(left.id)?;
         }
     }
     Ok(())
@@ -659,7 +668,7 @@ async fn listed(
     let done = server
         .run_done(&format!("LIST \"\" {quoted}"), |response| {
             if let Response::MailboxData(MailboxDatum::List(list)) = response
-                && sync::unescape(&list.name) == name
+                && same_folder(&sync::unescape(&list.name), name)
                 && !list.name_attributes.iter().any(|a| {
                     matches!(a, NameAttribute::Extension(e) if e.eq_ignore_ascii_case("\\NonExistent"))
                 })
@@ -669,6 +678,12 @@ async fn listed(
         })
         .await?;
     Ok(matches!(done, Done::Ok(_)).then_some(found))
+}
+
+/// Whether the server's name for a folder is the one asked for: INBOX is the one name that is
+/// not case-sensitive (RFC 3501, 5.1), and a server may answer it as `Inbox`.
+fn same_folder(listed: &str, name: &str) -> bool {
+    listed == name || (name.eq_ignore_ascii_case("INBOX") && listed.eq_ignore_ascii_case("INBOX"))
 }
 
 /// What one try of an action came to.
@@ -793,12 +808,9 @@ async fn one(
                 if let Some(copy) = sync::copy_uid(response) {
                     untagged = Some(match untagged.take() {
                         None => Ok(copy),
-                        Some(Ok(mut all)) if all.uidvalidity == copy.uidvalidity => {
-                            all.pairs.extend(copy.pairs);
-                            Ok(all)
-                        }
                         // Parts that disagree tell nothing to be trusted.
-                        Some(_) => Err(()),
+                        Some(Ok(all)) => sync::merged(all, copy).ok_or(()),
+                        Some(Err(())) => Err(()),
                     });
                 }
             })
@@ -1151,6 +1163,15 @@ async fn uid_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_inbox_is_listed_under_any_case_and_other_folders_only_as_asked() {
+        assert!(same_folder("Inbox", "INBOX"));
+        assert!(same_folder("INBOX", "inbox"));
+        assert!(same_folder("Archive", "Archive"));
+        assert!(!same_folder("archive", "Archive"));
+        assert!(!same_folder("Inbox/Archive", "INBOX"));
+    }
 
     #[test]
     fn an_append_is_given_a_timeout_that_grows_with_its_size_up_to_a_bound() {

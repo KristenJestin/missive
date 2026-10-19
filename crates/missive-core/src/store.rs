@@ -6,7 +6,7 @@
 //! is ever held across a wait on the network: a process killed at any point leaves a copy that is
 //! whole as of its last commit.
 //!
-//! The schema, version 17 (`PRAGMA user_version`). Version 1 is the copy itself:
+//! The schema, version 18 (`PRAGMA user_version`). Version 1 is the copy itself:
 //!
 //! ```sql
 #![doc = include_str!("store/schema-1.sql")]
@@ -118,6 +118,13 @@
 #![doc = include_str!("store/schema-17.sql")]
 //! ```
 //!
+//! Version 18 finds a half-moved message again after a renumbering, and counts the refusals to
+//! take a `\Deleted` back:
+//!
+//! ```sql
+#![doc = include_str!("store/schema-18.sql")]
+//! ```
+//!
 //! The index is contentless: it keeps the words and where they are, not the text, so a message
 //! costs its words and their places beside its raw message, and no text is stored twice. The text it is built from is read by `mail-parser`: the text parts of a message, and,
 //! for a message with only HTML, that HTML reduced to its text (markup, styles and scripts
@@ -134,7 +141,7 @@ use serde::{Deserialize, Serialize};
 
 /// The schema version this build writes. A copy written by a later version is refused rather
 /// than misread.
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// Each step brings the schema from the version before it: `MIGRATIONS[0]` from nothing to 1.
 const MIGRATIONS: &[&str] = &[
@@ -155,6 +162,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema-15.sql"),
     include_str!("store/schema-16.sql"),
     include_str!("store/schema-17.sql"),
+    include_str!("store/schema-18.sql"),
 ];
 
 mod drafts;

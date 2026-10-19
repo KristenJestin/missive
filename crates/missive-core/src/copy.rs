@@ -23,6 +23,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::actions::MAX_ATTEMPTS;
 use crate::compose::Followup;
 use crate::store::{HALF_MOVE_LEFT, SCHEMA_VERSION, SkippedFolder};
 
@@ -71,6 +72,9 @@ const MAYBE_HALF_MOVE_VERSION: i64 = 16;
 
 /// The first schema version that records which drafts Missive wrote itself.
 const OWN_DRAFT_VERSION: i64 = 17;
+
+/// The first schema version that counts the refusals to take a `\Deleted` back.
+const DELETED_REFUSED_VERSION: i64 = 18;
 
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
@@ -591,6 +595,26 @@ impl Copy {
               WHERE account.id = ?1 ORDER BY deleted_left.id, json_each.key",
         )?;
         let rows = statement.query_map([account], |r| {
+            Ok(message_id(account, r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Those of [`Copy::deleted_left`] the server refused to take back [`MAX_ATTEMPTS`] times or
+    /// more: the flag may stay until another client clears it or removes the message, which the
+    /// next sync of the folder sees. Empty in a copy older than the count.
+    pub fn deleted_refused(&self, account: &str) -> Result<Vec<String>> {
+        if self.version < DELETED_REFUSED_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare_cached(
+            "SELECT deleted_left.folder, deleted_left.uidvalidity, json_each.value
+               FROM deleted_left JOIN account ON account.key = deleted_left.account,
+                    json_each(deleted_left.uids)
+              WHERE account.id = ?1 AND deleted_left.refusals >= ?2
+              ORDER BY deleted_left.id, json_each.key",
+        )?;
+        let rows = statement.query_map(params![account, MAX_ATTEMPTS], |r| {
             Ok(message_id(account, r.get(0)?, r.get(1)?, r.get(2)?))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

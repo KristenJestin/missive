@@ -552,6 +552,15 @@ impl Store {
         Ok(false)
     }
 
+    /// The server refused to take back the flags of a [`Store::deleted_left`] row once more.
+    pub fn take_back_refused(&self, id: i64) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE deleted_left SET refusals = refusals + 1 WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     /// The flags of [`Store::deleted_left`] taken back, or that name other messages now.
     pub fn taken_back(&self, id: i64) -> rusqlite::Result<()> {
         self.connection
@@ -566,21 +575,8 @@ impl Store {
         folder: i64,
         uids: &[u32],
     ) -> rusqlite::Result<Vec<Option<Fingerprint>>> {
-        let mut statement = self.connection.prepare_cached(
-            "SELECT message_id, size, internal_date FROM message WHERE folder = ?1 AND uid = ?2",
-        )?;
         uids.iter()
-            .map(|uid| {
-                statement
-                    .query_row(params![folder, uid], |r| {
-                        Ok(Fingerprint {
-                            message_id: r.get(0)?,
-                            size: r.get(1)?,
-                            internal_date: r.get(2)?,
-                        })
-                    })
-                    .optional()
-            })
+            .map(|uid| fingerprint(&self.connection, folder, *uid))
             .collect()
     }
 
@@ -811,12 +807,19 @@ impl Store {
 }
 
 /// Whether the half move `half_move` names still has its message in both folders, as far as the
-/// copy knows: once the user removed one of them, it is settled.
+/// copy knows: once the user removed one of them, it is settled. A folder renumbered since may
+/// still have it, under a UID the copy does not know yet: the next complete sync of the folder
+/// finds it again by its fingerprint ([`Store::settle`]).
 pub(crate) const HALF_MOVE_LEFT: &str = "
-    EXISTS (SELECT 1 FROM message JOIN folder ON folder.id = message.folder
-             WHERE message.folder = half_move.folder AND message.uid = half_move.uid
-               AND folder.uidvalidity = half_move.uidvalidity)
+    (EXISTS (SELECT 1 FROM folder
+              WHERE folder.id = half_move.folder AND folder.uidvalidity IS NOT half_move.uidvalidity)
+     OR EXISTS (SELECT 1 FROM message JOIN folder ON folder.id = message.folder
+                 WHERE message.folder = half_move.folder AND message.uid = half_move.uid
+                   AND folder.uidvalidity = half_move.uidvalidity))
     AND (half_move.target_uid IS NULL
+         OR EXISTS (SELECT 1 FROM folder
+                     WHERE folder.id = half_move.target
+                       AND folder.uidvalidity IS NOT half_move.target_uidvalidity)
          OR EXISTS (SELECT 1 FROM message JOIN folder ON folder.id = message.folder
                      WHERE message.folder = half_move.target AND message.uid = half_move.target_uid
                        AND folder.uidvalidity = half_move.target_uidvalidity))";
@@ -848,11 +851,6 @@ fn half_move(
     let copied = copied
         .filter(|c| Some(c.uidvalidity) == uidvalidity)
         .filter(|_| source_uidvalidity == Some(action.uidvalidity));
-    // Those the user settled since are let go.
-    transaction.execute(
-        &format!("DELETE FROM half_move WHERE account = ?1 AND NOT ({HALF_MOVE_LEFT})"),
-        [account],
-    )?;
     for uid in &action.uids {
         let new = copied.and_then(|c| c.pairs.iter().find(|(old, _)| old == uid).map(|p| p.1));
         if let Some(new) = new {
@@ -885,10 +883,16 @@ fn half_move(
                 super::insert(transaction, target.id, &source)?;
             }
         }
+        // Under another UIDVALIDITY, the row at that UID is another message.
+        let fingerprint = if source_uidvalidity == Some(action.uidvalidity) {
+            fingerprint(transaction, action.folder.id, *uid)?
+        } else {
+            None
+        };
         transaction.execute(
             "INSERT INTO half_move (account, folder, uidvalidity, uid, target, target_uidvalidity,
-                                    target_uid, maybe)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                    target_uid, maybe, message_id, size, internal_date)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 account,
                 action.folder.id,
@@ -897,9 +901,275 @@ fn half_move(
                 target.id,
                 new.and(copied.map(|c| c.uidvalidity)),
                 new,
-                maybe
+                maybe,
+                fingerprint.as_ref().and_then(|f| f.message_id.as_deref()),
+                fingerprint.as_ref().map(|f| f.size),
+                fingerprint.as_ref().and_then(|f| f.internal_date),
             ],
         )?;
+    }
+    Ok(())
+}
+
+impl Store {
+    /// What a complete sync of `folder` settles, the copy now holding every message the server
+    /// listed there. Only rows of the copy change: nothing is asked of the server.
+    ///
+    /// A half move whose message is gone from either folder is settled, and its row leaves. One
+    /// whose side here was renumbered, or whose copy here was never told (a maybe, or a copy
+    /// without COPYUID), finds its message again by its fingerprint; found nowhere, it is gone.
+    /// Without a fingerprint, nothing tells: the row stays. A renumbering alone never deletes a
+    /// row: it empties the folder in the copy, and only a complete sync after it tells.
+    ///
+    /// A `\Deleted` left whose message no longer has it, or no longer is there, has nothing left
+    /// to take back: another client cleared it or removed the message.
+    ///
+    /// While a permanent delete waits on `folder`, nothing settles there: the copy lacks its
+    /// messages without the server having removed them, and if the server then refuses the delete
+    /// for good, they are back with whatever they had.
+    pub fn settle(&mut self, folder: i64) -> rusqlite::Result<()> {
+        let transaction = self.connection.transaction()?;
+        let deleting: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM action
+                             WHERE folder = ?1 AND kind = 'delete-permanently')",
+            [folder],
+            |r| r.get(0),
+        )?;
+        if deleting {
+            return Ok(());
+        }
+        let uidvalidity: Option<u32> = transaction.query_row(
+            "SELECT uidvalidity FROM folder WHERE id = ?1",
+            [folder],
+            |r| r.get(0),
+        )?;
+        let Some(uidvalidity) = uidvalidity else {
+            return Ok(());
+        };
+        settle_sources(&transaction, folder, uidvalidity)?;
+        settle_targets(&transaction, folder, uidvalidity)?;
+        settle_deleted_left(&transaction, folder, uidvalidity)?;
+        transaction.commit()
+    }
+}
+
+/// What the copy knows of the message at `uid` in `folder`, to find it again.
+fn fingerprint(
+    connection: &Connection,
+    folder: i64,
+    uid: u32,
+) -> rusqlite::Result<Option<Fingerprint>> {
+    connection
+        .query_row(
+            "SELECT message_id, size, internal_date FROM message WHERE folder = ?1 AND uid = ?2",
+            params![folder, uid],
+            |r| {
+                Ok(Fingerprint {
+                    message_id: r.get(0)?,
+                    size: r.get(1)?,
+                    internal_date: r.get(2)?,
+                })
+            },
+        )
+        .optional()
+}
+
+/// Whether the copy has a message at `uid` in `folder`.
+fn has_message(connection: &Connection, folder: i64, uid: u32) -> rusqlite::Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM message WHERE folder = ?1 AND uid = ?2",
+            params![folder, uid],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Where a message is found again by its fingerprint.
+enum Found {
+    At(u32),
+    Gone,
+    /// The fingerprint lacks what tells a copy from another message (see `find_copy`).
+    Unknown,
+}
+
+/// The lowest UID of `folder` with the message `fingerprint` describes, but those `taken` (a
+/// query on `?1` the folder and `?5` its UIDVALIDITY) names for other rows.
+fn find(
+    connection: &Connection,
+    folder: i64,
+    uidvalidity: u32,
+    message_id: Option<String>,
+    size: Option<i64>,
+    internal_date: Option<i64>,
+    taken: &str,
+) -> rusqlite::Result<Found> {
+    let (Some(message_id), Some(size), Some(internal_date)) = (message_id, size, internal_date)
+    else {
+        return Ok(Found::Unknown);
+    };
+    let uid: Option<u32> = connection.query_row(
+        &format!(
+            "SELECT min(uid) FROM message
+              WHERE folder = ?1 AND message_id = ?2 AND size = ?3 AND internal_date = ?4
+                AND uid NOT IN ({taken})"
+        ),
+        params![folder, message_id, size, internal_date, uidvalidity],
+        |r| r.get(0),
+    )?;
+    Ok(uid.map_or(Found::Gone, Found::At))
+}
+
+/// [`Store::settle`] for the half moves whose message the server still had in `folder`.
+fn settle_sources(
+    transaction: &Transaction,
+    folder: i64,
+    uidvalidity: u32,
+) -> rusqlite::Result<()> {
+    type Row = (i64, u32, u32, Option<String>, Option<i64>, Option<i64>);
+    let rows: Vec<Row> = transaction
+        .prepare_cached(
+            "SELECT id, uidvalidity, uid, message_id, size, internal_date FROM half_move
+              WHERE folder = ?1 ORDER BY id",
+        )?
+        .query_map([folder], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, row_uidvalidity, uid, message_id, size, internal_date) in rows {
+        let found = if row_uidvalidity == uidvalidity {
+            if has_message(transaction, folder, uid)? {
+                continue;
+            }
+            Found::Gone
+        } else {
+            find(
+                transaction,
+                folder,
+                uidvalidity,
+                message_id,
+                size,
+                internal_date,
+                "SELECT uid FROM half_move WHERE folder = ?1 AND uidvalidity = ?5",
+            )?
+        };
+        match found {
+            Found::At(uid) => transaction.execute(
+                "UPDATE half_move SET uidvalidity = ?2, uid = ?3 WHERE id = ?1",
+                params![id, uidvalidity, uid],
+            )?,
+            Found::Gone => transaction.execute("DELETE FROM half_move WHERE id = ?1", [id])?,
+            Found::Unknown => 0,
+        };
+    }
+    Ok(())
+}
+
+/// [`Store::settle`] for the half moves whose copy the server made in `folder`.
+fn settle_targets(
+    transaction: &Transaction,
+    folder: i64,
+    uidvalidity: u32,
+) -> rusqlite::Result<()> {
+    type Row = (
+        i64,
+        Option<u32>,
+        Option<u32>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let rows: Vec<Row> = transaction
+        .prepare_cached(
+            "SELECT id, target_uidvalidity, target_uid, message_id, size, internal_date
+               FROM half_move WHERE target = ?1 ORDER BY id",
+        )?
+        .query_map([folder], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, target_uidvalidity, target_uid, message_id, size, internal_date) in rows {
+        let found = match target_uid {
+            Some(uid) if target_uidvalidity == Some(uidvalidity) => {
+                if has_message(transaction, folder, uid)? {
+                    continue;
+                }
+                Found::Gone
+            }
+            // Renumbered, or never told: a maybe the server did not copy is found nowhere.
+            _ => find(
+                transaction,
+                folder,
+                uidvalidity,
+                message_id,
+                size,
+                internal_date,
+                "SELECT target_uid FROM half_move
+                  WHERE target = ?1 AND target_uidvalidity = ?5 AND target_uid IS NOT NULL",
+            )?,
+        };
+        match found {
+            Found::At(uid) => transaction.execute(
+                "UPDATE half_move SET target_uidvalidity = ?2, target_uid = ?3, maybe = 0
+                  WHERE id = ?1",
+                params![id, uidvalidity, uid],
+            )?,
+            Found::Gone => transaction.execute("DELETE FROM half_move WHERE id = ?1", [id])?,
+            Found::Unknown => 0,
+        };
+    }
+    Ok(())
+}
+
+/// [`Store::settle`] for the `\Deleted` flags left in `folder`. A row of another UIDVALIDITY is
+/// left to [`Store::taken_back`], at the next connection.
+fn settle_deleted_left(
+    transaction: &Transaction,
+    folder: i64,
+    uidvalidity: u32,
+) -> rusqlite::Result<()> {
+    let rows: Vec<(i64, String)> = transaction
+        .prepare_cached("SELECT id, uids FROM deleted_left WHERE folder = ?1 AND uidvalidity = ?2")?
+        .query_map(params![folder, uidvalidity], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, uids) in rows {
+        let uids: Vec<u32> = serde_json::from_str(&uids).unwrap_or_default();
+        let mut left = Vec::new();
+        for uid in &uids {
+            let flags: Option<String> = transaction
+                .query_row(
+                    "SELECT flags FROM message WHERE folder = ?1 AND uid = ?2",
+                    params![folder, uid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if flags.is_some_and(|flags| has_flag(&flags, "\\Deleted")) {
+                left.push(*uid);
+            }
+        }
+        if left.is_empty() {
+            transaction.execute("DELETE FROM deleted_left WHERE id = ?1", [id])?;
+        } else if left != uids {
+            transaction.execute(
+                "UPDATE deleted_left SET uids = ?2 WHERE id = ?1",
+                params![id, serde_json::to_string(&left).expect("numbers serialize")],
+            )?;
+        }
     }
     Ok(())
 }

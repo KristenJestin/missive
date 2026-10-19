@@ -1771,16 +1771,150 @@ async fn a_move_refused_while_its_copy_is_unknown_says_the_message_may_be_in_bot
     eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
     assert_eq!(env.shown_uids("INBOX"), [1, 2, 3, 4]);
 
-    // `status` says so, as a maybe.
-    assert_eq!(
-        env.status_of_alice().await["half_moved"],
+    // Once the archive is synced, its copy is found by its fingerprint: no longer a maybe.
+    let copy = env.id("Archive", 1);
+    half_moved_soon(
+        &env,
         serde_json::json!([{
-            "message": three, "copy": null, "folder": "inbox", "target": "archive",
-            "maybe": true,
-        }])
-    );
+            "message": three, "copy": copy, "folder": "inbox", "target": "archive",
+            "maybe": false,
+        }]),
+    )
+    .await;
     let text = stdout(&env.act(&["status"]).await);
-    assert!(text.contains("may be in both inbox and archive"), "{text}");
+    assert!(text.contains("is in both inbox and archive"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_maybe_half_move_whose_copy_never_landed_settles_once_the_target_is_synced() {
+    // The copy is never made, and its answer never comes; then the target cannot be read.
+    let (server, env, _daemon) = started_with(
+        mailbox().without_move().stall("UID COPY"),
+        &["--action-timeout", "1"],
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    eventually(10, "the copy", || tries(&server, "UID COPY") == 1).await;
+    server.heal();
+    server.refuse("STATUS");
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(event["maybe_copied"], true, "{event}");
+
+    // Nothing was copied, nothing removed: the target's sync finds no copy, and the row leaves.
+    // The target holds another message: an empty folder would not settle anything.
+    server.heal();
+    server.deliver("Archive", message(30));
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(server.uids("Archive"), [1]);
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    half_moved_soon(&env, serde_json::json!([])).await;
+    assert_eq!(env.half_move_rows(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_move_whose_source_was_renumbered_is_found_again_by_its_fingerprint() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["copied"], true, "{event}");
+    eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
+
+    // The server renumbers the inbox: the message is at UID 2 now, and still in both folders.
+    server.heal();
+    server.expunge("INBOX", 1);
+    server.bump_uidvalidity("INBOX");
+    succeeded(&sync_soon(&env).await);
+    eventually(10, "the inbox rebuilt", || env.uids("INBOX") == [1, 2, 3]).await;
+    let found = env.id("INBOX", 2);
+    assert_ne!(found, three);
+    let copy = env.id("Archive", 1);
+    half_moved_soon(
+        &env,
+        serde_json::json!([{
+            "message": found, "copy": copy, "folder": "inbox", "target": "archive",
+            "maybe": false,
+        }]),
+    )
+    .await;
+    assert_eq!(server.uids("Archive"), [1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_settled_half_move_leaves_after_a_complete_sync_but_not_on_a_renumbering() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    until_settled(&env, &mut events).await;
+    eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
+    server.heal();
+    // The archive holds another message, so that removing the copy does not empty it: an empty
+    // folder settles nothing.
+    server.deliver("Archive", message(30));
+
+    // A renumbering of the target empties it in the copy: the row stays, and the copy is found
+    // again under the new UIDVALIDITY.
+    server.bump_uidvalidity("Archive");
+    succeeded(&sync_soon(&env).await);
+    let copy = env.id("Archive", 1);
+    half_moved_soon(
+        &env,
+        serde_json::json!([{
+            "message": three, "copy": copy, "folder": "inbox", "target": "archive",
+            "maybe": false,
+        }]),
+    )
+    .await;
+    assert_eq!(env.half_move_rows(), 1);
+
+    // Another client removes the copy: the next complete sync of the archive deletes the row.
+    server.expunge("Archive", 1);
+    succeeded(&sync_soon(&env).await);
+    half_moved_soon(&env, serde_json::json!([])).await;
+    eventually(10, "the row deleted", || env.half_move_rows() == 0).await;
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+}
+
+/// Waits for the next action event that is not a retry, running a pass after each retry.
+async fn until_settled(env: &Env, events: &mut Events) -> serde_json::Value {
+    loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            return event;
+        }
+        succeeded(&sync_soon(env).await);
+    }
+}
+
+/// Waits until `status` lists `expected` as alice's half moves.
+async fn half_moved_soon(env: &Env, expected: serde_json::Value) {
+    let started = Instant::now();
+    loop {
+        let half_moved = env.status_of_alice().await["half_moved"].clone();
+        if half_moved == expected {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "half_moved is {half_moved}, not {expected}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+impl Env {
+    /// The rows of `half_move`, settled or not.
+    fn half_move_rows(&self) -> i64 {
+        self.copy()
+            .unwrap()
+            .query_row("SELECT count(*) FROM half_move", [], |row| row.get(0))
+            .unwrap()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2612,4 +2746,237 @@ async fn a_deleted_flag_left_in_a_folder_since_deleted_on_the_server_is_let_go()
     }
     // What another client marked is left alone.
     assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_left_is_kept_while_the_server_lists_no_folder_at_all() {
+    let (server, env, _daemon) = started(
+        mailbox()
+            .without_move()
+            .refuse("UID EXPUNGE")
+            .refuse("UID STORE 1 -FLAGS"),
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let one = env.id(PRIVATE_FOLDER, 1);
+    succeeded(&env.act(&["move", &one, "--to", "archive"]).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(
+        env.status_of_alice().await["deleted_left"],
+        serde_json::json!([one])
+    );
+
+    // A bridge still syncing: the folder cannot be selected, and LIST answers OK with nothing,
+    // not even the inbox. That does not tell the folder is gone.
+    server.heal();
+    server.refuse(&format!("SELECT \"{PRIVATE_FOLDER}\""));
+    server.truncate("LIST", 0);
+    // The folder is asked for only once it cannot be selected.
+    let started = Instant::now();
+    while tries(&server, &format!("LIST \"\" \"{PRIVATE_FOLDER}\"")) < 1 {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the folder was not asked for"
+        );
+        succeeded(&sync_soon(&env).await);
+    }
+    assert_eq!(
+        env.status_of_alice().await["deleted_left"],
+        serde_json::json!([one])
+    );
+
+    // Once the server lists its folders again without this one, it is let go.
+    server.heal();
+    server.delete_folder(PRIVATE_FOLDER);
+    succeeded(&sync_soon(&env).await);
+    let started = Instant::now();
+    while env.status_of_alice().await["deleted_left"] != serde_json::json!([]) {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the flag of a deleted folder is still listed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_the_server_never_takes_back_is_said_and_leaves_once_cleared_elsewhere() {
+    let (server, env, _daemon) = started(
+        mailbox()
+            .without_move()
+            .refuse("UID EXPUNGE")
+            .refuse("UID STORE 3 -FLAGS"),
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(server.flags("INBOX", 3), flags(&["\\Deleted"]));
+    let status = env.status_of_alice().await;
+    assert_eq!(status["deleted_left"], serde_json::json!([three]));
+    assert_eq!(status["deleted_refused"], serde_json::json!([]));
+
+    // Taking it back is refused at each pass: after the limit, `status` says so.
+    let started = Instant::now();
+    while env.status_of_alice().await["deleted_refused"] != serde_json::json!([three]) {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "a flag the server never takes back is not said"
+        );
+        succeeded(&sync_soon(&env).await);
+    }
+    let text = stdout(&env.act(&["status"]).await);
+    assert!(text.contains("refused to take it back"), "{text}");
+
+    // Another client clears it: the next sync of the folder sees it gone, and the row leaves.
+    server.set_flags("INBOX", 3, &[]);
+    succeeded(&sync_soon(&env).await);
+    let started = Instant::now();
+    loop {
+        let status = env.status_of_alice().await;
+        if status["deleted_left"] == serde_json::json!([])
+            && status["deleted_refused"] == serde_json::json!([])
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "a flag cleared elsewhere is still listed: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Nothing holds a move of the message back any more.
+    server.heal();
+    succeeded(&env.act(&["move", &three, "--to", PRIVATE_FOLDER]).await);
+    eventually(20, "the message moved", || {
+        server.uids(PRIVATE_FOLDER) == [1, 2]
+    })
+    .await;
+    assert_eq!(server.flags(PRIVATE_FOLDER, 2), Some(Vec::new()));
+}
+
+impl Env {
+    /// The rows of `deleted_left`: the `\Deleted` flags Missive still has to take back.
+    fn deleted_left_rows(&self) -> i64 {
+        self.copy()
+            .unwrap()
+            .query_row("SELECT count(*) FROM deleted_left", [], |row| row.get(0))
+            .unwrap()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_move_is_kept_when_a_renumbered_folder_answers_empty_and_is_found_when_it_fills() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    until_settled(&env, &mut events).await;
+    eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
+    server.heal();
+    assert_eq!(env.half_move_rows(), 1);
+
+    // A bridge still syncing: the inbox has a new UIDVALIDITY and nothing in it yet.
+    for uid in 1..=4 {
+        server.expunge("INBOX", uid);
+    }
+    server.bump_uidvalidity("INBOX");
+    succeeded(&sync_soon(&env).await);
+    eventually(10, "the inbox emptied", || env.uids("INBOX").is_empty()).await;
+    // An empty listing settles nothing: the message may come back.
+    assert_eq!(env.half_move_rows(), 1);
+
+    // It refills: the message is in both folders, and `status` says so.
+    server.deliver("INBOX", message(1).flag("\\Seen"));
+    server.deliver("INBOX", message(2).flag("\\Flagged"));
+    server.deliver("INBOX", message(3));
+    server.deliver("INBOX", message(4).flag("\\Deleted"));
+    succeeded(&sync_soon(&env).await);
+    eventually(10, "the inbox refilled", || {
+        env.uids("INBOX") == [1, 2, 3, 4]
+    })
+    .await;
+    let found = env.id("INBOX", 3);
+    let copy = env.id("Archive", 1);
+    half_moved_soon(
+        &env,
+        serde_json::json!([{
+            "message": found, "copy": copy, "folder": "inbox", "target": "archive",
+            "maybe": false,
+        }]),
+    )
+    .await;
+    assert_eq!(server.uids("Archive"), [1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_left_is_kept_when_the_folder_answers_empty() {
+    let (server, env, _daemon) = started(
+        mailbox()
+            .without_move()
+            .refuse("UID EXPUNGE")
+            .refuse("UID STORE 3 -FLAGS"),
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    until_settled(&env, &mut events).await;
+    assert_eq!(env.deleted_left_rows(), 1);
+    assert_eq!(server.flags("INBOX", 3), flags(&["\\Deleted"]));
+
+    // The same UIDVALIDITY, and an empty listing: nothing says the flag is gone.
+    for uid in 1..=4 {
+        server.expunge("INBOX", uid);
+    }
+    succeeded(&sync_soon(&env).await);
+    eventually(10, "the inbox emptied", || env.uids("INBOX").is_empty()).await;
+    assert_eq!(env.deleted_left_rows(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_left_is_kept_while_a_permanent_delete_of_its_message_waits() {
+    let server = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .folder(Folder::new("INBOX").message(message(1)).message(message(2)))
+        .refuse("UID EXPUNGE")
+        .refuse("UID STORE 1 -FLAGS")
+        .start()
+        .await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    let mut events = Events::subscribe(&env).await;
+    succeeded(&sync_soon(&env).await);
+
+    // The first delete is refused for good and leaves its flag on the server.
+    let one = env.id("INBOX", 1);
+    succeeded(&env.act(&["delete", "--permanently", &one]).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(server.flags("INBOX", 1), flags(&["\\Deleted"]));
+    assert_eq!(env.deleted_left_rows(), 1);
+
+    // A second one waits for its next try, and a sync runs meanwhile: the message is not in the
+    // copy then, but only because it is being deleted.
+    succeeded(&env.act(&["delete", "--permanently", &one]).await);
+    assert_eq!(events.action().await["outcome"], "retried");
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(env.deleted_left_rows(), 1);
+
+    // Refused for good again: the flag is still there, and still said.
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(server.flags("INBOX", 1), flags(&["\\Deleted"]));
+    succeeded(&sync_soon(&env).await);
+    eventually(10, "the message back in the copy", || {
+        env.uids("INBOX") == [1, 2]
+    })
+    .await;
+    assert_eq!(env.deleted_left_rows(), 1);
 }
