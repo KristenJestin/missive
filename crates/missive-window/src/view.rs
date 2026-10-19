@@ -349,7 +349,7 @@ impl Render for MailWindow {
             (Some(problem), _) => Some(problem.clone()),
             (None, Daemon::Stopped) => Some(
                 "The daemon is not running: this is the local copy as it was last synced \
-                 (missive sync starts it)."
+                 (the next action here, or missive sync, starts it)."
                     .to_owned(),
             ),
             _ => None,
@@ -603,15 +603,23 @@ impl MailWindow {
     fn reader(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = div().flex_1().min_w_0().h_full().flex().flex_col();
         match &self.model.reader {
-            Reader::Empty => pane.child(
-                div()
-                    .p_4()
-                    .text_color(palette.muted)
-                    .child("Enter or a click opens a message."),
-            ),
-            Reader::Gone => pane.child(div().p_4().text_color(palette.muted).child(
-                "This message is no longer in the local copy: the server removed or moved it.",
-            )),
+            // The keys act on the list's cursor when no message is open: their questions show
+            // here too.
+            Reader::Empty => pane
+                .children(self.picker(palette, cx))
+                .children(self.confirmation(palette, cx))
+                .child(
+                    div()
+                        .p_4()
+                        .text_color(palette.muted)
+                        .child("Enter or a click opens a message."),
+                ),
+            Reader::Gone => pane
+                .children(self.picker(palette, cx))
+                .children(self.confirmation(palette, cx))
+                .child(div().p_4().text_color(palette.muted).child(
+                    "This message is no longer in the local copy: the server removed or moved it.",
+                )),
             Reader::Open(opened) => {
                 let raw = opened.raw.clone();
                 let opener = self.opener.clone();
