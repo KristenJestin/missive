@@ -1025,6 +1025,75 @@ async fn a_deleted_flag_left_on_an_old_draft_by_a_cut_connection_is_taken_back()
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_recorded_before_the_drafts_folder_was_renumbered_is_never_taken_back() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    let mut daemon = env.daemon_with(&["--action-timeout", "1"]).await;
+    env.ready().await;
+    let mut watcher = env.watch().await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+    // The old version is marked deleted, and the connection is lost before its expunge.
+    server.stall("UID EXPUNGE");
+    env.save(&["--draft", &id, "--subject", "Second"]).await;
+    loop {
+        let event = watcher.next("draft").await;
+        if event["outcome"] == "retried" {
+            assert_eq!(event["reason"], "connection", "{event}");
+            break;
+        }
+    }
+
+    // Another client expunged the old version, and the server renumbered the folder: the new
+    // version is now the UID 1, and a third client marked it for removal. The copy follows the
+    // new UIDVALIDITY before the draft is tried again.
+    server.expunge("Drafts", 1);
+    let uidvalidity = server.bump_uidvalidity("Drafts");
+    server.set_flags("Drafts", 1, &["\\Draft", "\\Seen", "\\Deleted"]);
+    server.heal();
+    server.refuse("SELECT \"Drafts\"");
+    succeeded(&env.run(&["sync"]).await);
+    eventually(20, "the copy of the renumbered folder", || {
+        Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()
+            .and_then(|copy| {
+                copy.query_row(
+                    "SELECT uidvalidity FROM folder WHERE role = 'drafts'",
+                    [],
+                    |r| r.get::<_, u32>(0),
+                )
+                .ok()
+            })
+            == Some(uidvalidity)
+    })
+    .await;
+    server.heal();
+    succeeded(&env.run(&["sync"]).await);
+    settled(&env).await;
+    // A new connection takes back what the earlier ones left.
+    daemon.kill().await;
+    let _daemon = env.daemon().await;
+    env.ready().await;
+    succeeded(&env.run(&["sync"]).await);
+
+    // The UID 1 recorded before the renumbering names another message now: no flag is taken back.
+    assert!(
+        !removals(&server).iter().any(|line| line.contains("-FLAGS")),
+        "{:?}",
+        removals(&server)
+    );
+    assert!(
+        server
+            .flags("Drafts", 1)
+            .unwrap()
+            .contains(&"\\Deleted".to_owned()),
+        "{:?}",
+        server.flags("Drafts", 1)
+    );
+}
+
 /// A server whose IMAP side is reached through a relay, an account on it synced once, and the
 /// relay switched off: the daemon returned is offline.
 async fn imap_down() -> (FakeServer, Relay, Env, Daemon) {

@@ -317,11 +317,17 @@ async fn one(
         // Held as `&mut`: a `&Store` cannot cross an await of a task that may move between
         // threads.
         let held: &mut Store = store;
-        let mark = move |uids: &[u32]| Ok(held.draft_marked_deleted(draft.id, uids)?);
-        let done = actions::remove_marking(server, &old, &draft.marked_deleted, mark).await?;
+        let mark =
+            move |uids: &[u32]| Ok(held.draft_marked_deleted(draft.id, uidvalidity, uids)?);
+        // What an earlier try recorded names other messages once the folder was renumbered.
+        let earlier = match draft.marked_uidvalidity {
+            Some(recorded) if recorded == uidvalidity => draft.marked_deleted.as_slice(),
+            _ => &[],
+        };
+        let done = actions::remove_marking(server, &old, earlier, mark).await?;
         match done {
             Done::Ok(_) => {
-                store.draft_marked_deleted(draft.id, &[])?;
+                store.draft_marked_deleted(draft.id, uidvalidity, &[])?;
                 (old, Left::default())
             }
             // A removal only is tried again; a new version is in, and the older ones are found
