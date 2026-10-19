@@ -29,6 +29,14 @@ protocol version it was written for:
 {"protocol": 1, "request": "sync", "account": "alice"}
 ```
 
+`missive` and the window wait at most 10 seconds for the answer to a request that records
+something (every one but `sync` and `subscribe`), and 120 seconds for one that carries a message to
+queue (`send`, and `draft` with `send`), which may take long to write while a sync holds the copy.
+A daemon that accepts the connection and stays silent longer is reported as one that "did not
+answer"; the request may or may not have been recorded. For a message, the error says it may have
+been queued and to check `missive status` before sending it again: a second `send` queues a second
+message.
+
 Every answer carries `protocol`, the request it answers in `answer` (`null` when the request could
 not be read), and `ok`:
 

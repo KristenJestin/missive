@@ -262,11 +262,13 @@ fn the_reader_keys_open_a_compose_window(cx: &mut TestAppContext) {
         })
     };
     cx.simulate_keystrokes("r");
-    assert!(subjects(cx).is_empty(), "nothing is open");
-    cx.simulate_keystrokes("enter r");
     cx.run_until_parked();
-    assert_eq!(subjects(cx), ["Re: Plan 3"]);
-    cx.simulate_keystrokes("f");
+    assert_eq!(
+        subjects(cx),
+        ["Re: Plan 3"],
+        "nothing is open: the list's cursor is answered"
+    );
+    cx.simulate_keystrokes("enter f");
     cx.run_until_parked();
     assert_eq!(subjects(cx).len(), 2);
     assert!(subjects(cx).contains(&"Fwd: Plan 3".to_owned()));

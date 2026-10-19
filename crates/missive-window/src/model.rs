@@ -141,8 +141,18 @@ pub struct ReadTimer {
 /// The folders a message can be moved to, with the one the keyboard is on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Picker {
+    /// The message to move.
+    message: String,
     pub folders: Vec<FolderRef>,
     pub cursor: usize,
+}
+
+/// The message an action acts on.
+struct Target {
+    id: String,
+    folder: FolderRef,
+    unread: bool,
+    flagged: bool,
 }
 
 /// A message to reduce off the window's thread: [`Reduction::run`] takes up to its budget.
@@ -282,6 +292,22 @@ impl Model {
                 None => self.reader = Reader::Gone,
             }
         }
+        self.drop_stale_dialogs();
+    }
+
+    /// Closes a picker or a confirmation whose message is neither open nor listed any more: it
+    /// would stay on a screen that no longer shows it, and keep the keys from acting.
+    fn drop_stale_dialogs(&mut self) {
+        let message = match (&self.picker, &self.confirm) {
+            (Some(picker), _) => &picker.message,
+            (None, Some(id)) => id,
+            (None, None) => return,
+        };
+        let here = matches!(&self.reader, Reader::Open(opened) if opened.id == *message)
+            || self.messages.iter().any(|m| m.hit.id == *message);
+        if !here {
+            self.dismiss();
+        }
     }
 
     /// Follows one event of the daemon.
@@ -331,6 +357,7 @@ impl Model {
         if self.pane(&key).is_none() {
             return;
         }
+        self.dismiss();
         self.folder = Some(key);
         self.load_messages();
         self.cursor = (!self.messages.is_empty()).then_some(0);
@@ -431,74 +458,103 @@ impl Model {
         self.refresh();
     }
 
-    /// `U`: marks the open message unread; its read timer stops either way.
+    /// The message an action acts on: the open one, else the one under the list's cursor.
+    fn target(&self) -> Option<Target> {
+        if let Reader::Open(opened) = &self.reader {
+            return Some(Target {
+                id: opened.id.clone(),
+                folder: opened.folder.clone(),
+                unread: opened.unread,
+                flagged: opened.flagged,
+            });
+        }
+        let listed = self.messages.get(self.cursor?)?;
+        Some(Target {
+            id: listed.hit.id.clone(),
+            folder: listed.hit.folder.clone(),
+            unread: listed.hit.unread,
+            flagged: listed.flagged,
+        })
+    }
+
+    /// `U`: marks the message unread; its read timer stops either way.
     pub fn mark_unread(&mut self) {
         if self.modal() {
             return;
         }
         self.reading = None;
-        if let Reader::Open(opened) = &self.reader
-            && !opened.unread
+        if let Some(target) = self.target()
+            && !target.unread
         {
-            let id = opened.id.clone();
             self.ask(Command::Mark {
-                messages: vec![id],
+                messages: vec![target.id],
                 mark_as: "unread".to_owned(),
             });
         }
     }
 
-    /// `S`: flags the open message, or takes its flag off.
+    /// `S`: flags the message, or takes its flag off.
     pub fn toggle_flag(&mut self) {
         if self.modal() {
             return;
         }
-        if let Reader::Open(opened) = &self.reader {
-            let mark_as = if opened.flagged {
+        if let Some(target) = self.target() {
+            let mark_as = if target.flagged {
                 "unflagged"
             } else {
                 "flagged"
             };
-            let id = opened.id.clone();
             self.ask(Command::Mark {
-                messages: vec![id],
+                messages: vec![target.id],
                 mark_as: mark_as.to_owned(),
             });
         }
     }
 
-    /// Whether the open message can be archived: its account has a folder of the role `archive`,
-    /// and the message is not in it.
+    /// Whether the message can be archived: its account has a folder of the role `archive`, and
+    /// the message is not in it.
     pub fn can_archive(&self) -> bool {
-        let Reader::Open(opened) = &self.reader else {
+        let Some(target) = self.target() else {
             return false;
         };
-        self.folders_of(&opened.id)
+        self.folders_of(&target.id)
             .iter()
-            .any(|f| f.role.as_deref() == Some("archive") && f.id != opened.folder.id)
+            .any(|f| f.role.as_deref() == Some("archive") && f.id != target.folder.id)
     }
 
-    /// `A`: moves the open message to the account's archive.
+    /// `A`: moves the message to the account's archive.
     pub fn archive(&mut self) {
-        if !self.modal() && self.can_archive() {
-            self.move_open("archive".to_owned());
+        if !self.modal()
+            && self.can_archive()
+            && let Some(target) = self.target()
+        {
+            self.leave(
+                target.id.clone(),
+                Command::Move {
+                    messages: vec![target.id],
+                    to: "archive".to_owned(),
+                },
+            );
         }
     }
 
-    /// `M`: opens the folder picker for the open message: every folder of its account but its
-    /// own.
+    /// `M`: opens the folder picker for the message: every folder of its account but its own.
     pub fn pick_folder(&mut self) {
         if self.modal() {
             return;
         }
-        if let Reader::Open(opened) = &self.reader {
+        if let Some(target) = self.target() {
             let folders: Vec<FolderRef> = self
-                .folders_of(&opened.id)
+                .folders_of(&target.id)
                 .into_iter()
-                .filter(|f| f.id != opened.folder.id)
+                .filter(|f| f.id != target.folder.id)
                 .collect();
             if !folders.is_empty() {
-                self.picker = Some(Picker { folders, cursor: 0 });
+                self.picker = Some(Picker {
+                    message: target.id,
+                    folders,
+                    cursor: 0,
+                });
             }
         }
     }
@@ -513,18 +569,24 @@ impl Model {
         }
     }
 
-    /// Moves the open message to the folder under the picker's cursor.
+    /// Moves the message to the folder under the picker's cursor.
     pub fn choose_folder(&mut self) {
         if let Some(picker) = self.picker.take()
             && let Some(folder) = picker.folders.get(picker.cursor)
         {
             // A role is looked for first by the daemon: a folder that has one is named by it.
             let to = folder.role.clone().unwrap_or_else(|| folder.name.clone());
-            self.move_open(to);
+            self.leave(
+                picker.message.clone(),
+                Command::Move {
+                    messages: vec![picker.message],
+                    to,
+                },
+            );
         }
     }
 
-    /// Moves the open message to the folder at `at` of the picker.
+    /// Moves the message to the folder at `at` of the picker.
     pub fn choose_folder_at(&mut self, at: usize) {
         if let Some(picker) = &mut self.picker {
             picker.cursor = at.min(picker.folders.len() - 1);
@@ -532,39 +594,45 @@ impl Model {
         self.choose_folder();
     }
 
-    /// `Delete`: moves the open message to the trash. In the trash, it is deleted for good, and
-    /// only once the user confirms it.
+    /// `Delete`: moves the message to the trash. In the trash, it is deleted for good, and only
+    /// once the user confirms it.
     pub fn delete(&mut self) {
         if self.modal() {
             return;
         }
-        let Reader::Open(opened) = &self.reader else {
+        let Some(target) = self.target() else {
             return;
         };
-        let id = opened.id.clone();
-        if self.deletes_for_good() {
-            self.confirm = Some(id);
+        if target.folder.role.as_deref() == Some("trash") {
+            self.confirm = Some(target.id);
             return;
         }
-        self.leave(Command::Delete {
-            messages: vec![id],
-            permanently: false,
-        });
+        self.leave(
+            target.id.clone(),
+            Command::Delete {
+                messages: vec![target.id],
+                permanently: false,
+            },
+        );
     }
 
-    /// Whether `Delete` deletes the open message for good: only in the trash. In an account
-    /// that has none, the daemon refuses the move (`no-trash`), and the notice says so.
+    /// Whether `Delete` deletes the message for good: only in the trash. In an account that has
+    /// none, the daemon refuses the move (`no-trash`), and the notice says so.
     pub fn deletes_for_good(&self) -> bool {
-        matches!(&self.reader, Reader::Open(opened) if opened.folder.role.as_deref() == Some("trash"))
+        self.target()
+            .is_some_and(|target| target.folder.role.as_deref() == Some("trash"))
     }
 
     /// The user confirmed deleting a message for good.
     pub fn confirm_delete(&mut self) {
         if let Some(id) = self.confirm.take() {
-            self.leave(Command::Delete {
-                messages: vec![id],
-                permanently: true,
-            });
+            self.leave(
+                id.clone(),
+                Command::Delete {
+                    messages: vec![id],
+                    permanently: true,
+                },
+            );
         }
     }
 
@@ -584,20 +652,32 @@ impl Model {
         self.requests.push_back(command);
     }
 
-    fn move_open(&mut self, to: String) {
-        if let Reader::Open(opened) = &self.reader {
-            let id = opened.id.clone();
-            self.leave(Command::Move {
-                messages: vec![id],
-                to,
-            });
-        }
-    }
-
-    /// Asks for a request that takes the open message away: the reader closes.
-    fn leave(&mut self, command: Command) {
+    /// Asks for a request that takes message `id` away, and moves on as most mail clients do: if
+    /// it is open, the message below it opens, else the one above, else the reader closes; if it
+    /// is only under the cursor, the cursor goes to that message, so that a second key does not
+    /// ask for the same one again.
+    fn leave(&mut self, id: String, command: Command) {
         self.ask(command);
-        self.back();
+        let next = self
+            .messages
+            .iter()
+            .position(|m| m.hit.id == id)
+            .and_then(|at| {
+                if at + 1 < self.messages.len() {
+                    Some(at + 1)
+                } else {
+                    at.checked_sub(1)
+                }
+            });
+        let open = matches!(&self.reader, Reader::Open(opened) if opened.id == id);
+        match (open, next) {
+            (true, Some(next)) => {
+                let next = self.messages[next].hit.id.clone();
+                self.open(&next);
+            }
+            (true, None) => self.back(),
+            (false, next) => self.cursor = next.or(self.cursor),
+        }
     }
 
     /// The folders of the account a message is of.
@@ -636,6 +716,7 @@ impl Model {
         if let Reader::Open(opened) = &self.reader {
             let id = opened.id.clone();
             self.reader = self.read(&id);
+            self.drop_stale_dialogs();
         }
     }
 
@@ -842,10 +923,8 @@ impl Model {
             Start::ReplyAll => Some(Mode::ReplyAll),
             Start::Forward => None,
         };
-        let Reader::Open(opened) = &self.reader else {
-            return None;
-        };
-        let account = MessageId::parse(&opened.id)?.account;
+        let (id, raw, subject) = self.answered_message()?;
+        let account = MessageId::parse(&id)?.account;
         let answering = self
             .sources
             .accounts
@@ -853,13 +932,7 @@ impl Model {
             .map_err(|e| format!("the account cannot be read ({e})"))
             .and_then(|found| found.ok_or_else(|| format!("no account {account}")))
             .and_then(|found| {
-                reply::answering(
-                    &opened.id,
-                    &opened.raw,
-                    opened.subject.as_deref(),
-                    mode,
-                    &found.address,
-                )
+                reply::answering(&id, &raw, subject.as_deref(), mode, &found.address)
             });
         match answering {
             Ok(answering) => Some(Compose::answering(accounts, account, answering)),
@@ -867,6 +940,26 @@ impl Model {
                 self.notice = Some(format!("Cannot answer: {e}."));
                 None
             }
+        }
+    }
+
+    /// The message a reply or a forward starts from, with its source and subject: the open one,
+    /// else the one under the list's cursor.
+    fn answered_message(&mut self) -> Option<(String, Vec<u8>, Option<String>)> {
+        if let Reader::Open(opened) = &self.reader {
+            return Some((
+                opened.id.clone(),
+                opened.raw.clone(),
+                opened.subject.clone(),
+            ));
+        }
+        let id = self.under_cursor()?.to_owned();
+        match self.copy() {
+            Ok(Some(copy)) => match copy.message(&id) {
+                Ok(Ok(stored)) => Some((stored.hit.id, stored.raw, stored.hit.subject)),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
