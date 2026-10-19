@@ -125,9 +125,14 @@ pub async fn send_next(
     let message_id = message.message_id;
     Ok(Some(match submitted {
         Ok(Submitted::Sent) => {
+            // A folder that cannot be read is not an answer: the copy is left to the IMAP worker,
+            // which looks again. What was sent is recorded whatever these reads say.
             let sent_copy = if !message.sent_copy {
                 "server"
-            } else if store.sent_folder(key)?.is_none() && store.knows_folders(key)? {
+            } else if matches!(
+                (store.sent_folder(key), store.knows_folders(key)),
+                (Ok(None), Ok(true))
+            ) {
                 "none"
             } else {
                 "append"
