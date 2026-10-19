@@ -65,7 +65,8 @@
 #![doc = include_str!("store/schema-9.sql")]
 //! ```
 //!
-//! Version 10 adds the draft of another client a message of the outbox was sent from:
+//! Version 10 adds the moves the server refused after it had copied the messages, the numbers
+//! given to actions, and what the server can do:
 //!
 //! ```sql
 #![doc = include_str!("store/schema-10.sql")]
@@ -109,7 +110,8 @@ mod queue;
 
 pub use drafts::{DraftRow, Stored};
 pub use outbox::{Left, Retaken, SentCopy, ToSend};
-pub use queue::{Action, ActionFolder};
+pub(crate) use queue::HALF_MOVE_LEFT;
+pub use queue::{Action, ActionFolder, Fingerprint};
 
 /// The local copy, opened for writing.
 pub struct Store {
@@ -218,6 +220,19 @@ impl Store {
     }
 
     /// Records an account's connection state, and when `synced` that a complete sync just ended.
+    /// Records what the account's server can do, as its connection found it.
+    pub fn set_capabilities(
+        &self,
+        account: i64,
+        capabilities: crate::sync::Capabilities,
+    ) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE account SET can_move = ?2, can_uidplus = ?3 WHERE key = ?1",
+            params![account, capabilities.moves, capabilities.uidplus],
+        )?;
+        Ok(())
+    }
+
     pub fn set_state(&self, account: i64, state: &str, synced: bool) -> rusqlite::Result<()> {
         if synced {
             self.connection.execute(

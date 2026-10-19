@@ -23,7 +23,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{SCHEMA_VERSION, SkippedFolder};
+use crate::store::{HALF_MOVE_LEFT, SCHEMA_VERSION, SkippedFolder};
 
 /// Roles whose unread messages are left out of every total: nobody wants a badge for spam.
 const NOT_COUNTED: [&str; 2] = ["trash", "junk"];
@@ -55,6 +55,9 @@ const DRAFTS_VERSION: i64 = 7;
 /// The first schema version that records when a queued message is tried next (and, for a claimed
 /// one, when it was claimed).
 const RETRY_VERSION: i64 = 9;
+
+/// The first schema version that records the moves refused after their copy.
+const HALF_MOVE_VERSION: i64 = 10;
 
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
@@ -184,6 +187,19 @@ pub struct WaitingDraft {
     /// The tries that failed, and the last error.
     pub attempts: u32,
     pub last_error: Option<String>,
+}
+
+/// A message whose move the server refused after it had copied it: it is in both folders until
+/// the user removes one of them (`missive status`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HalfMoved {
+    /// Its identifier, in the folder it was to leave.
+    pub message: String,
+    /// The identifier of its copy in the target, when the server told its UID.
+    pub copy: Option<String>,
+    /// The folder it was to leave and its target: their roles, else their names.
+    pub folder: String,
+    pub target: String,
 }
 
 /// A folder of an account.
@@ -497,6 +513,39 @@ impl Copy {
                 last_sync: r.get(2)?,
                 messages: r.get::<_, i64>(3)? as u64,
                 skipped: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The messages of an account left in both folders by a move refused after their copy,
+    /// oldest first; empty in a copy older than them.
+    pub fn half_moved(&self, account: &str) -> Result<Vec<HalfMoved>> {
+        if self.version < HALF_MOVE_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare_cached(&format!(
+            "SELECT half_move.folder, half_move.uidvalidity, half_move.uid, half_move.target,
+                    half_move.target_uidvalidity, half_move.target_uid,
+                    coalesce(source.role, source.name), coalesce(target.role, target.name)
+               FROM half_move JOIN account ON account.key = half_move.account
+                    JOIN folder AS source ON source.id = half_move.folder
+                    JOIN folder AS target ON target.id = half_move.target
+              WHERE account.id = ?1 AND {HALF_MOVE_LEFT}
+              ORDER BY half_move.id"
+        ))?;
+        let rows = statement.query_map([account], |r| {
+            let copy = match (r.get::<_, Option<u32>>(4)?, r.get::<_, Option<u32>>(5)?) {
+                (Some(uidvalidity), Some(uid)) => {
+                    Some(message_id(account, r.get(3)?, uidvalidity, uid))
+                }
+                _ => None,
+            };
+            Ok(HalfMoved {
+                message: message_id(account, r.get(0)?, r.get(1)?, r.get(2)?),
+                copy,
+                folder: r.get(6)?,
+                target: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

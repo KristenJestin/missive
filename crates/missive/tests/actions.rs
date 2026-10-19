@@ -280,6 +280,20 @@ impl Env {
             .map(|(_, _, flags)| flags)
     }
 
+    /// The raw message of the copy, by the server's folder name and UID.
+    fn raw(&self, folder: &str, uid: u32) -> Option<Vec<u8>> {
+        self.copy()?
+            .query_row(
+                "SELECT message_raw.raw FROM message_raw
+                   JOIN message ON message.id = message_raw.message
+                   JOIN folder ON folder.id = message.folder
+                  WHERE folder.name = ?1 AND message.uid = ?2",
+                rusqlite::params![folder, uid],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
     /// An account's connection state in the copy.
     fn state(&self, id: &str) -> Option<String> {
         self.copy()?
@@ -689,6 +703,9 @@ async fn a_move_on_a_server_with_only_uidplus_copies_then_expunges_only_that_uid
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_without_move_or_uidplus_refuses_the_move_and_nothing_changes() {
     let (server, env, _daemon) = started(mailbox().without_move().without_uidplus()).await;
+    // As a copy that does not know the server's capabilities yet: the action is queued, and the
+    // worker refuses it.
+    env.forget_capabilities();
     let before = env.messages();
     let from = server.imap_log().len();
 
@@ -1221,7 +1238,7 @@ async fn watch_tells_when_an_action_is_applied_retried_or_refused() {
         next_action().await,
         serde_json::json!({
             "protocol": 1, "event": "action", "account": "alice", "action": "read",
-            "outcome": "applied", "messages": [three],
+            "outcome": "applied", "messages": [three], "id": 1,
         })
     );
     server.refuse("UID STORE");
@@ -1230,12 +1247,14 @@ async fn watch_tells_when_an_action_is_applied_retried_or_refused() {
         next_action().await,
         serde_json::json!({
             "protocol": 1, "event": "action", "account": "alice", "action": "flagged",
-            "outcome": "retried", "messages": [three], "reason": "refused", "attempts": 1,
+            "outcome": "retried", "messages": [three], "id": 2, "reason": "refused",
+            "attempts": 1,
         })
     );
     server.heal();
     succeeded(&sync_soon(&env).await);
     assert_eq!(next_action().await["outcome"], "applied");
+    env.forget_capabilities();
     succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
     let refused = next_action().await;
     assert_eq!(refused["action"], "move");
@@ -1552,4 +1571,449 @@ async fn after_an_action_the_sync_goes_back_to_examine_before_any_fetch() {
     );
     assert!(!after.iter().any(|c| c.starts_with("SELECT")), "{log:?}");
     assert!(after.iter().any(|c| c == "EXAMINE \"INBOX\""), "{log:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_whose_answer_never_came_is_not_trusted_to_another_message_with_its_message_id() {
+    // Another message with the same Message-ID arrives in the target meanwhile: the same message
+    // received again later (another INTERNALDATE), or another message (another size).
+    let impostors = [
+        message(3).internal_date("02-Jan-2026 10:00:00 +0000"),
+        Message::new(
+            "Message-ID: <3@example.com>\r\n\
+             \r\n\
+             Not the same message at all.\r\n",
+        ),
+    ];
+    for impostor in impostors {
+        let (server, env, _daemon) = started_with(
+            mailbox().without_move().stall("UID COPY"),
+            &["--action-timeout", "1"],
+        )
+        .await;
+        let original = server.raw("INBOX", 3).unwrap();
+        succeeded(
+            &env.act(&["move", &env.id("INBOX", 3), "--to", "archive"])
+                .await,
+        );
+        // The server never ran it, and never answered.
+        eventually(10, "the COPY", || tries(&server, "UID COPY") == 1).await;
+        server.deliver("Archive", impostor);
+        server.heal();
+
+        eventually(30, "the queue empty", || env.queue() == 0).await;
+        succeeded(&sync_soon(&env).await);
+
+        // Looked for, found, but not trusted: copied again before the source lost it.
+        assert_eq!(
+            tries(&server, "UID SEARCH UID"),
+            1,
+            "{:?}",
+            server.imap_log()
+        );
+        assert_eq!(tries(&server, "UID COPY"), 2, "{:?}", server.imap_log());
+        removed_after_the_last_copy(&server);
+        assert_eq!(server.uids("Archive"), [1, 2]);
+        assert_eq!(
+            server.raw("Archive", 2).unwrap(),
+            original,
+            "the second message of the archive is the real copy"
+        );
+        assert_eq!(server.uids("INBOX"), [1, 2, 4]);
+        assert_eq!(env.uids("Archive"), [1, 2]);
+        assert_eq!(env.uids("INBOX"), [1, 2, 4]);
+    }
+}
+
+impl Env {
+    /// `missive status --json`, the account `alice`.
+    async fn status_of_alice(&self) -> serde_json::Value {
+        let output = self.act(&["status", "--json"]).await;
+        succeeded(&output);
+        let status: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        status["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "alice")
+            .unwrap()
+            .clone()
+    }
+}
+
+/// A subscription to the daemon's events.
+struct Events(tokio::io::Lines<BufReader<UnixStream>>);
+
+impl Events {
+    async fn subscribe(env: &Env) -> Events {
+        let mut stream = UnixStream::connect(env.socket()).await.unwrap();
+        stream
+            .write_all(b"{\"protocol\":1,\"request\":\"subscribe\"}\n")
+            .await
+            .unwrap();
+        Events(BufReader::new(stream).lines())
+    }
+
+    /// The next `action` event.
+    async fn action(&mut self) -> serde_json::Value {
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(30), self.0.next_line())
+                .await
+                .expect("an event in time")
+                .unwrap()
+                .unwrap();
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if event["event"] == "action" {
+                return event;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_refused_after_its_copy_says_the_message_is_in_both_folders_and_removes_nothing() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    for pass in 1..=5 {
+        let event = events.action().await;
+        assert_eq!(
+            event["outcome"],
+            if pass < 5 { "retried" } else { "refused" }
+        );
+        if pass < 5 {
+            succeeded(&sync_soon(&env).await);
+        } else {
+            assert_eq!(event["copied"], true, "{event}");
+            let message = event["message"].as_str().unwrap();
+            assert!(message.contains("both"), "{message}");
+        }
+    }
+
+    // Nothing was removed: the message is in both folders, on the server and in the copy.
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(server.flags("INBOX", 3), Some(Vec::new()));
+    assert_eq!(server.uids("Archive"), [1]);
+    eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
+    assert_eq!(env.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(env.shown_uids("INBOX"), [1, 2, 3, 4]);
+
+    // `status` says so, until the user removed one of the two.
+    let copy = env.id("Archive", 1);
+    assert_eq!(
+        env.status_of_alice().await["half_moved"],
+        serde_json::json!([{
+            "message": three, "copy": copy, "folder": "inbox", "target": "archive",
+        }])
+    );
+    let text = stdout(&env.act(&["status"]).await);
+    assert!(text.contains("in both inbox and archive"), "{text}");
+    // A pass does not forget it.
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(
+        env.status_of_alice().await["half_moved"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The user deletes the copy in the archive: nothing is left half moved.
+    server.heal();
+    succeeded(&env.act(&["delete", &copy]).await);
+    eventually(20, "the queue empty", || env.queue() == 0).await;
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(server.uids("Archive"), Vec::<u32>::new());
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(
+        env.status_of_alice().await["half_moved"],
+        serde_json::json!([])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_move_whose_source_was_renumbered_writes_no_copy_of_another_message() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    // The copy is made, the removal refused: the action waits for its next try.
+    assert_eq!(events.action().await["outcome"], "retried");
+    assert_eq!(server.uids("Archive"), [1]);
+    let copy_on_the_server = server.raw("Archive", 1).unwrap();
+
+    // The server renumbers the inbox before that try; the UID 3 now names another message.
+    server.expunge("INBOX", 1);
+    server.bump_uidvalidity("INBOX");
+    let other = server.raw("INBOX", 3).unwrap();
+    assert!(other != copy_on_the_server);
+    succeeded(&sync_soon(&env).await);
+    let event = loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            break event;
+        }
+        succeeded(&sync_soon(&env).await);
+    };
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(event["reason"], "renumbered", "{event}");
+    assert_eq!(event["copied"], true, "{event}");
+
+    // The archive of the copy is the one the server has, never the other message.
+    succeeded(&sync_soon(&env).await);
+    eventually(20, "the archive in the copy", || env.uids("Archive") == [1]).await;
+    assert!(
+        env.raw("Archive", 1).unwrap() == copy_on_the_server,
+        "the copy of the archive is not the one the server has"
+    );
+}
+
+/// The JSON object a `--json` command printed.
+fn json(output: &Output) -> serde_json::Value {
+    serde_json::from_str(&stdout(output))
+        .unwrap_or_else(|e| panic!("{e}: {}\n{}", stdout(output), stderr(output)))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_answers_once_the_server_applied_a_mark_a_move_and_a_delete() {
+    let (server, env, _daemon) = started(mailbox()).await;
+    let three = env.id("INBOX", 3);
+    let two = env.id("INBOX", 2);
+    let one = env.id("INBOX", 1);
+
+    let output = env
+        .act(&["mark", &three, "--read", "--wait", "--json"])
+        .await;
+    succeeded(&output);
+    // Already on the server when the command answers.
+    assert_eq!(server.flags("INBOX", 3), flags(&["\\Seen"]));
+    let answer = json(&output);
+    assert_eq!(answer["messages"], serde_json::json!([three]));
+    assert_eq!(answer["outcome"], "applied");
+    let actions = answer["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["outcome"], "applied");
+    assert!(actions[0]["id"].is_number(), "{answer}");
+
+    let output = env.act(&["move", &two, "--to", "archive", "--wait"]).await;
+    succeeded(&output);
+    assert_eq!(server.uids("INBOX"), [1, 3, 4]);
+    assert_eq!(server.uids("Archive"), [1]);
+    let text = stdout(&output);
+    assert!(text.contains("applied on the server"), "{text}");
+
+    let output = env.act(&["delete", &one, "--wait", "--json"]).await;
+    succeeded(&output);
+    assert_eq!(server.uids("INBOX"), [3, 4]);
+    assert_eq!(server.uids("Trash"), [1, 2, 3]);
+    assert_eq!(json(&output)["outcome"], "applied");
+}
+
+/// The exit status of `--wait` when the server refused an action.
+const REFUSED: i32 = 5;
+/// The exit status of `--wait` when an action is still in the queue.
+const QUEUED: i32 = 4;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_tells_an_action_the_server_refused_apart() {
+    let (_server, env, _daemon) = started(mailbox().bad("UID MOVE")).await;
+    let three = env.id("INBOX", 3);
+
+    let output = env
+        .act(&["move", &three, "--to", "archive", "--wait", "--json"])
+        .await;
+    assert_eq!(output.status.code(), Some(REFUSED), "{}", stderr(&output));
+    let answer = json(&output);
+    assert_eq!(answer["outcome"], "refused");
+    assert_eq!(answer["actions"][0]["outcome"], "refused");
+    assert_eq!(answer["actions"][0]["reason"], "refused");
+    assert!(answer["actions"][0]["message"].is_string(), "{answer}");
+
+    let output = env
+        .act(&["move", &three, "--to", "archive", "--wait"])
+        .await;
+    assert_eq!(output.status.code(), Some(REFUSED));
+    assert!(stdout(&output).contains("refused"), "{}", stdout(&output));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_on_an_account_that_is_offline_says_the_action_is_still_queued_at_once() {
+    let (_server, _relay, env) = offline().await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    eventually(10, "unreachable", || {
+        env.state("alice").as_deref() == Some("unreachable")
+    })
+    .await;
+
+    let started = Instant::now();
+    let output = env
+        .act(&["mark", &env.id("INBOX", 3), "--read", "--wait", "--json"])
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(output.status.code(), Some(QUEUED), "{}", stderr(&output));
+    let answer = json(&output);
+    assert_eq!(answer["outcome"], "queued");
+    assert_eq!(answer["actions"][0]["outcome"], "queued");
+    assert_eq!(answer["actions"][0]["reason"], "unreachable");
+    // Recorded all the same, and shown at once.
+    assert_eq!(env.queue(), 1);
+    assert_eq!(env.flags("INBOX", 3).as_deref(), Some("\\Seen"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_gives_up_after_its_timeout_while_the_server_keeps_refusing_for_now() {
+    let (server, env, _daemon) = started(mailbox()).await;
+    server.refuse("UID STORE");
+
+    let started = Instant::now();
+    let output = env
+        .act(&[
+            "mark",
+            &env.id("INBOX", 3),
+            "--read",
+            "--wait",
+            "--timeout",
+            "2",
+            "--json",
+        ])
+        .await;
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(2) && waited < Duration::from_secs(10),
+        "{waited:?}"
+    );
+    assert_eq!(output.status.code(), Some(QUEUED), "{}", stderr(&output));
+    let answer = json(&output);
+    assert_eq!(answer["outcome"], "queued");
+    assert_eq!(answer["actions"][0]["reason"], "timeout");
+    assert_eq!(env.queue(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_with_no_daemon_running_does_not_believe_the_state_the_last_one_left() {
+    let (server, relay, env) = offline().await;
+    let mut daemon = env.daemon(&["--check-interval", "3600"]).await;
+    eventually(10, "unreachable", || {
+        env.state("alice").as_deref() == Some("unreachable")
+    })
+    .await;
+    assert!(daemon.stop("-TERM").await.success());
+    assert_eq!(env.state("alice").as_deref(), Some("unreachable"));
+    // The server is back; the command starts a daemon, which connects.
+    relay.up.store(true, Ordering::SeqCst);
+
+    let output = env
+        .act(&["mark", &env.id("INBOX", 3), "--read", "--wait", "--json"])
+        .await;
+    succeeded(&output);
+    assert_eq!(json(&output)["outcome"], "applied");
+    assert_eq!(server.flags("INBOX", 3), flags(&["\\Seen"]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_with_a_daemon_older_than_the_command_says_it_cannot_tell() {
+    let env = Env::new().await;
+    std::fs::create_dir_all(env.socket().parent().unwrap()).unwrap();
+    // A daemon from before `--wait`: its answer to `mark` has no `actions`.
+    let listener = tokio::net::UnixListener::bind(env.socket()).unwrap();
+    let old_daemon = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap();
+            write
+                .write_all(b"{\"protocol\":1,\"answer\":\"subscribe\",\"ok\":true}\n")
+                .await
+                .unwrap();
+            lines.next_line().await.unwrap();
+            write
+                .write_all(
+                    b"{\"protocol\":1,\"answer\":\"mark\",\"ok\":true,\
+                      \"messages\":[\"alice/1/100/3\"]}\n",
+                )
+                .await
+                .unwrap();
+            // The daemon stays connected: the command must not wait for its timeout.
+            let _ = lines.next_line().await;
+        }
+    });
+
+    let started = Instant::now();
+    let output = env
+        .act(&["mark", "alice/1/100/3", "--read", "--wait", "--json"])
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let answer = json(&output);
+    assert_eq!(answer["outcome"], "queued", "{answer}");
+    assert_eq!(answer["messages"], serde_json::json!(["alice/1/100/3"]));
+
+    let output = env
+        .act(&["mark", "alice/1/100/3", "--read", "--wait"])
+        .await;
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("older") && text.contains("--wait"), "{text}");
+    assert!(!text.contains("applied"), "{text}");
+    old_daemon.abort();
+}
+
+impl Env {
+    /// Makes the copy forget the server's capabilities, as a copy written before it recorded them.
+    fn forget_capabilities(&self) {
+        Connection::open(self.copy_path())
+            .unwrap()
+            .execute("UPDATE account SET can_move = NULL, can_uidplus = NULL", [])
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_the_server_cannot_do_is_refused_when_asked_once_its_capabilities_are_known() {
+    let (server, env, _daemon) = started(mailbox().without_move().without_uidplus()).await;
+    let before = env.messages();
+    let from = server.imap_log().len();
+
+    for args in [
+        vec!["move", "--to", "archive"],
+        vec!["delete"],
+        vec!["delete", "--permanently"],
+    ] {
+        let folder = if args.contains(&"--permanently") {
+            "Trash"
+        } else {
+            "INBOX"
+        };
+        let id = env.id(folder, 1);
+        let mut args = args.clone();
+        args.push(&id);
+        let output = env.act(&args).await;
+        failed(&output);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(stderr(&output).contains("UIDPLUS"), "{}", stderr(&output));
+        assert_eq!(env.queue(), 0, "{args:?}");
+    }
+    assert_eq!(env.messages(), before);
+    assert!(
+        writes(&server, from).is_empty(),
+        "{:?}",
+        writes(&server, from)
+    );
+    // A mark needs neither.
+    succeeded(&env.act(&["mark", &env.id("INBOX", 3), "--read"]).await);
+
+    // With MOVE but without UIDPLUS, a move is accepted and a permanent delete refused.
+    let (_server, env, _daemon) = started(mailbox().without_uidplus()).await;
+    let output = env
+        .act(&["delete", "--permanently", "--json", &env.id("Trash", 1)])
+        .await;
+    failed(&output);
+    assert!(stderr(&output).contains("UIDPLUS"), "{}", stderr(&output));
+    succeeded(
+        &env.act(&["move", &env.id("INBOX", 3), "--to", "archive"])
+            .await,
+    );
+    eventually(10, "the queue empty", || env.queue() == 0).await;
 }

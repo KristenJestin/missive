@@ -894,7 +894,7 @@ const MONTHS: [&str; 12] = [
 
 /// An IMAP internal date, `17-Oct-2026 09:30:00 +0200` (the day may be one digit after a space),
 /// in seconds since the epoch.
-fn parse_internal_date(text: &str) -> Option<i64> {
+pub(crate) fn parse_internal_date(text: &str) -> Option<i64> {
     let mut parts = text.trim_start().split(' ');
     let mut date = parts.next()?.split('-');
     let mut time = parts.next()?.split(':');

@@ -274,6 +274,7 @@ fn acted(result: std::result::Result<(), act::ActError>) -> Result<()> {
             std::process::exit(act::NOT_FOUND.into());
         }
         Err(act::ActError::Failed(message)) => Err(Failure(message)),
+        Err(act::ActError::Exit(status)) => std::process::exit(status.into()),
     }
 }
 

@@ -199,6 +199,9 @@ pub struct Answer {
     /// The messages an action was recorded for, by identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<String>>,
+    /// The numbers of the actions recorded, as their `action` events give them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<i64>>,
     /// The number of a message put in the outbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbox: Option<i64>,

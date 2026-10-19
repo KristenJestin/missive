@@ -58,6 +58,7 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `no-trash` | a `delete` without `permanently`, in an account that has no trash |
 | `in-trash` | a `delete` without `permanently` of a message already in the trash |
 | `not-in-trash` | a `delete` with `permanently` of a message outside the trash, in an account that has one |
+| `unsupported` | a `move`, `delete` or `delete` with `permanently` the account's server cannot apply safely: it has neither `MOVE` nor `UIDPLUS` (a move), or no `UIDPLUS` (a permanent delete). Known from the server's capabilities, recorded at each connection; before the first one, the action is recorded, and refused when tried (`docs/events.md`) |
 | `busy` | a message whose move waits for the server: it takes no other action until then; or a `draft` naming a draft whose message waits in the outbox |
 | `uncertain` | a `resend` without `yes` of an `uncertain` message: the server may have taken it already |
 | `not-failed` | a `resend` or a `discard` of a message that is neither `failed` nor `uncertain` (`message` says its state) |
@@ -107,8 +108,14 @@ the copy, in one transaction, and answered: nothing waits for the server, which 
 unreachable. The answer gives the identifiers recorded, each once, in the order of the request:
 
 ```json
-{"protocol": 1, "answer": "mark", "ok": true, "messages": ["alice/1/1745112/4"]}
+{"protocol": 1, "answer": "mark", "ok": true, "messages": ["alice/1/1745112/4"], "actions": [12]}
 ```
+
+`actions` gives the numbers of the actions recorded, one per folder of the messages: the `id` of
+their `action` events. A number names one action for ever, never another one later. To follow a
+request until the server applied it (as `missive mark --wait` does), a client subscribes, then
+sends the request on the same connection: the events that come before the answer are kept and
+matched once the answer gives the numbers.
 
 A request that cannot apply to one of its messages records nothing, and is answered with one of
 the errors above. The daemon then applies the queue on the server, in order, when the account is
