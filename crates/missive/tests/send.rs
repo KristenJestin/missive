@@ -134,6 +134,11 @@ impl Env {
         AccountStore::new(self.path("config").join("missive"))
             .save("alice", &account, setup.certificate.as_ref())
             .unwrap();
+        self.set_password(PASSWORD).await;
+    }
+
+    /// Takes the account's password out of the keyring.
+    async fn remove_password(&self) {
         let connection = zbus::connection::Builder::address(self.keyring.address())
             .unwrap()
             .build()
@@ -142,7 +147,22 @@ impl Env {
         Keyring::open_on(connection)
             .await
             .unwrap()
-            .store("alice", &Password::new(PASSWORD.to_owned()))
+            .delete("alice")
+            .await
+            .unwrap();
+    }
+
+    /// Puts `password` in the keyring as the account's.
+    async fn set_password(&self, password: &str) {
+        let connection = zbus::connection::Builder::address(self.keyring.address())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        Keyring::open_on(connection)
+            .await
+            .unwrap()
+            .store("alice", &Password::new(password.to_owned()))
             .await
             .unwrap();
     }
@@ -1287,6 +1307,83 @@ async fn a_new_message_does_not_cut_short_the_wait_after_a_refused_login() {
     // Waiting is not losing: both go once the server takes the login.
     server.heal();
     took(&server, 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_fixed_during_the_wait_after_a_refused_login_ends_the_wait() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    env.set_password("a-wrong-password").await;
+    let _daemon = env.daemon().await;
+    succeeded(&env.compose(&["--body", BODY]).await);
+    // The third refusal starts a wait of 4 seconds.
+    eventually(20, "three refused logins", || {
+        env.outbox()
+            .first()
+            .is_some_and(|(_, _, attempts)| *attempts >= 3)
+    })
+    .await;
+
+    // The user fixes the password, and tells the daemon what it already listens to.
+    let fixed = Instant::now();
+    env.set_password(PASSWORD).await;
+    succeeded(&env.run(&["sync"]).await);
+
+    eventually(3, "the message sent before the wait ended", || {
+        server.smtp_messages().len() == 1
+    })
+    .await;
+    assert!(fixed.elapsed() < Duration::from_secs(3));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_that_comes_during_the_wait_for_one_ends_the_wait() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    env.remove_password().await;
+    let _daemon = env.daemon().await;
+    succeeded(&env.compose(&["--body", BODY]).await);
+    // The third wait is 4 seconds.
+    eventually(20, "three waits for a password", || {
+        env.logs().matches("no password in the keyring").count() >= 3
+    })
+    .await;
+
+    let fixed = Instant::now();
+    env.set_password(PASSWORD).await;
+    env.run(&["sync"]).await;
+
+    eventually(3, "the message sent before the wait ended", || {
+        server.smtp_messages().len() == 1
+    })
+    .await;
+    assert!(fixed.elapsed() < Duration::from_secs(3));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sync_with_the_same_wrong_password_does_not_end_the_wait_after_a_refused_login() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    env.set_password("a-wrong-password").await;
+    let _daemon = env.daemon().await;
+    succeeded(&env.compose(&["--body", BODY]).await);
+    eventually(20, "two refused logins", || {
+        env.outbox()
+            .first()
+            .is_some_and(|(_, _, attempts)| *attempts >= 2)
+    })
+    .await;
+    let tries = env.outbox()[0].2;
+
+    // The account stays `auth-refused`: the sync fails.
+    env.run(&["sync"]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Asking again with the password that was refused would only be refused again.
+    assert_eq!(env.outbox()[0].2, tries, "{:?}", env.outbox());
 }
 
 /// Holds the answer to the end of data for 2 seconds, then, once the server has it in hand, makes

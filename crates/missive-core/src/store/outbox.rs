@@ -197,6 +197,15 @@ impl Store {
         Ok(())
     }
 
+    /// Makes the account's queued messages due at once, whatever wait they were given: a login
+    /// that was refused is no reason for a message to wait once the password is another.
+    pub fn due_now(&self, account: i64) -> rusqlite::Result<usize> {
+        self.connection.execute(
+            "UPDATE outbox SET next_attempt_at = 0 WHERE account = ?1 AND state = 'queued'",
+            [account],
+        )
+    }
+
     /// Puts a `failed` message, or with `uncertain_too` an `uncertain` one, back in the queue,
     /// to send at once. Only the user asks for it: an `uncertain` message may have reached the
     /// server already. In one statement, so that the message is queued once.

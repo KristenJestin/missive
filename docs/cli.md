@@ -807,8 +807,12 @@ A message stays in the outbox until its server took it, in one of these states:
 | `uncertain` | the connection was lost after its end of data and before the server's answer (or the daemon was killed then): the server may have taken it. It stays, shown by `status` and `missive outbox`, and is never sent again by itself: a message delivered twice is worse than a question. Only `missive outbox resend <n> --yes` sends it again |
 
 Messages are sent one at a time, in the order they were written, each when its time has come: a
-message that waits for a new try holds back none of the others. `missive watch` tells when a
-message is `sent`, `send-failed` or `send-uncertain` (`docs/events.md`).
+message that waits for a new try holds back none of the others. After a login the server
+refused, or with no password in the keyring, the daemon waits longer each time (1 second, then
+twice as long, up to 5 minutes) and a new message does not cut the wait short; a password fixed
+meanwhile does, once `missive sync` tells the daemon to look again: the password is read again,
+and if it is not the one that was refused, the messages are tried at once. `missive watch` tells
+when a message is `sent`, `send-failed` or `send-uncertain` (`docs/events.md`).
 
 #### `missive outbox [--json]`, `missive outbox resend <n> [--yes]`, `missive outbox discard <n>`
 
