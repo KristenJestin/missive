@@ -361,7 +361,12 @@ impl Compose {
                 if asked.send {
                     self.state = State::Sent;
                 } else if self.closing && self.state == State::Editing {
-                    self.state = State::Closed;
+                    // What was typed while this save was on its way is still to save.
+                    if self.needs_save() {
+                        self.save_wanted = true;
+                    } else {
+                        self.state = State::Closed;
+                    }
                 }
                 if !self.closing && self.state != State::Sending {
                     self.notice = None;

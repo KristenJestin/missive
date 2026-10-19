@@ -160,6 +160,27 @@ fn closing_saves_the_draft_then_closes() {
 }
 
 #[test]
+fn closing_while_a_save_is_in_flight_saves_what_was_typed_since_before_closing() {
+    let mut compose = new_message();
+    let first = draft(type_and_wait(&mut compose, Field::Body, "Dear Zoe").unwrap());
+    assert_eq!(first.body.as_deref(), Some("Dear Zoe"));
+
+    // The save is on its way with a snapshot; the user types more, then closes.
+    compose.edit(Field::Body, "Dear Zoe, lunch at noon?".to_owned());
+    assert!(!compose.close());
+    assert_eq!(compose.take_request(), None, "one at a time");
+
+    // The first answer must not close the window: what was typed since is not saved.
+    compose.answered(saved("d@example.org"));
+    assert!(!compose.done());
+    let second = draft(compose.take_request().expect("the rest is saved too"));
+    assert_eq!(second.draft.as_deref(), Some("d@example.org"));
+    assert_eq!(second.body.as_deref(), Some("Dear Zoe, lunch at noon?"));
+    compose.answered(saved("d@example.org"));
+    assert!(compose.done());
+}
+
+#[test]
 fn closing_without_a_change_since_the_last_save_closes_at_once() {
     let mut compose = new_message();
     type_and_wait(&mut compose, Field::Body, "Done").unwrap();
