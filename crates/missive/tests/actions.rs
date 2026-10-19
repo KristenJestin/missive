@@ -2914,6 +2914,48 @@ async fn a_half_move_is_kept_when_a_renumbered_folder_answers_empty_and_is_found
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_half_move_is_kept_while_a_permanent_delete_of_its_copy_waits() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["delete", &three]).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["copied"], true, "{event}");
+    eventually(10, "the copy in the trash", || {
+        env.uids("Trash") == [1, 2, 3]
+    })
+    .await;
+    assert_eq!(env.half_move_rows(), 1);
+
+    // The copy in the trash is deleted for good, and the server keeps refusing: the first try is
+    // retried, and a sync runs meanwhile. The copy is not in the copy then, but only because it
+    // is being deleted.
+    let copy = env.id("Trash", 3);
+    succeeded(&env.act(&["delete", "--permanently", &copy]).await);
+    assert_eq!(events.action().await["outcome"], "retried");
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(env.half_move_rows(), 1);
+
+    // Refused for good: the copy is back, and the message is still said to be in both folders.
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    eventually(10, "the copy back in the trash", || {
+        env.uids("Trash") == [1, 2, 3]
+    })
+    .await;
+    half_moved_soon(
+        &env,
+        serde_json::json!([{
+            "message": three, "copy": copy, "folder": "inbox", "target": "trash",
+            "maybe": false,
+        }]),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_deleted_flag_left_is_kept_when_the_folder_answers_empty() {
     let (server, env, _daemon) = started(
         mailbox()
