@@ -170,10 +170,17 @@ impl Env {
 
     /// Starts `missive daemon` in the foreground and waits until it answers on its socket.
     async fn daemon(&self) -> Daemon {
+        self.daemon_with(&[]).await
+    }
+
+    /// [`Env::daemon`], given `args` too.
+    async fn daemon_with(&self, args: &[&str]) -> Daemon {
         let n = self.logs.fetch_add(1, Ordering::Relaxed);
         let log = std::fs::File::create(self.home.path().join(format!("daemon-{n}.log"))).unwrap();
+        let mut arguments = vec!["daemon", "--check-interval", "3600"];
+        arguments.extend_from_slice(args);
         let child = self
-            .command(&["daemon", "--check-interval", "3600"])
+            .command(&arguments)
             .stdout(Stdio::null())
             .stderr(log)
             .kill_on_drop(true)
@@ -957,6 +964,133 @@ async fn a_refused_expunge_takes_back_the_deleted_flag_it_set_itself() {
             .flags("Drafts", 1)
             .unwrap()
             .contains(&"\\Deleted".to_owned())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_left_on_an_old_draft_by_a_cut_connection_is_taken_back() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    let _daemon = env.daemon_with(&["--action-timeout", "1"]).await;
+    env.ready().await;
+    let mut watcher = env.watch().await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+    // The old version is marked deleted, and the connection is lost before its expunge.
+    server.stall("UID EXPUNGE");
+
+    env.save(&["--draft", &id, "--subject", "Second"]).await;
+    loop {
+        let event = watcher.next("draft").await;
+        if event["outcome"] == "retried" {
+            assert_eq!(event["reason"], "connection", "{event}");
+            break;
+        }
+    }
+    let marked = || {
+        server
+            .flags("Drafts", 1)
+            .unwrap()
+            .contains(&"\\Deleted".to_owned())
+    };
+    assert!(marked());
+    // Then the server refuses the expunge, and to take the flag back.
+    server.heal();
+    server.refuse("UID EXPUNGE");
+    server.refuse("UID STORE 1 -FLAGS");
+    succeeded(&env.run(&["sync"]).await);
+    settled(&env).await;
+
+    // The flag found set is still Missive's own: it is tried, then kept to take back.
+    drafts_on_server(&server, &["First", "Second"]).await;
+    assert!(
+        removals(&server).contains(&"UID STORE 1 -FLAGS.SILENT (\\Deleted)".to_owned()),
+        "{:?}",
+        removals(&server)
+    );
+    let status = env.status().await;
+    let left = status["accounts"][0]["deleted_left"].as_array().unwrap();
+    assert_eq!(left.len(), 1, "{status}");
+    assert!(left[0].as_str().unwrap().ends_with("/1"), "{status}");
+
+    server.heal();
+    succeeded(&env.run(&["sync"]).await);
+    eventually(20, "the flag taken back", || !marked()).await;
+    let status = env.status().await;
+    assert_eq!(
+        status["accounts"][0]["deleted_left"],
+        serde_json::json!([]),
+        "{status}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_recorded_before_the_drafts_folder_was_renumbered_is_never_taken_back() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    let mut daemon = env.daemon_with(&["--action-timeout", "1"]).await;
+    env.ready().await;
+    let mut watcher = env.watch().await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+    // The old version is marked deleted, and the connection is lost before its expunge.
+    server.stall("UID EXPUNGE");
+    env.save(&["--draft", &id, "--subject", "Second"]).await;
+    loop {
+        let event = watcher.next("draft").await;
+        if event["outcome"] == "retried" {
+            assert_eq!(event["reason"], "connection", "{event}");
+            break;
+        }
+    }
+
+    // Another client expunged the old version, and the server renumbered the folder: the new
+    // version is now the UID 1, and a third client marked it for removal. The copy follows the
+    // new UIDVALIDITY before the draft is tried again.
+    server.expunge("Drafts", 1);
+    let uidvalidity = server.bump_uidvalidity("Drafts");
+    server.set_flags("Drafts", 1, &["\\Draft", "\\Seen", "\\Deleted"]);
+    server.heal();
+    server.refuse("SELECT \"Drafts\"");
+    succeeded(&env.run(&["sync"]).await);
+    eventually(20, "the copy of the renumbered folder", || {
+        Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()
+            .and_then(|copy| {
+                copy.query_row(
+                    "SELECT uidvalidity FROM folder WHERE role = 'drafts'",
+                    [],
+                    |r| r.get::<_, u32>(0),
+                )
+                .ok()
+            })
+            == Some(uidvalidity)
+    })
+    .await;
+    server.heal();
+    succeeded(&env.run(&["sync"]).await);
+    settled(&env).await;
+    // A new connection takes back what the earlier ones left.
+    daemon.kill().await;
+    let _daemon = env.daemon().await;
+    env.ready().await;
+    succeeded(&env.run(&["sync"]).await);
+
+    // The UID 1 recorded before the renumbering names another message now: no flag is taken back.
+    assert!(
+        !removals(&server).iter().any(|line| line.contains("-FLAGS")),
+        "{:?}",
+        removals(&server)
+    );
+    assert!(
+        server
+            .flags("Drafts", 1)
+            .unwrap()
+            .contains(&"\\Deleted".to_owned()),
+        "{:?}",
+        server.flags("Drafts", 1)
     );
 }
 

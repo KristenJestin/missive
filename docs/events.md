@@ -18,7 +18,10 @@ Accounts are named by their identifier, as `missive account list` shows it.
 
 A watcher starts with the present, so that a program that has just begun knows where things stand
 without asking: one `state` event for each account, in the order of their identifiers, then one
-`unread` event. After these come the events as they happen, in the order they happened.
+`unread` event. After these come the events as they happen, in the order they happened. An account
+the daemon has not told a state for yet (it has just started, and its worker is still reading the
+keyring) has no `state` event in the present: the state the previous daemon left is not its state
+now, and its first `state` event comes as soon as it has one.
 
 Nothing before the moment of subscribing is replayed. A `new-message` that arrived while no one
 watched is not told; the `unread` event of the present shows its effect.
@@ -166,6 +169,7 @@ the daemon tried it on the server.
 | `attempts` | number | with `retried` only: how many times it failed so far |
 | `message` | string | with `refused` only: why, for people |
 | `copied` | `true` | with a refused `move` or `delete` only, and only when the server had copied the messages to the target before the move was refused: they are in both folders (below) |
+| `maybe_copied` | `true` | with a refused `move` or `delete` only, and only when the server's answer to its copy to the target was lost: the messages may be in both folders (below) |
 
 An action on messages of several folders is one action per folder, each with its event.
 
@@ -192,14 +196,21 @@ An action on messages of several folders is one action per folder, each with its
   with `moved` when the server moved them without saying their new UIDs (no `COPYUID`, or a copy
   found again after a lost answer rather than told): nothing is done to them in their new folder.
   A permanent delete asked while the move of its messages to the trash waited is refused with
-  `not-moved` when that move is refused: the messages never reached the trash.
+  `not-moved` when that move is refused: the messages never reached the trash. A move or a
+  delete of messages that keep a `\Deleted` flag Missive set (above), which Missive tried to take
+  back once more and could not, is refused with `deleted-left` and nothing is sent: `UID MOVE` and
+  `UID COPY` keep the flags, so the messages would arrive marked deleted in a folder where nothing
+  tells Missive to take the flag back. Ask again once it is taken back.
 
 A move on a server without `MOVE` is a `UID COPY`, then the removal of the messages from their
 folder. When the removal is refused for good (or the folder renumbered) once the copy was made,
 the messages are in both folders: the event has `copied` `true`, its `message` says so, the copy
 shows both (the copy in the target too, when the server told its UID), and `missive status` lists
 each message in `half_moved` until the user deletes or moves one of the two. Nothing is removed to
-fix it without the user.
+fix it without the user. When the move is refused while the server's answer to its `UID COPY` is
+still unknown (the connection was lost before it came, and the target could not be read since to
+find out), the messages may be in both folders: the event has `maybe_copied` `true` instead, its
+`message` says so, the target is synced, and `half_moved` lists each message with `maybe` `true`.
 
 ### `sent`
 

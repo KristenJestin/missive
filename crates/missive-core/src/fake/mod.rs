@@ -211,6 +211,7 @@ pub struct Builder {
     without_move: bool,
     without_keywords: bool,
     without_uidplus: bool,
+    split_copyuid: bool,
     imap_login_no: Option<String>,
     smtp_login_only: bool,
     fetch_delay: Duration,
@@ -256,6 +257,13 @@ impl Builder {
     /// Serves without UIDPLUS (RFC 4315): no `COPYUID`, and `UID EXPUNGE` is an unknown command.
     pub fn without_uidplus(mut self) -> Self {
         self.without_uidplus = true;
+        self
+    }
+
+    /// Tells the new UIDs of a `UID MOVE` in one untagged `COPYUID` per message rather than one
+    /// for all, as a server that moves them in batches may.
+    pub fn split_copyuid(mut self) -> Self {
+        self.split_copyuid = true;
         self
     }
 
@@ -401,6 +409,7 @@ impl Builder {
             moves: !self.without_move,
             keywords: !self.without_keywords,
             uidplus: !self.without_uidplus,
+            split_copyuid: self.split_copyuid,
             imap_login_no: self.imap_login_no,
             smtp_login_only: self.smtp_login_only,
             fetch_delay: self.fetch_delay,
@@ -515,6 +524,14 @@ impl FakeServer {
         })
     }
 
+    /// Deletes a folder and its messages, as another client would.
+    pub fn delete_folder(&self, name: &str) {
+        self.shared.change(|state| {
+            state.folder(name);
+            state.folders.retain(|f| f.name != name);
+        })
+    }
+
     /// Gives a folder a new UIDVALIDITY and renumbers its messages from 1, as a server does when
     /// it rebuilds a folder. Returns the new UIDVALIDITY.
     pub fn bump_uidvalidity(&self, folder: &str) -> u32 {
@@ -582,6 +599,15 @@ impl FakeServer {
             .state()
             .rules
             .push(Rule::new(command, Action::Cut(lines)));
+    }
+
+    /// Answers nothing to every IMAP command that starts with `command`, as
+    /// [`Builder::stall`] does, until [`FakeServer::heal`].
+    pub fn stall(&self, command: &str) {
+        self.shared
+            .state()
+            .rules
+            .push(Rule::new(command, Action::Stall));
     }
 
     /// Answers every IMAP command that starts with `command` with the first `lines` lines of its
@@ -696,6 +722,7 @@ struct Shared {
     moves: bool,
     keywords: bool,
     uidplus: bool,
+    split_copyuid: bool,
     imap_login_no: Option<String>,
     smtp_login_only: bool,
     fetch_delay: Duration,

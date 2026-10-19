@@ -38,8 +38,9 @@
 //!
 //! A removal records the `\Deleted` it sets itself before it sets it: when the connection is lost
 //! before the flag is taken back, the next try still knows it is its own. An action refused for
-//! good that leaves it there keeps it in [`Store::deleted_left`], and it is taken back at the
-//! next connection.
+//! good that leaves it there keeps it in [`Store::deleted_left`], and it is taken back at once,
+//! then at the next connection, unless the folder was renumbered or deleted since. Until then, a move of those messages is refused: `UID MOVE` and
+//! `UID COPY` keep the flags, and the copy in the target would keep a `\Deleted` nothing records.
 //!
 //! An action asked while a move of its messages waits is recorded on them as the server still has
 //! them, apart from the messages that are not moving, and follows them to their new UIDs once the
@@ -50,7 +51,8 @@
 //!
 //! A move refused once its `UID COPY` was made leaves the messages in both folders. Nothing is
 //! removed to fix it: the copy shows both, the outcome says so, and the messages are recorded as
-//! half moved ([`crate::copy::Copy::half_moved`]) until the user removes one of the two.
+//! half moved ([`crate::copy::Copy::half_moved`]) until the user removes one of the two. A move
+//! refused while the answer to its `UID COPY` is unknown is recorded the same way, as a maybe.
 //!
 //! A `UID COPY` whose answer was never read (the connection was cut) may or may not have
 //! copied: before copying again, the target's UIDNEXT tells whether anything arrived there since,
@@ -62,7 +64,9 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use async_imap::imap_proto::{AttributeValue, MailboxDatum, Response, StatusAttribute};
+use async_imap::imap_proto::{
+    AttributeValue, MailboxDatum, NameAttribute, Response, StatusAttribute,
+};
 
 use crate::connect::{ConnectError, ImapSession};
 use crate::copy::message_id;
@@ -251,13 +255,16 @@ pub enum Result {
         reason: &'static str,
     },
     /// It was dropped and its change taken back from the copy. `reason` is `renumbered`,
-    /// `no-such-folder`, `unsupported`, `refused` or `connection` (it failed that way
+    /// `no-such-folder`, `unsupported`, `deleted-left`, `refused` or `connection` (it failed that way
     /// [`MAX_ATTEMPTS`] times). `copied`: a move the server refused once it had copied the
     /// messages, which are in both folders now; nothing is removed to fix it but by the user.
+    /// `maybe_copied`: a move refused while the answer to its copy was unknown, whose messages
+    /// may be in both folders.
     Refused {
         reason: &'static str,
         message: String,
         copied: bool,
+        maybe_copied: bool,
     },
 }
 
@@ -446,6 +453,7 @@ async fn round(
             Err(error) => return Err(error),
         };
         let mut behind = (Vec::new(), NOT_MOVED);
+        let mut left = 0;
         let result = match result {
             Step::Applied { resync, moved } => {
                 applied.resync.extend(resync);
@@ -464,6 +472,7 @@ async fn round(
                 }
                 let dropped = refuse(store, &action, applied)?;
                 behind.0 = dropped.behind.clone();
+                left = dropped.deleted_left;
                 refused(
                     "refused",
                     format!("the server refused it {attempts} times ({why})"),
@@ -473,6 +482,7 @@ async fn round(
             Step::Refused(reason, message) => {
                 let dropped = refuse(store, &action, applied)?;
                 behind.0 = dropped.behind.clone();
+                left = dropped.deleted_left;
                 refused(reason, message.to_owned(), &dropped)
             }
             Step::Skipped => {
@@ -484,6 +494,10 @@ async fn round(
         };
         applied.outcomes.push(outcome(result));
         refuse_behind(store, account_id, &behind.0, behind.1, applied)?;
+        // Before anything else is asked of its messages: a move would carry the flag along.
+        if left > 0 {
+            take_back(server, store, account, applied).await?;
+        }
     }
 }
 
@@ -545,7 +559,7 @@ fn refuse(
 ) -> std::result::Result<Dropped, SyncError> {
     let dropped = store.refused(action)?;
     applied.resync.insert(action.folder.id);
-    if dropped.copied
+    if (dropped.copied || dropped.maybe_copied)
         && let Some(target) = &action.target
     {
         applied.resync.insert(target.id);
@@ -563,6 +577,12 @@ fn refused(reason: &'static str, why: String, dropped: &Dropped) -> Result {
              folders now: nothing was removed, delete or move one of the two",
         );
     }
+    if dropped.maybe_copied {
+        message.push_str(
+            "; the server's answer to the copy to the target was lost, so the messages may be in \
+             both folders now: nothing was removed, look in the target",
+        );
+    }
     if dropped.deleted_left > 0 {
         message.push_str(&format!(
             "; {} of them keep the \\Deleted flag Missive set on the server, which it takes \
@@ -574,6 +594,7 @@ fn refused(reason: &'static str, why: String, dropped: &Dropped) -> Result {
         reason,
         message,
         copied: dropped.copied,
+        maybe_copied: dropped.maybe_copied,
     }
 }
 
@@ -592,7 +613,13 @@ async fn take_back(
             continue;
         }
         match server.select(&left.folder.name).await? {
-            None => continue,
+            None => {
+                // A folder deleted since has none of its messages left to take the flag from.
+                if listed(server, &left.folder.name).await? == Some(false) {
+                    store.taken_back(left.id)?;
+                }
+                continue;
+            }
             Some(uidvalidity) if uidvalidity != left.uidvalidity => {
                 store.taken_back(left.id)?;
                 continue;
@@ -616,6 +643,30 @@ async fn take_back(
     Ok(())
 }
 
+/// Whether the server lists a folder (`LIST "" <name>`); `None` when it cannot tell.
+async fn listed(
+    server: &mut Server<'_>,
+    name: &str,
+) -> std::result::Result<Option<bool>, SyncError> {
+    let Some(quoted) = sync::quote(name) else {
+        return Ok(None);
+    };
+    let mut found = false;
+    let done = server
+        .run_done(&format!("LIST \"\" {quoted}"), |response| {
+            if let Response::MailboxData(MailboxDatum::List(list)) = response
+                && sync::unescape(&list.name) == name
+                && !list.name_attributes.iter().any(|a| {
+                    matches!(a, NameAttribute::Extension(e) if e.eq_ignore_ascii_case("\\NonExistent"))
+                })
+            {
+                found = true;
+            }
+        })
+        .await?;
+    Ok(matches!(done, Done::Ok(_)).then_some(found))
+}
+
 /// What one try of an action came to.
 enum Step {
     /// `moved`: the actions asked after a move that could not follow its messages.
@@ -637,6 +688,12 @@ const RENUMBERED: Step = Step::Refused(
 const NO_SUCH_FOLDER: Step =
     Step::Refused("no-such-folder", "the server has no such target folder");
 const BAD: Step = Step::Refused("refused", "the server refused the command as malformed");
+const DELETED_LEFT: Step = Step::Refused(
+    "deleted-left",
+    "a refused action left the \\Deleted flag Missive set on these messages and it could not be \
+     taken back yet: moving them would carry it to the target, where any client's EXPUNGE would \
+     remove them, so nothing was moved",
+);
 
 async fn one(
     server: &mut Server<'_>,
@@ -657,6 +714,12 @@ async fn one(
             resync: Vec::new(),
             moved: Vec::new(),
         });
+    }
+    // `UID MOVE` and `UID COPY` keep the flags, and the target keeps no record of this one.
+    if action.kind.moves()
+        && store.deleted_left_on(action.folder.id, action.uidvalidity, &action.uids)?
+    {
+        return Ok(DELETED_LEFT);
     }
     // Refused before anything is sent.
     if let Some(why) = unsupported(action.kind, capabilities.moves, capabilities.uidplus) {
@@ -719,18 +782,30 @@ async fn one(
         return Ok(NO_SUCH_FOLDER);
     };
     if capabilities.moves {
-        let mut untagged = None;
+        // A server may tell the new UIDs in several untagged COPYUIDs, one per batch it moved.
+        let mut untagged: Option<std::result::Result<CopyUid, ()>> = None;
         let done = server
             .run_done(&format!("UID MOVE {set} {target_name}"), |response| {
                 if let Some(copy) = sync::copy_uid(response) {
-                    untagged = Some(copy);
+                    untagged = Some(match untagged.take() {
+                        None => Ok(copy),
+                        Some(Ok(mut all)) if all.uidvalidity == copy.uidvalidity => {
+                            all.pairs.extend(copy.pairs);
+                            Ok(all)
+                        }
+                        // Parts that disagree tell nothing to be trusted.
+                        Some(_) => Err(()),
+                    });
                 }
             })
             .await?;
         return Ok(match done {
             Done::Ok(tagged) => {
-                let (resync, moved) =
-                    store.applied_move(action, untagged.or(tagged).as_ref(), true)?;
+                let copied = match untagged {
+                    Some(untagged) => untagged.ok(),
+                    None => tagged,
+                };
+                let (resync, moved) = store.applied_move(action, copied.as_ref(), true)?;
                 Step::Applied { resync, moved }
             }
             Done::No { try_create: true } => NO_SUCH_FOLDER,
@@ -741,22 +816,7 @@ async fn one(
     copy_then_remove(server, store, action, &target_name).await
 }
 
-/// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` of the same UIDs. An expunge the
-/// server refused takes the flag back (best effort), but only from the messages that did not
-/// have it before: left there, another client's `EXPUNGE` would remove messages the copy shows,
-/// once the action is refused, and a `\Deleted` another client set is not ours to clear. Which
-/// ones had it is asked first (`UID SEARCH DELETED UID <set>`); an answer refused means the
-/// removal is not started.
-pub(crate) async fn remove(
-    server: &mut Server<'_>,
-    uids: &[u32],
-) -> std::result::Result<Done, SyncError> {
-    remove_marking(server, uids, &[], |_| Ok(())).await
-}
-
-/// [`remove`] for an action, which records the `\Deleted` it sets itself: a connection lost
-/// before the flag is taken back leaves it on the server, and the next try, which then finds it
-/// set, must still know it is Missive's own.
+/// [`remove_marking`] for an action.
 async fn removing(
     server: &mut Server<'_>,
     store: &mut Store,
@@ -769,9 +829,18 @@ async fn removing(
     .await
 }
 
-/// [`remove`]; `earlier` are the UIDs an earlier try marked itself, and `mark` records those
-/// whose flag is Missive's own, before it is set and once it is taken back.
-async fn remove_marking(
+/// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` of the same UIDs. An expunge the
+/// server refused takes the flag back (best effort), but only from the messages that did not
+/// have it before: left there, another client's `EXPUNGE` would remove messages the copy shows,
+/// once the action is refused, and a `\Deleted` another client set is not ours to clear. Which
+/// ones had it is asked first (`UID SEARCH DELETED UID <set>`); an answer refused means the
+/// removal is not started.
+///
+/// `mark` records the UIDs whose flag is Missive's own, before it is set and once it is taken
+/// back: a connection lost before the flag is taken back leaves it on the server, and the next
+/// try, which then finds it set, must still know it is Missive's own. `earlier` are the UIDs an
+/// earlier try recorded.
+pub(crate) async fn remove_marking(
     server: &mut Server<'_>,
     uids: &[u32],
     earlier: &[u32],

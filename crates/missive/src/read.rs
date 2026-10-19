@@ -365,16 +365,26 @@ pub fn status(json: bool) -> Result<()> {
             }
         }
         for half in &account.half_moved {
-            println!(
-                "\thalf moved: {} is in both {} and {}, since the server refused to remove it \
-                 after copying it; delete or move one of the two",
-                half.message, half.folder, half.target
-            );
+            if half.maybe {
+                println!(
+                    "\thalf moved: {} may be in both {} and {}, since the server's answer to its \
+                     copy was lost and the move was then refused; look in {}, and delete or move \
+                     one of the two if it is there",
+                    half.message, half.folder, half.target, half.target
+                );
+            } else {
+                println!(
+                    "\thalf moved: {} is in both {} and {}, since the server refused to remove it \
+                     after copying it; delete or move one of the two",
+                    half.message, half.folder, half.target
+                );
+            }
         }
         for message in &account.deleted_left {
             println!(
-                "\tstill marked \\Deleted: {message}, by an action that was then refused; \
-                 Missive takes the flag back at the next connection"
+                "\tstill marked \\Deleted: {message}, by an action that was then refused or \
+                 the removal of a draft's older version; Missive takes the flag back at the next \
+                 connection"
             );
         }
     }

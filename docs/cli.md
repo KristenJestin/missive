@@ -206,7 +206,7 @@ the daemon runs.
       ],
       "half_moved": [
         { "message": "alice/1/1745112/4", "copy": "alice/2/1745113/9", "folder": "inbox",
-          "target": "archive" }
+          "target": "archive", "maybe": false }
       ],
       "deleted_left": [] },
     { "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0,
@@ -245,7 +245,8 @@ the daemon runs.
 | `accounts[].half_moved[].message` | string | the message's identifier, in the folder it was to leave |
 | `accounts[].half_moved[].copy` | string or `null` | the identifier of its copy in the target; `null` when the server did not tell its UID (the copy is in the target all the same) |
 | `accounts[].half_moved[].folder`, `.target` | string | the folder it was to leave and its target: their roles, else their names |
-| `accounts[].deleted_left` | array of strings | the messages an action refused for good left marked `\Deleted` on the server, by their identifiers: Missive set the flag itself and lost the connection before it could take it back. It takes it back at the next connection; `[]` when none |
+| `accounts[].half_moved[].maybe` | boolean | `true` when the message may only be in both: the move was refused while the server's answer to its copy was lost, so whether the target has it is not known (`copy` is then `null`); `false` in a copy written before this field existed |
+| `accounts[].deleted_left` | array of strings | the messages an action refused for good, or the removal of a draft's older versions, left marked `\Deleted` on the server, by their identifiers: Missive set the flag itself and could not take it back (the connection was lost, or the server refused). It takes it back at the next connection, or lets it go once the folder was renumbered or deleted on the server (no message is left to take it from); `[]` when none |
 
 `ready` does not mean the copy is complete: a folder the server refuses is skipped, the others are
 synced, and the account is `ready` all the same. `skipped` is what keeps that from being silent. It
@@ -277,11 +278,14 @@ each stuck one (`stuck` above) and for each sent one whose copy could not be loo
 `	drafts: 1 to write to the Drafts folder` (or `kept in the local copy: the account has no
 Drafts folder`), and one line for each draft whose last try failed. Each message of `half_moved`
 has a line: `	half moved: alice/1/1745112/4 is in both inbox and archive, since the server refused to
-remove it after copying it; delete or move one of the two`. A message leaves `half_moved` once one
+remove it after copying it; delete or move one of the two`, or, with `maybe`, `	half moved:
+alice/1/1745112/4 may be in both inbox and archive, since the server's answer to its copy was lost
+and the move was then refused; look in archive, and delete or move one of the two if it is there`.
+A message leaves `half_moved` once one
 of the two is gone from the copy (the user deleted or moved it, or another client did); a copy
 written before this field existed says `[]`. Each message of `deleted_left` has a line too:
-`	still marked \Deleted: alice/1/1745112/4, by an action that was then refused; Missive takes
-the flag back at the next connection`.
+`	still marked \Deleted: alice/1/1745112/4, by an action that was then refused or the removal
+of a draft's older version; Missive takes the flag back at the next connection`.
 
 ### `missive unread [--json]`
 
@@ -653,7 +657,8 @@ tried again later, or refused. A refused action is taken back from the copy: the
 the server has it. A move the server refused after it had copied the messages (a server without
 `MOVE`) leaves them in both folders: the event says so (`copied`), and `status` lists them
 (`half_moved`) until the user deletes or moves one of the two; nothing is removed without the
-user.
+user. One refused while the answer to its copy was lost may have: the event says so
+(`maybe_copied`), and `status` lists them as a maybe.
 
 While a move waits for the server, the message is shown in its new folder, but its identifier
 still names the folder the server has it in; once moved, it has a new identifier there (its UID in
@@ -730,6 +735,7 @@ With `--json`, the object has two fields more:
 | `actions[].reason` | string | with `refused`: the `reason` of the `action` event; with `queued`: the state of the account that is offline (`unreachable`…), `timeout` or `gone` (the daemon stopped) |
 | `actions[].message` | string | with `refused`: why, for people |
 | `actions[].copied` | `true` | with a refused move that left the messages in two folders (`docs/events.md`) |
+| `actions[].maybe_copied` | `true` | with a refused move that may have left the messages in two folders (`docs/events.md`) |
 
 The exit status tells them apart: 0 when every action was applied, 5 when one was refused, 4 when
 one is still queued (and none refused). The line or the object is printed in every case.

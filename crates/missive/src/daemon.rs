@@ -30,7 +30,7 @@
 //! kinds. It names an account by its number in the copy and a folder by its id there, never by
 //! a name: an account's identifier is often its address, and a folder's name is the user's own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -274,6 +274,9 @@ struct Events {
     sender: broadcast::Sender<Event>,
     /// The unread counts last told, so that only a change is told.
     unread: Mutex<Unread>,
+    /// The accounts whose state this daemon told: the copy keeps the state the last daemon left
+    /// for the others, which is not theirs now.
+    told: Mutex<BTreeSet<String>>,
 }
 
 impl Events {
@@ -284,11 +287,15 @@ impl Events {
         Events {
             sender: broadcast::channel(EVENT_BUFFER).0,
             unread: Mutex::new(unread),
+            told: Mutex::new(BTreeSet::new()),
         }
     }
 
     /// Without a watcher there is nobody to tell, which is not an error.
     fn send(&self, event: Event) {
+        if let Event::State { account, .. } = &event {
+            locked(&self.told).insert(account.clone());
+        }
         let _ = self.sender.send(event);
     }
 
@@ -538,11 +545,15 @@ impl Daemon {
         };
         let mut present = Vec::new();
         match reader.states() {
-            Ok(states) => present.extend(
-                states
-                    .into_iter()
-                    .map(|(account, state)| Event::State { account, state }),
-            ),
+            Ok(states) => {
+                let told = locked(&self.events.told);
+                present.extend(
+                    states
+                        .into_iter()
+                        .filter(|(account, _)| told.contains(account))
+                        .map(|(account, state)| Event::State { account, state }),
+                )
+            }
             Err(e) => log!("cannot read the accounts' states for a watcher ({e})"),
         }
         match open_copy(&self.store).map(|copy| Unread::of(&copy)) {
@@ -1840,21 +1851,23 @@ impl Worker {
 
     /// Logs what became of an action, and tells the watchers.
     fn tell_outcome(&mut self, outcome: &Outcome) {
-        let (name, reason, attempts, message, copied) = match &outcome.result {
-            actions::Result::Applied => ("applied", None, None, None, None),
+        let (name, reason, attempts, message, copied, maybe_copied) = match &outcome.result {
+            actions::Result::Applied => ("applied", None, None, None, None, None),
             actions::Result::Retried { attempts, reason } => {
-                ("retried", Some(*reason), Some(*attempts), None, None)
+                ("retried", Some(*reason), Some(*attempts), None, None, None)
             }
             actions::Result::Refused {
                 reason,
                 message,
                 copied,
+                maybe_copied,
             } => (
                 "refused",
                 Some(*reason),
                 None,
                 Some(message.clone()),
                 copied.then_some(true),
+                maybe_copied.then_some(true),
             ),
         };
         log!(
@@ -1879,6 +1892,7 @@ impl Worker {
             attempts,
             message,
             copied,
+            maybe_copied,
         }));
     }
 

@@ -118,6 +118,10 @@ pub struct ActionEvent {
     /// first: they are in both folders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copied: Option<bool>,
+    /// For a refused move only, `true` when the answer to its copy to the target was lost: the
+    /// messages may be in both folders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maybe_copied: Option<bool>,
 }
 
 /// What became of a draft at the server (`docs/events.md`).
@@ -383,6 +387,7 @@ mod tests {
             attempts: None,
             message: None,
             copied: None,
+            maybe_copied: None,
         });
         assert_eq!(
             applied.line(),
@@ -398,6 +403,7 @@ mod tests {
             attempts: Some(2),
             message: None,
             copied: None,
+            maybe_copied: None,
         });
         assert_eq!(
             retried.line(),

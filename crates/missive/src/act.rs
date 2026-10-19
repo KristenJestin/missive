@@ -185,6 +185,8 @@ struct Waited {
     message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     copied: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maybe_copied: Option<bool>,
 }
 
 async fn run(
@@ -379,6 +381,7 @@ async fn ask_and_wait(
                         reason: event.reason,
                         message: event.message,
                         copied: event.copied,
+                        maybe_copied: event.maybe_copied,
                     },
                 );
             }
@@ -402,6 +405,7 @@ async fn ask_and_wait(
                 reason: stopped.clone(),
                 message: None,
                 copied: None,
+                maybe_copied: None,
             })
         })
         .collect();

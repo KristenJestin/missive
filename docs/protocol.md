@@ -250,7 +250,8 @@ Starts the event stream on this connection:
 
 After that answer the daemon writes `event` lines on the connection, each one a JSON object with
 `protocol` and `event` (the name), and the other fields `docs/events.md` gives that event. The
-first ones are the present: a `state` event for each account, then an `unread` event.
+first ones are the present: a `state` event for each account (each the daemon has told a state for
+yet), then an `unread` event.
 
 The connection stays a connection of requests: it may send `sync` (or any other request) after
 subscribing, and the answer comes on the same connection, in the order of the requests, among the

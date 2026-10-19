@@ -915,7 +915,12 @@ async fn an_unknown_message_is_refused_with_its_exit_status_and_nothing_is_recor
 /// A server reached through a relay, with an account and a first sync, then a daemon stopped
 /// and the relay switched off: the next daemon finds the server down.
 async fn offline() -> (FakeServer, Relay, Env) {
-    let server = mailbox().start().await;
+    offline_from(mailbox()).await
+}
+
+/// [`offline`], on a server `builder` describes.
+async fn offline_from(builder: missive_core::fake::Builder) -> (FakeServer, Relay, Env) {
+    let server = builder.start().await;
     let relay = Relay::start(server.imap_tls_addr()).await;
     relay.up.store(true, Ordering::SeqCst);
     let env = Env::new().await;
@@ -1709,6 +1714,7 @@ async fn a_move_refused_after_its_copy_says_the_message_is_in_both_folders_and_r
         env.status_of_alice().await["half_moved"],
         serde_json::json!([{
             "message": three, "copy": copy, "folder": "inbox", "target": "archive",
+            "maybe": false,
         }])
     );
     let text = stdout(&env.act(&["status"]).await);
@@ -1734,6 +1740,47 @@ async fn a_move_refused_after_its_copy_says_the_message_is_in_both_folders_and_r
         env.status_of_alice().await["half_moved"],
         serde_json::json!([])
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_refused_while_its_copy_is_unknown_says_the_message_may_be_in_both_folders() {
+    // The copy is made, but its answer is lost; then the target cannot be read to find it.
+    let (server, env, _daemon) = started(mailbox().without_move().cut("UID COPY", 0)).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    eventually(10, "the copy", || tries(&server, "UID COPY") == 1).await;
+    server.heal();
+    server.refuse("STATUS");
+    let event = loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            break event;
+        }
+        succeeded(&sync_soon(&env).await);
+    };
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(event["maybe_copied"], true, "{event}");
+    assert_eq!(event.get("copied"), None, "{event}");
+    let message = event["message"].as_str().unwrap();
+    assert!(message.contains("may be in both folders"), "{message}");
+
+    // It was copied: the message is in both folders, and nothing was removed.
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(server.uids("Archive"), [1]);
+    eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
+    assert_eq!(env.shown_uids("INBOX"), [1, 2, 3, 4]);
+
+    // `status` says so, as a maybe.
+    assert_eq!(
+        env.status_of_alice().await["half_moved"],
+        serde_json::json!([{
+            "message": three, "copy": null, "folder": "inbox", "target": "archive",
+            "maybe": true,
+        }])
+    );
+    let text = stdout(&env.act(&["status"]).await);
+    assert!(text.contains("may be in both inbox and archive"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1916,6 +1963,38 @@ async fn wait_with_no_daemon_running_does_not_believe_the_state_the_last_one_lef
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wait_does_not_take_the_state_the_last_daemon_left_for_the_new_ones() {
+    let (_server, relay, env) = offline().await;
+    let mut daemon = env.daemon(&["--check-interval", "3600"]).await;
+    eventually(10, "unreachable", || {
+        env.state("alice").as_deref() == Some("unreachable")
+    })
+    .await;
+    assert!(daemon.stop("-TERM").await.success());
+    // The server is back, and the new daemon has not told any state yet: its worker waits for
+    // the keyring.
+    relay.up.store(true, Ordering::SeqCst);
+    env.keyring.stall_secret_reads();
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    assert_eq!(env.state("alice").as_deref(), Some("unreachable"));
+
+    let output = env
+        .act(&[
+            "mark",
+            &env.id("INBOX", 3),
+            "--read",
+            "--wait",
+            "--timeout",
+            "2",
+            "--json",
+        ])
+        .await;
+    assert_eq!(output.status.code(), Some(QUEUED), "{}", stderr(&output));
+    let answer = json(&output);
+    assert_eq!(answer["actions"][0]["reason"], "timeout", "{answer}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wait_with_a_daemon_older_than_the_command_says_it_cannot_tell() {
     let env = Env::new().await;
     std::fs::create_dir_all(env.socket().parent().unwrap()).unwrap();
@@ -2079,6 +2158,43 @@ async fn actions_asked_while_a_move_waits_follow_the_message_to_its_new_uid() {
     succeeded(&sync_soon(&env).await);
     assert_eq!(env.uids("Trash"), [1, 2, 3]);
     assert_eq!(env.flags("Trash", 3).as_deref(), Some("\\Flagged \\Seen"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_action_behind_a_move_whose_copyuid_came_in_parts_follows_every_message() {
+    let (server, relay, env) = offline_from(mailbox().split_copyuid()).await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    eventually(10, "unreachable", || {
+        env.state("alice").as_deref() == Some("unreachable")
+    })
+    .await;
+    let from = server.imap_log().len();
+    let (two, three) = (env.id("INBOX", 2), env.id("INBOX", 3));
+    succeeded(&env.act(&["move", &two, &three, "--to", "archive"]).await);
+    succeeded(&env.act(&["mark", &two, &three, "--read"]).await);
+    relay.up.store(true, Ordering::SeqCst);
+
+    // One untagged COPYUID per message: together they tell both new UIDs.
+    wrote(
+        &server,
+        from,
+        &[
+            "SELECT \"INBOX\"",
+            "UID MOVE 2:3 \"Archive\"",
+            "SELECT \"Archive\"",
+            "UID STORE 1:2 +FLAGS (\\Seen)",
+        ],
+    )
+    .await;
+    eventually(10, "the queue empty", || env.queue() == 0).await;
+    for uid in [1, 2] {
+        assert!(
+            server
+                .flags("Archive", uid)
+                .unwrap()
+                .contains(&"\\Seen".to_owned())
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2405,4 +2521,95 @@ async fn a_deleted_flag_left_by_a_cut_connection_is_reported_and_taken_back_at_t
     // What another client marked is left alone.
     assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
     assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_after_a_refusal_that_left_its_deleted_flag_does_not_carry_it_to_another_folder() {
+    // The removal is refused, and taking its flag back too, until the limit refuses the move.
+    let (server, env, _daemon) = started(
+        mailbox()
+            .without_move()
+            .refuse("UID EXPUNGE")
+            .refuse("UID STORE 3 -FLAGS"),
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    // Asked while the first waits: once that one is refused, it applies where the message is.
+    succeeded(&env.act(&["move", &three, "--to", PRIVATE_FOLDER]).await);
+    let first = loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            break event;
+        }
+        succeeded(&sync_soon(&env).await);
+    };
+    assert_eq!(first["outcome"], "refused", "{first}");
+    assert_eq!(first["copied"], true, "{first}");
+    assert_eq!(server.flags("INBOX", 3), flags(&["\\Deleted"]));
+
+    // `UID COPY` keeps the flags: copied now, the message would carry the `\Deleted` Missive set
+    // into a folder where no record of it is kept, and any client's EXPUNGE would remove it.
+    let second = events.action().await;
+    assert_eq!(second["outcome"], "refused", "{second}");
+    assert_eq!(second["reason"], "deleted-left", "{second}");
+    let message = second["message"].as_str().unwrap();
+    assert!(message.contains("\\Deleted"), "{message}");
+    assert_eq!(server.uids(PRIVATE_FOLDER), [1]);
+    assert_eq!(tries(&server, "UID COPY"), 1);
+    assert_eq!(env.queue(), 0);
+
+    // The flag is taken back at the next connection, and still nothing was moved.
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    eventually(20, "the flag taken back", || {
+        server.flags("INBOX", 3) == Some(Vec::new())
+    })
+    .await;
+    assert_eq!(server.uids(PRIVATE_FOLDER), [1]);
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_left_in_a_folder_since_deleted_on_the_server_is_let_go() {
+    // The removal is refused, and taking its flag back too, until the limit refuses the move.
+    let (server, env, _daemon) = started(
+        mailbox()
+            .without_move()
+            .refuse("UID EXPUNGE")
+            .refuse("UID STORE 1 -FLAGS"),
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let one = env.id(PRIVATE_FOLDER, 1);
+    succeeded(&env.act(&["move", &one, "--to", "archive"]).await);
+    loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            assert_eq!(event["outcome"], "refused", "{event}");
+            break;
+        }
+        succeeded(&sync_soon(&env).await);
+    }
+    assert_eq!(
+        env.status_of_alice().await["deleted_left"],
+        serde_json::json!([one])
+    );
+
+    // Another client deletes the folder: no message is left to take the flag back from.
+    server.delete_folder(PRIVATE_FOLDER);
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    let started = Instant::now();
+    while env.status_of_alice().await["deleted_left"] != serde_json::json!([]) {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the flag of a deleted folder is still listed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // What another client marked is left alone.
+    assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
 }
