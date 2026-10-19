@@ -749,18 +749,30 @@ async fn one(
         return Ok(NO_SUCH_FOLDER);
     };
     if capabilities.moves {
-        let mut untagged = None;
+        // A server may tell the new UIDs in several untagged COPYUIDs, one per batch it moved.
+        let mut untagged: Option<std::result::Result<CopyUid, ()>> = None;
         let done = server
             .run_done(&format!("UID MOVE {set} {target_name}"), |response| {
                 if let Some(copy) = sync::copy_uid(response) {
-                    untagged = Some(copy);
+                    untagged = Some(match untagged.take() {
+                        None => Ok(copy),
+                        Some(Ok(mut all)) if all.uidvalidity == copy.uidvalidity => {
+                            all.pairs.extend(copy.pairs);
+                            Ok(all)
+                        }
+                        // Parts that disagree tell nothing to be trusted.
+                        Some(_) => Err(()),
+                    });
                 }
             })
             .await?;
         return Ok(match done {
             Done::Ok(tagged) => {
-                let (resync, moved) =
-                    store.applied_move(action, untagged.or(tagged).as_ref(), true)?;
+                let copied = match untagged {
+                    Some(untagged) => untagged.ok(),
+                    None => tagged,
+                };
+                let (resync, moved) = store.applied_move(action, copied.as_ref(), true)?;
                 Step::Applied { resync, moved }
             }
             Done::No { try_create: true } => NO_SUCH_FOLDER,

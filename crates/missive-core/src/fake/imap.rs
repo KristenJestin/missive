@@ -815,7 +815,11 @@ impl Session {
             )
         });
         if moves {
-            if let Some(copyuid) = &copyuid {
+            if self.shared.split_copyuid && self.shared.uidplus {
+                for (old, new) in &pairs {
+                    self.send(format!("* OK [COPYUID {uidvalidity} {old} {new}] moved"));
+                }
+            } else if let Some(copyuid) = &copyuid {
                 self.send(format!("* OK {copyuid}moved"));
             }
             let selected = self.selected.as_mut().expect("checked above");

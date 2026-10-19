@@ -915,7 +915,12 @@ async fn an_unknown_message_is_refused_with_its_exit_status_and_nothing_is_recor
 /// A server reached through a relay, with an account and a first sync, then a daemon stopped
 /// and the relay switched off: the next daemon finds the server down.
 async fn offline() -> (FakeServer, Relay, Env) {
-    let server = mailbox().start().await;
+    offline_from(mailbox()).await
+}
+
+/// [`offline`], on a server `builder` describes.
+async fn offline_from(builder: missive_core::fake::Builder) -> (FakeServer, Relay, Env) {
+    let server = builder.start().await;
     let relay = Relay::start(server.imap_tls_addr()).await;
     relay.up.store(true, Ordering::SeqCst);
     let env = Env::new().await;
@@ -2121,6 +2126,43 @@ async fn actions_asked_while_a_move_waits_follow_the_message_to_its_new_uid() {
     succeeded(&sync_soon(&env).await);
     assert_eq!(env.uids("Trash"), [1, 2, 3]);
     assert_eq!(env.flags("Trash", 3).as_deref(), Some("\\Flagged \\Seen"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_action_behind_a_move_whose_copyuid_came_in_parts_follows_every_message() {
+    let (server, relay, env) = offline_from(mailbox().split_copyuid()).await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    eventually(10, "unreachable", || {
+        env.state("alice").as_deref() == Some("unreachable")
+    })
+    .await;
+    let from = server.imap_log().len();
+    let (two, three) = (env.id("INBOX", 2), env.id("INBOX", 3));
+    succeeded(&env.act(&["move", &two, &three, "--to", "archive"]).await);
+    succeeded(&env.act(&["mark", &two, &three, "--read"]).await);
+    relay.up.store(true, Ordering::SeqCst);
+
+    // One untagged COPYUID per message: together they tell both new UIDs.
+    wrote(
+        &server,
+        from,
+        &[
+            "SELECT \"INBOX\"",
+            "UID MOVE 2:3 \"Archive\"",
+            "SELECT \"Archive\"",
+            "UID STORE 1:2 +FLAGS (\\Seen)",
+        ],
+    )
+    .await;
+    eventually(10, "the queue empty", || env.queue() == 0).await;
+    for uid in [1, 2] {
+        assert!(
+            server
+                .flags("Archive", uid)
+                .unwrap()
+                .contains(&"\\Seen".to_owned())
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

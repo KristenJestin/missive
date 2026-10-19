@@ -211,6 +211,7 @@ pub struct Builder {
     without_move: bool,
     without_keywords: bool,
     without_uidplus: bool,
+    split_copyuid: bool,
     imap_login_no: Option<String>,
     smtp_login_only: bool,
     fetch_delay: Duration,
@@ -256,6 +257,13 @@ impl Builder {
     /// Serves without UIDPLUS (RFC 4315): no `COPYUID`, and `UID EXPUNGE` is an unknown command.
     pub fn without_uidplus(mut self) -> Self {
         self.without_uidplus = true;
+        self
+    }
+
+    /// Tells the new UIDs of a `UID MOVE` in one untagged `COPYUID` per message rather than one
+    /// for all, as a server that moves them in batches may.
+    pub fn split_copyuid(mut self) -> Self {
+        self.split_copyuid = true;
         self
     }
 
@@ -401,6 +409,7 @@ impl Builder {
             moves: !self.without_move,
             keywords: !self.without_keywords,
             uidplus: !self.without_uidplus,
+            split_copyuid: self.split_copyuid,
             imap_login_no: self.imap_login_no,
             smtp_login_only: self.smtp_login_only,
             fetch_delay: self.fetch_delay,
@@ -705,6 +714,7 @@ struct Shared {
     moves: bool,
     keywords: bool,
     uidplus: bool,
+    split_copyuid: bool,
     imap_login_no: Option<String>,
     smtp_login_only: bool,
     fetch_delay: Duration,
