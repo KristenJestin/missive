@@ -754,6 +754,22 @@ impl Daemon {
                 }
                 Err(e) => return failed(e.to_string()),
             }
+            // Without UIDPLUS its last version stays in the Drafts folder, listed: sending it
+            // again would send the same message twice.
+            if request.send {
+                match store.already_sent(key, id) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return Answer::error(
+                            Some(name),
+                            "already-sent",
+                            "this draft was already sent (its message is in the Sent folder or \
+                             was sent from the outbox); write a new message instead",
+                        );
+                    }
+                    Err(e) => return failed(e.to_string()),
+                }
+            }
         }
         let changed = request.to.is_some()
             || request.cc.is_some()

@@ -1126,6 +1126,36 @@ async fn without_uidplus_the_old_version_is_left_in_place_and_the_user_is_told()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn without_uidplus_a_sent_draft_left_in_drafts_is_not_sent_a_second_time() {
+    let server = mailbox().without_uidplus().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+    eventually(20, "the draft in the copy", || {
+        block(env.drafts()).first().is_some_and(|d| d["uid"] == 1)
+    })
+    .await;
+    succeeded(&env.run(&["compose", "--draft", &id, "--send"]).await);
+    took(&server, 1).await;
+    eventually(20, "the copy in Sent", || !server.uids("Sent").is_empty()).await;
+    settled(&env).await;
+    succeeded(&env.run(&["sync"]).await);
+    // Without UIDPLUS the draft's version cannot be removed: it is still there, and listed.
+    drafts_on_server(&server, &["First"]).await;
+    assert_eq!(env.drafts().await.len(), 1);
+
+    let output = env.run(&["compose", "--draft", &id, "--send"]).await;
+
+    failed(&output);
+    assert!(
+        stderr(&output).contains("already sent"),
+        "{}",
+        stderr(&output)
+    );
+    took(&server, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn without_a_drafts_folder_the_draft_stays_local_and_status_says_so() {
     let server = FakeServer::builder()
         .user(USER, PASSWORD)
