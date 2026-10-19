@@ -148,6 +148,7 @@ impl ComposeWindow {
             font,
         };
         this.title(window);
+        this.lock_fields(cx);
         this
     }
 
@@ -182,6 +183,7 @@ impl ComposeWindow {
         if self.model.done() {
             window.remove_window();
         }
+        self.lock_fields(cx);
         self.title(window);
         cx.notify();
     }
@@ -222,6 +224,25 @@ impl ComposeWindow {
             })
         })
         .detach();
+    }
+
+    /// What the widget of `field` shows.
+    pub fn shown(&self, field: Field, cx: &App) -> String {
+        match field {
+            Field::Body => self.body.read(cx).value().to_string(),
+            _ => self.input(field).read(cx).value().to_string(),
+        }
+    }
+
+    /// The fields take no text while the message is being sent: what was typed then would show
+    /// in the window and be missing from the model, and be lost if the send failed.
+    fn lock_fields(&self, cx: &mut Context<Self>) {
+        let locked = self.model.state == State::Sending;
+        for (_, state) in &self.fields {
+            state.update(cx, |state, cx| state.set_readonly(locked, cx));
+        }
+        self.body
+            .update(cx, |state, cx| state.set_readonly(locked, cx));
     }
 
     fn input(&self, field: Field) -> Entity<InputState> {

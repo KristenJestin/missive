@@ -11,7 +11,7 @@ use std::time::Duration;
 use common::{ID, Mail, mailbox};
 use gpui_kit::{AnyWindowHandle, Modifiers, TestAppContext, VisualContext, VisualTestContext};
 use missive_core::protocol::{Answer, Command, PROTOCOL, SaveDraft};
-use missive_window::compose::{Compose, SAVE_AFTER};
+use missive_window::compose::{Compose, Field, SAVE_AFTER, State};
 use missive_window::compose_view::{Chooser, ComposeWindow};
 use missive_window::view::{self, Asker, MailWindow, Opener};
 
@@ -139,6 +139,49 @@ fn ctrl_enter_in_the_text_adds_no_line(cx: &mut TestAppContext) {
     let asked = asked.lock().unwrap();
     assert_eq!(asked.last().unwrap().body.as_deref(), Some("Hello"));
     assert!(asked.last().unwrap().send);
+}
+
+#[gpui_kit::test]
+fn the_fields_take_no_text_while_the_message_is_being_sent(cx: &mut TestAppContext) {
+    let (asker, asked) = asker();
+    let mut compose = new_message();
+    compose.to = "zoe@example.com".to_owned();
+    compose.state = State::Sending;
+    let cx = window(cx, compose, asker, no_chooser());
+
+    // The text typed meanwhile would show in the widget and be lost to the model.
+    cx.simulate_input("Hello");
+    let shown = |cx: &mut VisualTestContext, field| {
+        cx.update(|window, cx| {
+            let root = window.root::<ComposeWindow>().flatten().unwrap();
+            root.read(cx).shown(field, cx)
+        })
+    };
+    assert_eq!(shown(cx, Field::Body), "", "the body is read-only");
+    cx.simulate_keystrokes("shift-tab");
+    cx.simulate_input("more");
+    assert_eq!(shown(cx, Field::To), "zoe@example.com", "so is To");
+
+    // The send failed: the fields are editable again, and show what the model holds.
+    cx.update(|window, cx| {
+        let root = window.root::<ComposeWindow>().flatten().unwrap();
+        root.update(cx, |this, cx| {
+            this.model.state = State::Editing;
+            this.changed(window, cx);
+        });
+    });
+    cx.simulate_input("!");
+    cx.run_until_parked();
+    let model = cx.update(|window, cx| {
+        let root = window.root::<ComposeWindow>().flatten().unwrap();
+        let model = &root.read(cx).model;
+        (model.to.clone(), model.body.clone())
+    });
+    assert_eq!(shown(cx, Field::To), model.0);
+    assert_eq!(shown(cx, Field::Body), model.1);
+    cx.simulate_keystrokes("ctrl-w");
+    cx.run_until_parked();
+    assert_eq!(asked.lock().unwrap().len(), 1, "closing saves what shows");
 }
 
 #[gpui_kit::test]
