@@ -73,6 +73,16 @@ const IDLE_RENEWAL: Duration = Duration::from_secs(25 * 60);
 const IDLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a worker in the middle of a sync is given to finish it when the daemon stops.
 const STOP_GRACE: Duration = Duration::from_secs(3);
+/// How long the daemon waits for its workers once it stops: the longest of the graces a worker
+/// is given (a sync's, the outbox record's), and a second for it to end. Derived from them, so
+/// that the record always fits inside the wait.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(
+    (if STOP_GRACE.as_secs() > outbox::RECORD_GRACE.as_secs() {
+        STOP_GRACE.as_secs()
+    } else {
+        outbox::RECORD_GRACE.as_secs()
+    }) + 1,
+);
 /// The longest wait between two connections to an unreachable server.
 const BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 /// How many events a watcher may be behind by before it misses some: a few minutes of a busy
@@ -185,10 +195,7 @@ pub async fn run(options: Options) -> Result<(), String> {
     let _ = stop.send(true);
     let mut tasks = std::mem::take(&mut *locked(&daemon.tasks));
     let all = async { while tasks.join_next().await.is_some() {} };
-    if tokio::time::timeout(STOP_GRACE + Duration::from_secs(3), all)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(JOIN_TIMEOUT, all).await.is_err() {
         log!("a worker did not stop in time and was cut off");
     }
     drop(listener);
@@ -2275,4 +2282,15 @@ pub async fn connect() -> Result<UnixStream, String> {
     let socket = socket_path().map_err(|e| e.to_string())?;
     let program = std::env::current_exe().map_err(|e| e.to_string())?;
     client::connect(&socket, &program).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wait_for_the_workers_leaves_the_record_all_its_grace_and_a_second() {
+        assert!(JOIN_TIMEOUT >= outbox::RECORD_GRACE + Duration::from_secs(1));
+        assert!(JOIN_TIMEOUT >= STOP_GRACE + Duration::from_secs(1));
+    }
 }
