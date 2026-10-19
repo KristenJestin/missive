@@ -603,15 +603,23 @@ impl MailWindow {
     fn reader(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = div().flex_1().min_w_0().h_full().flex().flex_col();
         match &self.model.reader {
-            Reader::Empty => pane.child(
-                div()
-                    .p_4()
-                    .text_color(palette.muted)
-                    .child("Enter or a click opens a message."),
-            ),
-            Reader::Gone => pane.child(div().p_4().text_color(palette.muted).child(
-                "This message is no longer in the local copy: the server removed or moved it.",
-            )),
+            // The keys act on the list's cursor when no message is open: their questions show
+            // here too.
+            Reader::Empty => pane
+                .children(self.picker(palette, cx))
+                .children(self.confirmation(palette, cx))
+                .child(
+                    div()
+                        .p_4()
+                        .text_color(palette.muted)
+                        .child("Enter or a click opens a message."),
+                ),
+            Reader::Gone => pane
+                .children(self.picker(palette, cx))
+                .children(self.confirmation(palette, cx))
+                .child(div().p_4().text_color(palette.muted).child(
+                    "This message is no longer in the local copy: the server removed or moved it.",
+                )),
             Reader::Open(opened) => {
                 let raw = opened.raw.clone();
                 let opener = self.opener.clone();

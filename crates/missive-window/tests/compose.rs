@@ -98,7 +98,10 @@ fn model_id(model: &Model, subject: &str) -> String {
 async fn a_reply_all_and_a_forward_start_from_the_open_message() {
     let mail = Mail::new(mailbox()).await;
     let mut model = mail.model();
-    assert!(model.compose(Start::Reply).is_none(), "no message open");
+    assert!(
+        model.compose(Start::Reply).is_some(),
+        "no message open: Plan 3, under the cursor"
+    );
     open(&mut model, "Plan 1");
 
     let all = model.compose(Start::ReplyAll).unwrap();
