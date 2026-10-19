@@ -28,7 +28,8 @@
 //!
 //! After the server's `250`, recording that it was sent is tried again for a while when the copy
 //! is busy: a row left `sending` would be reported `uncertain` by the next daemon, for a message
-//! that was sent.
+//! that was sent. A daemon that stops meanwhile finishes it, for a short while ([`record`] is
+//! apart from [`submit_next`] for that).
 //!
 //! The copy in Sent is appended by the account's IMAP connection, through the verified write
 //! path (`APPEND` counts only with its tagged `OK`), flagged `\Seen`, with the message's Bcc
@@ -91,6 +92,16 @@ pub enum Tried {
     },
 }
 
+/// A message submitted, and what the server said: not recorded yet.
+#[derive(Debug)]
+pub struct Submission {
+    id: i64,
+    message_id: String,
+    /// Whether a copy is to go in Sent (the server does not keep one itself).
+    sent_copy: bool,
+    submitted: Result<Submitted, ConnectError>,
+}
+
 /// Submits the account's first message whose time has come, if there is one, and records what
 /// came of it.
 pub async fn send_next(
@@ -100,6 +111,22 @@ pub async fn send_next(
     password: &Password,
     tls: Arc<ClientConfig>,
 ) -> rusqlite::Result<Option<Tried>> {
+    match submit_next(store, key, account, password, tls).await? {
+        Some(submission) => record(store, key, submission).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The first half of [`send_next`]: claims the account's first message whose time has come, if
+/// there is one, and submits it. A caller that stops its worker may drop this future; it must not
+/// drop [`record`], which only the server's answer, known here, makes possible.
+pub async fn submit_next(
+    store: &mut Store,
+    key: i64,
+    account: &Account,
+    password: &Password,
+    tls: Arc<ClientConfig>,
+) -> rusqlite::Result<Option<Submission>> {
     let Some(message) = store.claim_next(key, now())? else {
         return Ok(None);
     };
@@ -122,12 +149,31 @@ pub async fn send_next(
         },
     )
     .await;
-    let message_id = message.message_id;
-    Ok(Some(match submitted {
+    Ok(Some(Submission {
+        id,
+        message_id: message.message_id,
+        sent_copy: message.sent_copy,
+        submitted,
+    }))
+}
+
+/// The second half of [`send_next`]: records what came of a submission, a few local writes.
+pub async fn record(
+    store: &mut Store,
+    key: i64,
+    submission: Submission,
+) -> rusqlite::Result<Tried> {
+    let Submission {
+        id,
+        message_id,
+        sent_copy: copy,
+        submitted,
+    } = submission;
+    Ok(match submitted {
         Ok(Submitted::Sent) => {
             // A folder that cannot be read is not an answer: the copy is left to the IMAP worker,
             // which looks again. What was sent is recorded whatever these reads say.
-            let sent_copy = if !message.sent_copy {
+            let sent_copy = if !copy {
                 "server"
             } else if matches!(
                 (store.sent_folder(key), store.knows_folders(key)),
@@ -172,7 +218,7 @@ pub async fn send_next(
             recorded(store, |store| store.send_again(id, &why, now())).await?;
             Tried::Login { id, error }
         }
-    }))
+    })
 }
 
 /// Records what came of a submission, trying again while the copy is busy: the server's answer

@@ -333,6 +333,18 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// SIGTERM, and waits for the daemon to end by itself, at most `seconds`.
+    async fn stop(&mut self, seconds: u64) -> ExitStatus {
+        let pid = self.child.id().unwrap();
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        tokio::time::timeout(Duration::from_secs(seconds), self.child.wait())
+            .await
+            .expect("the daemon did not stop in time")
+            .unwrap()
+    }
+
     async fn kill(&mut self) -> ExitStatus {
         self.child.kill().await.unwrap();
         self.child.wait().await.unwrap()
@@ -1275,4 +1287,71 @@ async fn a_new_message_does_not_cut_short_the_wait_after_a_refused_login() {
     // Waiting is not losing: both go once the server takes the login.
     server.heal();
     took(&server, 2).await;
+}
+
+/// Holds the answer to the end of data for 2 seconds, then, once the server has it in hand, makes
+/// every change of the outbox fail, as a busy or a broken disk would. Returns the connection that
+/// lifts the failure (`lift`), and the time the server answers at.
+async fn blocked_at_the_answer(server: &FakeServer, env: &Env) -> (Connection, Instant) {
+    server.smtp_delay(".", Duration::from_secs(2));
+    succeeded(&env.compose(&["--body", BODY]).await);
+    eventually(20, "the end of data held", || server.smtp_delayed() == 1).await;
+    let answers_at = Instant::now() + Duration::from_secs(2);
+    let copy = Connection::open(env.copy_path()).unwrap();
+    copy.execute_batch(
+        "CREATE TRIGGER no_update BEFORE UPDATE ON outbox
+           BEGIN SELECT RAISE(ABORT, 'the copy cannot be written'); END;
+         CREATE TRIGGER no_delete BEFORE DELETE ON outbox
+           BEGIN SELECT RAISE(ABORT, 'the copy cannot be written'); END;",
+    )
+    .unwrap();
+    (copy, answers_at)
+}
+
+fn lift(copy: &Connection) {
+    copy.execute_batch("DROP TRIGGER no_update; DROP TRIGGER no_delete;")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_stopped_while_a_sent_message_is_recorded_finishes_recording_it() {
+    let server = mailbox().start().await;
+    let (env, mut daemon) = started(&Setup::of(&server)).await;
+    let (copy, answers_at) = blocked_at_the_answer(&server, &env).await;
+    // The server answered, and the first try of the record failed: it waits for the next.
+    tokio::time::sleep_until((answers_at + Duration::from_millis(400)).into()).await;
+    let stopping = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        lift(&copy);
+    });
+
+    daemon.stop(15).await;
+    stopping.await.unwrap();
+
+    assert_eq!(server.smtp_messages().len(), 1);
+    let outbox = env.outbox();
+    assert_eq!(
+        outbox.iter().map(|m| m.1.as_str()).collect::<Vec<_>>(),
+        ["sent"],
+        "{outbox:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_stopped_while_the_record_cannot_be_written_still_stops() {
+    let server = mailbox().start().await;
+    let (env, mut daemon) = started(&Setup::of(&server)).await;
+    let (_copy, answers_at) = blocked_at_the_answer(&server, &env).await;
+    tokio::time::sleep_until((answers_at + Duration::from_millis(400)).into()).await;
+
+    let started = Instant::now();
+    daemon.stop(15).await;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "{:?}",
+        started.elapsed()
+    );
+    // Not recorded: the next daemon will say the message is uncertain.
+    assert_eq!(env.outbox()[0].1, "sending");
 }

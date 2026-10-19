@@ -1960,16 +1960,41 @@ impl SmtpWorker {
                 }
                 continue;
             };
-            let tried = tokio::select! {
-                tried = outbox::send_next(
+            // What is written is whole: the outbox says where the message stopped.
+            let submitted = tokio::select! {
+                submitted = outbox::submit_next(
                     &mut self.store,
                     self.key,
                     &self.account,
                     login,
                     tls.clone(),
-                ) => tried,
-                // What is written is whole: the outbox says where the message stopped.
+                ) => submitted,
                 _ = stopped(&mut self.stop) => return,
+            };
+            let tried = match submitted {
+                Ok(Some(submission)) => {
+                    // The server's answer is known only here: a stop does not drop it, or the
+                    // message it took would stay `sending`, then `uncertain`. It is a few local
+                    // writes, given a little time, not all the time a broken disk takes.
+                    let record = outbox::record(&mut self.store, self.key, submission);
+                    tokio::pin!(record);
+                    tokio::select! {
+                        tried = &mut record => tried.map(Some),
+                        _ = async {
+                            stopped(&mut self.stop).await;
+                            tokio::time::sleep(STOP_GRACE).await;
+                        } => {
+                            log!(
+                                "account {}: the daemon stopped before the outbox could be \
+                                 written: the message is left as it was",
+                                self.key
+                            );
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
             };
             let tried = match tried {
                 Ok(Some(tried)) => tried,
