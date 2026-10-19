@@ -242,10 +242,10 @@ the daemon runs.
 | `accounts[].drafts[].attempts` | number | the tries that failed (tried again at the next pass) |
 | `accounts[].drafts[].last_error` | string or `null` | the last kind of error |
 | `accounts[].half_moved` | array | the messages a move left in two folders: the server refused to remove them after it had copied them (a server without `MOVE`; see [Changing messages](#changing-messages)), oldest first, `[]` when none |
-| `accounts[].half_moved[].message` | string | the message's identifier, in the folder it was to leave |
+| `accounts[].half_moved[].message` | string | the message's identifier, in the folder it was to leave; after the server renumbered that folder, the identifier it had before, until the next complete sync of the folder finds the message again |
 | `accounts[].half_moved[].copy` | string or `null` | the identifier of its copy in the target; `null` when the server did not tell its UID (the copy is in the target all the same) |
 | `accounts[].half_moved[].folder`, `.target` | string | the folder it was to leave and its target: their roles, else their names |
-| `accounts[].half_moved[].maybe` | boolean | `true` when the message may only be in both: the move was refused while the server's answer to its copy was lost, so whether the target has it is not known (`copy` is then `null`); `false` in a copy written before this field existed |
+| `accounts[].half_moved[].maybe` | boolean | `true` when the message may only be in both: the move was refused while the server's answer to its copy was lost, so whether the target has it is not known (`copy` is then `null`) until the next complete sync of the target looks for it there; `false` in a copy written before this field existed |
 | `accounts[].deleted_left` | array of strings | the messages an action refused for good, or the removal of a draft's older versions, left marked `\Deleted` on the server, by their identifiers: Missive set the flag itself and could not take it back (the connection was lost, or the server refused). It takes it back at the next connection, or lets it go once the folder was renumbered or deleted on the server (no message is left to take it from); `[]` when none |
 
 `ready` does not mean the copy is complete: a folder the server refuses is skipped, the others are
@@ -282,8 +282,13 @@ remove it after copying it; delete or move one of the two`, or, with `maybe`, `	
 alice/1/1745112/4 may be in both inbox and archive, since the server's answer to its copy was lost
 and the move was then refused; look in archive, and delete or move one of the two if it is there`.
 A message leaves `half_moved` once one
-of the two is gone from the copy (the user deleted or moved it, or another client did); a copy
-written before this field existed says `[]`. Each message of `deleted_left` has a line too:
+of the two is gone from the copy (the user deleted or moved it, or another client did); its row
+is deleted at the next complete sync of that folder. A renumbering of either folder does not make
+it leave: the next complete sync of the folder finds the message again by its `Message-ID`, size
+and internal date, or, found nowhere, lets it go; one without a `Message-ID` cannot be found again
+and stays listed. A `maybe` is settled the same way at the next complete sync of the target: its
+copy found there, it is listed as in both; found nowhere, it leaves. A copy written before this
+field existed says `[]`. Each message of `deleted_left` has a line too:
 `	still marked \Deleted: alice/1/1745112/4, by an action that was then refused or the removal
 of a draft's older version; Missive takes the flag back at the next connection`.
 

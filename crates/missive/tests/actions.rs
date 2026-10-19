@@ -1771,16 +1771,145 @@ async fn a_move_refused_while_its_copy_is_unknown_says_the_message_may_be_in_bot
     eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
     assert_eq!(env.shown_uids("INBOX"), [1, 2, 3, 4]);
 
-    // `status` says so, as a maybe.
-    assert_eq!(
-        env.status_of_alice().await["half_moved"],
+    // Once the archive is synced, its copy is found by its fingerprint: no longer a maybe.
+    let copy = env.id("Archive", 1);
+    half_moved_soon(
+        &env,
         serde_json::json!([{
-            "message": three, "copy": null, "folder": "inbox", "target": "archive",
-            "maybe": true,
-        }])
-    );
+            "message": three, "copy": copy, "folder": "inbox", "target": "archive",
+            "maybe": false,
+        }]),
+    )
+    .await;
     let text = stdout(&env.act(&["status"]).await);
-    assert!(text.contains("may be in both inbox and archive"), "{text}");
+    assert!(text.contains("is in both inbox and archive"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_maybe_half_move_whose_copy_never_landed_settles_once_the_target_is_synced() {
+    // The copy is never made, and its answer never comes; then the target cannot be read.
+    let (server, env, _daemon) = started_with(
+        mailbox().without_move().stall("UID COPY"),
+        &["--action-timeout", "1"],
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    eventually(10, "the copy", || tries(&server, "UID COPY") == 1).await;
+    server.heal();
+    server.refuse("STATUS");
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(event["maybe_copied"], true, "{event}");
+
+    // Nothing was copied, nothing removed: the target's sync finds no copy, and the row leaves.
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(server.uids("Archive"), Vec::<u32>::new());
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    half_moved_soon(&env, serde_json::json!([])).await;
+    assert_eq!(env.half_move_rows(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_move_whose_source_was_renumbered_is_found_again_by_its_fingerprint() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["copied"], true, "{event}");
+    eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
+
+    // The server renumbers the inbox: the message is at UID 2 now, and still in both folders.
+    server.heal();
+    server.expunge("INBOX", 1);
+    server.bump_uidvalidity("INBOX");
+    succeeded(&sync_soon(&env).await);
+    eventually(10, "the inbox rebuilt", || env.uids("INBOX") == [1, 2, 3]).await;
+    let found = env.id("INBOX", 2);
+    assert_ne!(found, three);
+    let copy = env.id("Archive", 1);
+    half_moved_soon(
+        &env,
+        serde_json::json!([{
+            "message": found, "copy": copy, "folder": "inbox", "target": "archive",
+            "maybe": false,
+        }]),
+    )
+    .await;
+    assert_eq!(server.uids("Archive"), [1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_settled_half_move_leaves_after_a_complete_sync_but_not_on_a_renumbering() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    until_settled(&env, &mut events).await;
+    eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
+    server.heal();
+
+    // A renumbering of the target empties it in the copy: the row stays, and the copy is found
+    // again under the new UIDVALIDITY.
+    server.bump_uidvalidity("Archive");
+    succeeded(&sync_soon(&env).await);
+    let copy = env.id("Archive", 1);
+    half_moved_soon(
+        &env,
+        serde_json::json!([{
+            "message": three, "copy": copy, "folder": "inbox", "target": "archive",
+            "maybe": false,
+        }]),
+    )
+    .await;
+    assert_eq!(env.half_move_rows(), 1);
+
+    // Another client removes the copy: the next complete sync of the archive deletes the row.
+    server.expunge("Archive", 1);
+    succeeded(&sync_soon(&env).await);
+    half_moved_soon(&env, serde_json::json!([])).await;
+    eventually(10, "the row deleted", || env.half_move_rows() == 0).await;
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+}
+
+/// Waits for the next action event that is not a retry, running a pass after each retry.
+async fn until_settled(env: &Env, events: &mut Events) -> serde_json::Value {
+    loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            return event;
+        }
+        succeeded(&sync_soon(env).await);
+    }
+}
+
+/// Waits until `status` lists `expected` as alice's half moves.
+async fn half_moved_soon(env: &Env, expected: serde_json::Value) {
+    let started = Instant::now();
+    loop {
+        let half_moved = env.status_of_alice().await["half_moved"].clone();
+        if half_moved == expected {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "half_moved is {half_moved}, not {expected}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+impl Env {
+    /// The rows of `half_move`, settled or not.
+    fn half_move_rows(&self) -> i64 {
+        self.copy()
+            .unwrap()
+            .query_row("SELECT count(*) FROM half_move", [], |row| row.get(0))
+            .unwrap()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

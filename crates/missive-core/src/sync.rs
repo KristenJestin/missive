@@ -313,11 +313,13 @@ pub async fn folder(
         .copied()
         .collect();
     if missing.is_empty() {
+        store.settle(folder.row.id)?;
         return Ok(Ok(changes));
     }
     // The sizes of what is missing, in commands of a bounded length. A refusal (`NO`) keeps the
     // sizes that came before it: a message the server cannot read must not hold the others back.
     let mut sizes = HashMap::new();
+    let mut fetched = 0;
     for set in uid_sets(&missing, SET_BYTES) {
         run(
             session,
@@ -362,6 +364,7 @@ pub async fn folder(
         // The whole messages that came are kept, however the command ended. One that did not
         // come is still missing from the copy: the next pass asks for it again.
         changes.new += messages.len();
+        fetched += messages.len();
         store.insert(folder.row.id, &messages)?;
         // A message expunged meanwhile is simply not there; the next listing tells. But one the
         // server did not size is told apart from it by nothing, so it is counted: the log says
@@ -369,6 +372,10 @@ pub async fn folder(
         if ended? == Ended::No || without_size {
             changes.refused += uids.len().saturating_sub(messages.len());
         }
+    }
+    // Only a copy that holds every message the listing gave tells what is gone.
+    if fetched == missing.len() {
+        store.settle(folder.row.id)?;
     }
     Ok(Ok(changes))
 }
