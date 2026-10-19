@@ -2124,14 +2124,7 @@ impl SmtpWorker {
     /// The account's password from the keyring, read as the IMAP worker reads it. `&mut`
     /// although only read: the copy is not `Sync`, and the future must be `Send`.
     async fn password(&mut self) -> Option<Password> {
-        let found = match Keyring::open().await {
-            Ok(keyring) => keyring.password(&self.id).await,
-            Err(e) => Err(e),
-        };
-        found.unwrap_or_else(|_| {
-            log!("account {}: the keyring cannot be read", self.key);
-            None
-        })
+        read_password(&self.id, self.key).await
     }
 
     /// Waits for `timeout`, or for a message written to (or put back in) the outbox. `false`
@@ -2165,7 +2158,10 @@ impl SmtpWorker {
                     }
                 }
                 _ = self.recheck.notified(), if refused.is_some() => {
-                    let now = self.password().await;
+                    let now = tokio::select! {
+                        now = read_password(&self.id, self.key) => now,
+                        _ = stopped(&mut self.stop) => return false,
+                    };
                     if let (Some(now), Some(refused)) = (now, refused)
                         && now.expose() != refused.expose()
                     {
@@ -2268,6 +2264,19 @@ impl SmtpWorker {
 
 const UNCERTAIN_LEFT: &str = "the daemon stopped while the message was being sent: it may have \
                               been sent, so it is not sent again";
+
+/// The SMTP worker's read of the keyring, apart from the worker so that a stop can be raced
+/// against it: a keyring that asks for a passphrase holds the read until someone types it.
+async fn read_password(id: &str, key: i64) -> Option<Password> {
+    let found = match Keyring::open().await {
+        Ok(keyring) => keyring.password(id).await,
+        Err(e) => Err(e),
+    };
+    found.unwrap_or_else(|_| {
+        log!("account {key}: the keyring cannot be read");
+        None
+    })
+}
 
 /// The kind of a sync error, for the log.
 fn kind(error: &SyncError) -> String {

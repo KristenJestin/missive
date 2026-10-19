@@ -1682,3 +1682,39 @@ async fn a_claim_without_a_claim_time_is_not_called_stuck() {
     succeeded(&output);
     assert!(!stdout(&output).contains("stuck"), "{}", stdout(&output));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_does_not_wait_for_a_keyring_read_during_the_wait_after_a_refused_login() {
+    let server = mailbox()
+        .smtp_answer("AUTH", "535 5.7.8 authentication failed")
+        .start()
+        .await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    let mut daemon = env.daemon().await;
+    env.ready().await;
+    succeeded(&env.compose(&["--body", BODY]).await);
+    eventually(20, "two refused logins", || {
+        env.outbox()
+            .first()
+            .is_some_and(|(_, _, attempts)| *attempts >= 2)
+    })
+    .await;
+    // The keyring waits for a passphrase nobody types; a sync makes the worker look at it.
+    env.keyring.stall_secret_reads();
+    succeeded(&env.run(&["sync"]).await);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let stopping = Instant::now();
+    daemon.stop(15).await;
+
+    assert!(
+        stopping.elapsed() < Duration::from_secs(3),
+        "the stop waited {:?}",
+        stopping.elapsed()
+    );
+    assert!(
+        !env.logs().contains("did not stop in time"),
+        "a worker was cut off"
+    );
+}
