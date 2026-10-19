@@ -304,7 +304,14 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
 fn refuse_if_open(account: &str, draft: &str) -> Result<(), ActError> {
     let key = match read::message(draft) {
         Ok(stored) => missive_core::compose::draft_message_id(&stored.raw),
-        Err(_) if MessageId::parse(draft).is_none() => Some(draft.to_owned()),
+        // The name the daemon finds the draft by: its brackets go, as `find_draft` strips them.
+        Err(_) if MessageId::parse(draft).is_none() => Some(
+            draft
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_owned(),
+        ),
         Err(_) => None,
     };
     if key.is_some_and(|key| draft_lock::is_held(account, &key)) {

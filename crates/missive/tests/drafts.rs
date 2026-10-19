@@ -2291,3 +2291,32 @@ async fn a_draft_of_another_client_open_in_a_window_is_refused_by_either_of_its_
     }
     drafts_on_server(&server, &["Re: Other client"]).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_named_by_a_bracketed_message_id_open_in_a_window_is_refused() {
+    let (server, env, _daemon, _id) = with_a_foreign_draft().await;
+    // The window holds the lock of the bare `Message-ID`; the shell names it with its brackets,
+    // as a header writes it, and the daemon finds the same draft under that name.
+    let runtime = env.path("runtime").join("missive");
+    let missive_core::draft_lock::Taking::Ours(_window) =
+        missive_core::draft_lock::take_in(&runtime, "alice", "other@example.com")
+    else {
+        panic!("the draft is free");
+    };
+    let output = env
+        .run(&[
+            "compose",
+            "--draft",
+            "<other@example.com>",
+            "--subject",
+            "Changed",
+        ])
+        .await;
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("open in a compose window"),
+        "{}",
+        stderr(&output)
+    );
+    drafts_on_server(&server, &["Re: Other client"]).await;
+}
