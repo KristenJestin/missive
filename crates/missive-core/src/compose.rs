@@ -178,6 +178,13 @@ impl Followup {
     }
 }
 
+/// The `Message-ID` of a draft, without its angle brackets: the same for every version of it.
+pub fn draft_message_id(raw: &[u8]) -> Option<String> {
+    MessageParser::default()
+        .parse_headers(raw)
+        .and_then(|parsed| parsed.message_id().map(str::to_owned))
+}
+
 impl Draft {
     /// Whether it can be sent: it has a recipient, and can be written.
     pub fn check(&self) -> Result<(), String> {
