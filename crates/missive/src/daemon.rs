@@ -104,6 +104,8 @@ pub struct Options {
     pub batch_size: usize,
     /// How long the server is given to answer each command of an action.
     pub action_timeout: Duration,
+    /// The least time between two counted tries of a copy for Sent.
+    pub copy_spacing: Duration,
 }
 
 macro_rules! log {
@@ -1580,6 +1582,7 @@ impl Worker {
             &mut self.store,
             self.key,
             self.options.action_timeout,
+            self.options.copy_spacing,
         )
         .await;
         for copy in &copies.copied {
@@ -2262,9 +2265,6 @@ impl SmtpWorker {
     }
 }
 
-const UNCERTAIN_LEFT: &str = "the daemon stopped while the message was being sent: it may have \
-                              been sent, so it is not sent again";
-
 /// The SMTP worker's read of the keyring, apart from the worker so that a stop can be raced
 /// against it: a keyring that asks for a passphrase holds the read until someone types it.
 async fn read_password(id: &str, key: i64) -> Option<Password> {
@@ -2277,6 +2277,9 @@ async fn read_password(id: &str, key: i64) -> Option<Password> {
         None
     })
 }
+
+const UNCERTAIN_LEFT: &str = "the daemon stopped while the message was being sent: it may have \
+                              been sent, so it is not sent again";
 
 /// The kind of a sync error, for the log.
 fn kind(error: &SyncError) -> String {

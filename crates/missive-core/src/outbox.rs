@@ -38,7 +38,9 @@
 //! recipients in it (see [`crate::compose`]). A try whose answer was lost, or that a killed daemon
 //! left, may have appended it: each try is counted before its `APPEND`, and every try after the
 //! first searches the Sent folder for its `Message-ID` first (a search that fails is not a try,
-//! but is counted apart). Missive never creates a Sent folder.
+//! but is counted apart). Two counted tries are at least [`COPY_SPACING`] apart, so that the
+//! limit means minutes: the passes and the wakes in between count none. Missive never creates a
+//! Sent folder.
 //! After [`MAX_ATTEMPTS`] tries, or [`MAX_ATTEMPTS`] failed searches, the copy is given up (the
 //! message was sent).
 
@@ -62,6 +64,11 @@ const RECORD_PAUSE: Duration = Duration::from_secs(1);
 /// second for the last one, so that a stop never takes away tries the record would have had.
 pub const RECORD_GRACE: Duration =
     Duration::from_secs(RECORD_PAUSE.as_secs() * (RECORD_TRIES as u64 - 1) + 1);
+
+/// The least time between two counted tries of a copy for Sent (an `APPEND` started, or a look in
+/// Sent that failed): the limit of [`MAX_ATTEMPTS`] means minutes, not the passes of a few
+/// seconds, so that a server that refuses for a minute does not use the tries up.
+pub const COPY_SPACING: Duration = Duration::from_secs(60);
 
 /// How long a message stays `claimed` before `status` calls it stuck, in milliseconds: more than
 /// a submission can take (each command waits at most 5 minutes, the data 10).
@@ -299,9 +306,10 @@ pub async fn copy_sent(
     store: &mut Store,
     key: i64,
     timeout: Duration,
+    spacing: Duration,
 ) -> (Copies, Result<(), SyncError>) {
     let mut copies = Copies::default();
-    let result = copy_each(session, store, key, timeout, &mut copies).await;
+    let result = copy_each(session, store, key, timeout, spacing, &mut copies).await;
     (copies, result)
 }
 
@@ -310,8 +318,10 @@ async fn copy_each(
     store: &mut Store,
     key: i64,
     timeout: Duration,
+    spacing: Duration,
     copies: &mut Copies,
 ) -> Result<(), SyncError> {
+    let spacing = i64::try_from(spacing.as_millis()).unwrap_or(i64::MAX);
     for copy in store.sent_copies(key)? {
         let id = copy.id;
         let Some((folder, name)) = store.sent_folder(key)? else {
@@ -334,6 +344,12 @@ async fn copy_each(
             });
             continue;
         };
+        // A pass, or a wake, within the spacing of the last counted try counts none: the limit of
+        // tries is meant to last minutes.
+        if copy.next_at > now() {
+            continue;
+        }
+        let next_at = now().saturating_add(spacing);
         // Only an append started counts: a search that fails (the connection dropped) says
         // nothing of the copy, and the next pass searches again, a few times.
         if copy.attempts > 0 {
@@ -350,15 +366,15 @@ async fn copy_each(
                 Ok(Ok(Some(false))) => {}
                 // A refusal is not an answer: appending again could double the copy.
                 Ok(Ok(None)) => {
-                    search_failed(store, id, copy.message_id, copies)?;
+                    search_failed(store, id, copy.message_id, next_at, copies)?;
                     continue;
                 }
                 Ok(Err(error)) => {
-                    search_failed(store, id, copy.message_id, copies)?;
+                    search_failed(store, id, copy.message_id, next_at, copies)?;
                     return Err(error);
                 }
                 Err(_) => {
-                    search_failed(store, id, copy.message_id, copies)?;
+                    search_failed(store, id, copy.message_id, next_at, copies)?;
                     copies.timed_out = true;
                     return Err(SyncError::Connection(ConnectError::Unreachable(
                         "the IMAP server did not answer SEARCH in time".to_owned(),
@@ -366,7 +382,7 @@ async fn copy_each(
                 }
             }
         }
-        let attempts = store.copy_trying(id)?;
+        let attempts = store.copy_trying(id, next_at)?;
         let tried =
             tokio::time::timeout(timeout, sync::append(session, &quoted, "\\Seen", &copy.raw))
                 .await;
@@ -433,9 +449,10 @@ fn search_failed(
     store: &mut Store,
     id: i64,
     message_id: String,
+    next_at: i64,
     copies: &mut Copies,
 ) -> rusqlite::Result<()> {
-    if store.copy_search_failed(id)? >= MAX_ATTEMPTS {
+    if store.copy_search_failed(id, next_at)? >= MAX_ATTEMPTS {
         store.copy_done(id)?;
         copies.copied.push(Copied::GivenUp {
             id,
