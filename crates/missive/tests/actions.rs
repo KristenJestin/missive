@@ -1963,6 +1963,38 @@ async fn wait_with_no_daemon_running_does_not_believe_the_state_the_last_one_lef
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wait_does_not_take_the_state_the_last_daemon_left_for_the_new_ones() {
+    let (_server, relay, env) = offline().await;
+    let mut daemon = env.daemon(&["--check-interval", "3600"]).await;
+    eventually(10, "unreachable", || {
+        env.state("alice").as_deref() == Some("unreachable")
+    })
+    .await;
+    assert!(daemon.stop("-TERM").await.success());
+    // The server is back, and the new daemon has not told any state yet: its worker waits for
+    // the keyring.
+    relay.up.store(true, Ordering::SeqCst);
+    env.keyring.stall_secret_reads();
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    assert_eq!(env.state("alice").as_deref(), Some("unreachable"));
+
+    let output = env
+        .act(&[
+            "mark",
+            &env.id("INBOX", 3),
+            "--read",
+            "--wait",
+            "--timeout",
+            "2",
+            "--json",
+        ])
+        .await;
+    assert_eq!(output.status.code(), Some(QUEUED), "{}", stderr(&output));
+    let answer = json(&output);
+    assert_eq!(answer["actions"][0]["reason"], "timeout", "{answer}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wait_with_a_daemon_older_than_the_command_says_it_cannot_tell() {
     let env = Env::new().await;
     std::fs::create_dir_all(env.socket().parent().unwrap()).unwrap();

@@ -18,7 +18,10 @@ Accounts are named by their identifier, as `missive account list` shows it.
 
 A watcher starts with the present, so that a program that has just begun knows where things stand
 without asking: one `state` event for each account, in the order of their identifiers, then one
-`unread` event. After these come the events as they happen, in the order they happened.
+`unread` event. After these come the events as they happen, in the order they happened. An account
+the daemon has not told a state for yet (it has just started, and its worker is still reading the
+keyring) has no `state` event in the present: the state the previous daemon left is not its state
+now, and its first `state` event comes as soon as it has one.
 
 Nothing before the moment of subscribing is replayed. A `new-message` that arrived while no one
 watched is not told; the `unread` event of the present shows its effect.
