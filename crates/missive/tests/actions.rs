@@ -1954,6 +1954,77 @@ async fn a_half_move_whose_source_was_renumbered_writes_no_copy_of_another_messa
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_move_refused_after_its_source_was_renumbered_is_found_again_by_its_fingerprint() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    // The copy is made, the removal refused: the action waits for its next try.
+    assert_eq!(events.action().await["outcome"], "retried");
+
+    // The server renumbers the inbox before that try: the message is at UID 2 now.
+    server.expunge("INBOX", 1);
+    server.bump_uidvalidity("INBOX");
+    succeeded(&sync_soon(&env).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["reason"], "renumbered", "{event}");
+    assert_eq!(event["copied"], true, "{event}");
+
+    // What tells the message from another was taken when the action was recorded: the next
+    // complete syncs find it in both folders, under the UIDs the server gives it now.
+    succeeded(&sync_soon(&env).await);
+    let found = env.id("INBOX", 2);
+    assert_ne!(found, three);
+    let copy = env.id("Archive", 1);
+    half_moved_soon(
+        &env,
+        serde_json::json!([{
+            "message": found, "copy": copy, "folder": "inbox", "target": "archive",
+            "maybe": false,
+        }]),
+    )
+    .await;
+    assert_eq!(server.uids("Archive"), [1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_maybe_half_move_refused_after_its_source_was_renumbered_settles_once_the_target_is_synced()
+ {
+    // The copy is never made, and its answer never comes.
+    let (server, env, _daemon) = started_with(
+        mailbox().without_move().stall("UID COPY"),
+        &["--action-timeout", "1"],
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    eventually(10, "the copy", || tries(&server, "UID COPY") == 1).await;
+
+    // The server renumbers the inbox, and the target cannot be read: whether the message was
+    // copied is not known.
+    server.heal();
+    server.refuse("STATUS");
+    server.expunge("INBOX", 1);
+    server.bump_uidvalidity("INBOX");
+    succeeded(&sync_soon(&env).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(event["maybe_copied"], true, "{event}");
+
+    // Nothing was copied: the target's sync finds no copy by the fingerprint taken when the
+    // action was recorded, and the row leaves. The target holds another message: an empty folder
+    // would not settle anything.
+    server.heal();
+    server.deliver("Archive", message(30));
+    succeeded(&sync_soon(&env).await);
+    succeeded(&sync_soon(&env).await);
+    half_moved_soon(&env, serde_json::json!([])).await;
+    eventually(10, "the row deleted", || env.half_move_rows() == 0).await;
+    assert_eq!(server.uids("Archive"), [1]);
+}
+
 /// The JSON object a `--json` command printed.
 fn json(output: &Output) -> serde_json::Value {
     serde_json::from_str(&stdout(output))
