@@ -686,6 +686,7 @@ async fn a_move_on_a_server_with_only_uidplus_copies_then_expunges_only_that_uid
             "SELECT \"INBOX\"",
             "STATUS \"Archive\" (UIDNEXT)",
             "UID COPY 3 \"Archive\"",
+            "UID SEARCH DELETED UID 3",
             "UID STORE 3 +FLAGS.SILENT (\\Deleted)",
             "UID EXPUNGE 3",
         ],
@@ -724,11 +725,13 @@ async fn a_server_without_move_or_uidplus_refuses_the_move_and_nothing_changes()
     );
     assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
     assert!(server.uids("Archive").is_empty());
-    let logs = env.logs();
-    assert!(
-        logs.contains("refused: the server has neither MOVE nor UIDPLUS"),
-        "{logs}"
-    );
+    // The queue is empty once the row left; the daemon logs the refusal around that, and a log
+    // read in between holds the line cut short.
+    eventually(10, "the refusal in the log", || {
+        env.logs()
+            .contains("refused: the server has neither MOVE nor UIDPLUS")
+    })
+    .await;
     // A permanent delete is refused the same way.
     succeeded(
         &env.act(&["delete", "--permanently", &env.id("Trash", 1)])
@@ -778,6 +781,7 @@ async fn delete_permanently_from_the_trash_expunges_that_uid_only() {
         from,
         &[
             "SELECT \"Trash\"",
+            "UID SEARCH DELETED UID 1",
             "UID STORE 1 +FLAGS.SILENT (\\Deleted)",
             "UID EXPUNGE 1",
         ],

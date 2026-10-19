@@ -60,6 +60,7 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `not-in-trash` | a `delete` with `permanently` of a message outside the trash, in an account that has one |
 | `unsupported` | a `move`, `delete` or `delete` with `permanently` the account's server cannot apply safely: it has neither `MOVE` nor `UIDPLUS` (a move), or no `UIDPLUS` (a permanent delete). Known from the server's capabilities, recorded at each connection; before the first one, the action is recorded, and refused when tried (`docs/events.md`) |
 | `busy` | a message whose move waits for the server: it takes no other action until then; or a `draft` naming a draft whose message waits in the outbox |
+| `already-sent` | a `draft` with `send` naming a draft whose message was already sent (the Sent folder holds it, or the outbox sent it or does not know whether the server took it): nothing is sent twice |
 | `uncertain` | a `resend` without `yes` of an `uncertain` message: the server may have taken it already |
 | `not-failed` | a `resend` or a `discard` of a message that is neither `failed` nor `uncertain` (`message` says its state) |
 | `bad-request` (`send`, `draft`) | also: the message cannot be sent as written (`message` says why: no recipient, an address that is not one…) |
@@ -212,7 +213,8 @@ it went.
 every version of the draft. With `send`, the answer also has `outbox`, as for `send`. A `draft`
 that names no draft of the account is answered `no-such-message`. A `draft` naming a draft whose
 message still waits in the outbox is answered `busy`: a client that lost the answer to its `send`
-and asks again sends nothing twice.
+and asks again sends nothing twice. A `draft` with `send` naming a draft whose message was already
+sent is answered `already-sent`.
 
 A `draft` naming a draft another client wrote (one without Missive's `X-Missive-Draft` header)
 does not replace it: the daemon makes a new draft from it, under a new `message_id`, and the

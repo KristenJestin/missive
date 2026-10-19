@@ -32,7 +32,9 @@
 //! command changes nothing for it, and the next sync removes it from the copy.
 //!
 //! A removal whose `UID EXPUNGE` was refused takes its `\Deleted` back, so that no other
-//! client's `EXPUNGE` removes the message later.
+//! client's `EXPUNGE` removes the message later, but only from the messages that did not have it
+//! before the removal (`UID SEARCH DELETED UID <uids>` asks which): a `\Deleted` another client
+//! set stays.
 //!
 //! A move refused once its `UID COPY` was made leaves the messages in both folders. Nothing is
 //! removed to fix it: the copy shows both, the outcome says so, and the messages are recorded as
@@ -61,6 +63,20 @@ pub const MAX_ATTEMPTS: u32 = 5;
 /// How long the server is given to answer each command of an action: one that never answers
 /// would hold the worker for ever. Moving many large messages can take a server a while.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The slowest link an `APPEND` is waited for, in bytes per second (about 256 kbit/s).
+const APPEND_RATE: u64 = 32 * 1024;
+
+/// The longest an `APPEND` is waited for, whatever its size.
+const APPEND_TIMEOUT_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// How long to wait for an `APPEND` of `size` bytes: the timeout of a command, and the time its
+/// message takes on a slow link, up to a bound. A large message on a slow link would otherwise
+/// time out at every pass and be uploaded again. A timeout asked beyond the bound is kept.
+fn append_timeout(timeout: Duration, size: usize) -> Duration {
+    let upload = Duration::from_secs(size as u64 / APPEND_RATE);
+    (timeout + upload).min(APPEND_TIMEOUT_MAX.max(timeout))
+}
 
 /// What an action does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,8 +351,9 @@ impl Server<'_> {
         flags: &str,
         raw: &[u8],
     ) -> std::result::Result<Done, SyncError> {
+        let timeout = append_timeout(self.timeout, raw.len());
         let result =
-            tokio::time::timeout(self.timeout, sync::append(self.session, name, flags, raw)).await;
+            tokio::time::timeout(timeout, sync::append(self.session, name, flags, raw)).await;
         self.timed(result)
     }
 }
@@ -555,7 +572,7 @@ async fn one(
         });
     }
     if action.kind == Kind::DeletePermanently {
-        return Ok(match remove(server, &set).await? {
+        return Ok(match remove(server, &action.uids).await? {
             Done::Ok(_) => {
                 store.applied_delete(action)?;
                 Step::Applied { resync: Vec::new() }
@@ -586,16 +603,23 @@ async fn one(
             Done::Bad => BAD,
         });
     }
-    copy_then_remove(server, store, action, &set, &target_name).await
+    copy_then_remove(server, store, action, &target_name).await
 }
 
 /// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` of the same UIDs. An expunge the
-/// server refused takes the flag back (best effort): left there, another client's `EXPUNGE`
-/// would remove messages the copy shows, once the action is refused.
+/// server refused takes the flag back (best effort), but only from the messages that did not
+/// have it before: left there, another client's `EXPUNGE` would remove messages the copy shows,
+/// once the action is refused, and a `\Deleted` another client set is not ours to clear. Which
+/// ones had it is asked first (`UID SEARCH DELETED UID <set>`); an answer refused means the
+/// removal is not started.
 pub(crate) async fn remove(
     server: &mut Server<'_>,
-    set: &str,
+    uids: &[u32],
 ) -> std::result::Result<Done, SyncError> {
+    let set = sync::uid_set(uids);
+    let Some(marked) = server.search(&format!("DELETED UID {set}")).await? else {
+        return Ok(Done::No { try_create: false });
+    };
     let done = server
         .run_done(
             &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
@@ -608,10 +632,18 @@ pub(crate) async fn remove(
     let done = server
         .run_done(&format!("UID EXPUNGE {set}"), |_| {})
         .await?;
-    if !matches!(done, Done::Ok(_)) {
+    let ours: Vec<u32> = uids
+        .iter()
+        .copied()
+        .filter(|uid| !marked.contains(uid))
+        .collect();
+    if !matches!(done, Done::Ok(_)) && !ours.is_empty() {
         server
             .run_done(
-                &format!("UID STORE {set} -FLAGS.SILENT (\\Deleted)"),
+                &format!(
+                    "UID STORE {} -FLAGS.SILENT (\\Deleted)",
+                    sync::uid_set(&ours)
+                ),
                 |_| {},
             )
             .await?;
@@ -624,7 +656,6 @@ async fn copy_then_remove(
     server: &mut Server<'_>,
     store: &mut Store,
     action: &Action,
-    set: &str,
     target_name: &str,
 ) -> std::result::Result<Step, SyncError> {
     let mut action = action.clone();
@@ -669,7 +700,7 @@ async fn copy_then_remove(
         }
     }
     // Copied: only the removal from the source is left, which can be tried again as it is.
-    Ok(match remove(server, set).await? {
+    Ok(match remove(server, &action.uids).await? {
         Done::Ok(_) => Step::Applied {
             resync: store.applied_move(&action, action.copied.as_ref())?,
         },
@@ -870,6 +901,23 @@ async fn uid_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_append_is_given_a_timeout_that_grows_with_its_size_up_to_a_bound() {
+        let base = Duration::from_secs(30);
+        // A small message gets the usual timeout.
+        assert_eq!(append_timeout(base, 1_000), base);
+        // A large one on a slow link gets longer, in proportion.
+        let ten = append_timeout(base, 10 * 1024 * 1024);
+        let twenty = append_timeout(base, 20 * 1024 * 1024);
+        assert!(ten > base * 4, "{ten:?}");
+        assert!(twenty > ten, "{twenty:?}");
+        // Bounded: a connection that never answers is not waited for for ever.
+        assert_eq!(append_timeout(base, usize::MAX), APPEND_TIMEOUT_MAX);
+        // A timeout asked beyond the bound is kept.
+        let long = Duration::from_secs(3600);
+        assert_eq!(append_timeout(long, 100 * 1024 * 1024), long);
+    }
 
     #[test]
     fn a_refused_move_that_copied_says_the_messages_are_in_both_folders() {
