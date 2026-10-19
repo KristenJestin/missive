@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{NewMessage, Store};
 use crate::actions::{Kind, Queued, Refused, Wanted, unsupported, with_flag};
-use crate::copy::{MessageId, NotFound};
+use crate::copy::{MessageId, NotFound, has_flag};
 use crate::sync::CopyUid;
 
 /// The roles a move can name a folder by.
@@ -112,6 +112,43 @@ impl Store {
             transaction.commit()?;
         }
         Ok(queued)
+    }
+}
+
+impl Store {
+    /// Whether `id` names a message of the copy now, as an action would find it: the refusal
+    /// says why when it does not. For a request that names a message without acting on it.
+    pub fn check_message(&self, id: &str) -> rusqlite::Result<Result<(), Refused>> {
+        let Some(parsed) = MessageId::parse(id) else {
+            return Ok(Err(not_found(id, NotFound::Invalid)));
+        };
+        let folder: Option<(Option<u32>, String)> = self
+            .connection
+            .query_row(
+                "SELECT folder.uidvalidity, folder.name FROM folder
+                   JOIN account ON account.key = folder.account
+                  WHERE account.id = ?1 AND folder.id = ?2",
+                params![parsed.account, parsed.folder],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((uidvalidity, name)) = folder else {
+            return Ok(Err(not_found(id, NotFound::Unknown)));
+        };
+        if uidvalidity.unwrap_or(0) != parsed.uidvalidity {
+            return Ok(Err(not_found(id, NotFound::Renumbered(name))));
+        }
+        let found: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM message WHERE folder = ?1 AND uid = ?2",
+                params![parsed.folder, parsed.uid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found
+            .map(drop)
+            .ok_or_else(|| not_found(id, NotFound::Unknown)))
     }
 }
 
@@ -269,6 +306,26 @@ pub(super) fn queue_in(
                 (Kind::DeletePermanently, None)
             }
         };
+        if let Some((flag, add)) = kind.flag() {
+            // A flag change a message already has is no change: recorded, a skipped action
+            // would take the flag back from the copy though the server has it.
+            let folder = group.folder;
+            let mut kept = Vec::new();
+            for uid in &group.uids {
+                let flags: String = transaction.query_row(
+                    "SELECT flags FROM message WHERE folder = ?1 AND uid = ?2",
+                    params![folder, uid],
+                    |r| r.get(0),
+                )?;
+                if has_flag(&flags, flag) != add {
+                    kept.push(*uid);
+                }
+            }
+            if kept.is_empty() {
+                continue;
+            }
+            group.uids = kept;
+        }
         let capabilities: (Option<bool>, Option<bool>) = transaction.query_row(
             "SELECT can_move, can_uidplus FROM account WHERE key = ?1",
             [group.account],
@@ -649,6 +706,32 @@ impl Store {
         transaction.execute("DELETE FROM action WHERE id = ?1", [action.id])?;
         for uid in &action.uids {
             moving_again(&transaction, action.folder.id, *uid)?;
+        }
+        transaction.commit()
+    }
+
+    /// Drops a flag action the server cannot keep (a keyword in a folder that says no keyword
+    /// stays), and takes its flag back from the copy's messages there and then: the server was
+    /// never asked, so nothing in the folder changed and it is not read again.
+    pub fn skipped(&mut self, action: &Action) -> rusqlite::Result<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM action WHERE id = ?1", [action.id])?;
+        if let Some((flag, add)) = action.kind.flag() {
+            for uid in &action.uids {
+                let flags: Option<String> = transaction
+                    .query_row(
+                        "SELECT flags FROM message WHERE folder = ?1 AND uid = ?2",
+                        params![action.folder.id, uid],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(flags) = flags {
+                    transaction.execute(
+                        "UPDATE message SET flags = ?3 WHERE folder = ?1 AND uid = ?2",
+                        params![action.folder.id, uid, with_flag(&flags, flag, !add)],
+                    )?;
+                }
+            }
         }
         transaction.commit()
     }
@@ -1133,6 +1216,78 @@ mod tests {
     }
 
     #[test]
+    fn a_keyword_the_server_cannot_keep_is_taken_back_at_once_and_the_folder_is_left_alone() {
+        let mut f = fixture();
+        f.store.apply_listing(f.inbox, &[], &[], Some(9)).unwrap();
+        f.queue(&[f.id(f.inbox, 2)], Wanted::Mark(Kind::Forwarded))
+            .unwrap();
+        assert_eq!(f.flags(f.inbox)[&2], "$Forwarded");
+        let forwarded = f.next();
+
+        f.store.skipped(&forwarded).unwrap();
+
+        assert_eq!(f.actions(), 0);
+        assert_eq!(f.flags(f.inbox)[&2], "");
+        assert_eq!(
+            f.flags(f.inbox)[&1],
+            "\\Seen",
+            "the other messages are untouched"
+        );
+        // Nothing asks for the folder to be read again.
+        let row = f.store.folder(1, "INBOX", Some("inbox")).unwrap();
+        assert_eq!(row.highest_modseq, Some(9));
+    }
+
+    #[test]
+    fn a_flag_a_message_already_has_is_not_queued_so_a_skipped_action_cannot_take_it_back() {
+        let mut f = fixture();
+        f.store
+            .apply_listing(
+                f.inbox,
+                &[],
+                &[(2, "$Forwarded \\Answered".to_owned())],
+                Some(9),
+            )
+            .unwrap();
+
+        for kind in [Kind::Forwarded, Kind::Answered] {
+            let queued = f.queue(&[f.id(f.inbox, 2)], Wanted::Mark(kind)).unwrap();
+            assert!(queued.actions.is_empty(), "{kind:?}");
+        }
+        // Taking a flag away from a message that has not got it is as much of a no-op.
+        let queued = f
+            .queue(&[f.id(f.inbox, 2)], Wanted::Mark(Kind::Unread))
+            .unwrap();
+        assert!(queued.actions.is_empty());
+
+        assert_eq!(f.actions(), 0);
+        assert_eq!(f.flags(f.inbox)[&2], "$Forwarded \\Answered");
+    }
+
+    #[test]
+    fn a_mark_is_queued_for_the_messages_that_lack_the_flag_only() {
+        let mut f = fixture();
+        f.store
+            .apply_listing(f.inbox, &[], &[(2, "$Forwarded".to_owned())], Some(9))
+            .unwrap();
+
+        let queued = f
+            .queue(
+                &[f.id(f.inbox, 2), f.id(f.inbox, 3)],
+                Wanted::Mark(Kind::Forwarded),
+            )
+            .unwrap();
+
+        assert_eq!(queued.actions.len(), 1);
+        assert_eq!(queued.messages.len(), 2, "both are named in the answer");
+        let forwarded = f.next();
+        assert_eq!(forwarded.uids, [3]);
+        f.store.skipped(&forwarded).unwrap();
+        assert_eq!(f.flags(f.inbox)[&2], "$Forwarded");
+        assert_eq!(f.flags(f.inbox)[&3], "");
+    }
+
+    #[test]
     fn a_refused_mark_leaves_the_queue_and_its_folder_is_read_again_whole() {
         let mut f = fixture();
         f.store.apply_listing(f.inbox, &[], &[], Some(9)).unwrap();
@@ -1309,6 +1464,19 @@ mod tests {
             .apply_listing(f.inbox, &[], &[(2, String::new())], None)
             .unwrap();
         assert_eq!(f.flags(f.inbox)[&2], "");
+    }
+
+    #[test]
+    fn a_message_is_checked_without_acting_on_it() {
+        let f = fixture();
+        assert!(f.store.check_message(&f.id(f.inbox, 2)).unwrap().is_ok());
+        let id = f.id(f.inbox, 99);
+        for bad in [id.as_str(), "alice/999/1/1", "not an id", "other/1/1/1"] {
+            let refused = f.store.check_message(bad).unwrap().unwrap_err();
+            assert_eq!(refused.error, "no-such-message", "{bad}");
+            assert!(refused.message.starts_with(bad), "{}", refused.message);
+        }
+        assert_eq!(f.actions(), 0);
     }
 
     #[test]

@@ -668,7 +668,7 @@ pub fn shown(id: &str) -> std::result::Result<Stored, ShowError> {
     }
     let configured = configured()?;
     let waiting = match open()? {
-        Some(copy) => copy.waiting(id)?,
+        Some(copy) => copy.waiting(None, id)?,
         None => None,
     };
     match waiting {

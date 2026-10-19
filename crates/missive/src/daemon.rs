@@ -41,7 +41,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use missive_core::account::{Account, AccountStore, Listing, Password};
 use missive_core::actions::{self, Kind, Outcome, Wanted};
 use missive_core::client;
-use missive_core::compose::{self, Attachment, Draft, Mailbox};
+use missive_core::compose::{self, Attachment, Draft, Followup, Mailbox};
 use missive_core::connect::{ConnectError, ImapSession, client_config, open_imap};
 use missive_core::copy::{Copy, MessageId};
 use missive_core::drafts;
@@ -753,21 +753,30 @@ impl Daemon {
             Ok(key) => key,
             Err(e) => return failed(e.to_string()),
         };
+        let asked = match self.followup(&store, name, &request.answers, &request.forwards) {
+            Ok(asked) => asked,
+            Err(refused) => return *refused,
+        };
         // Only a draft Missive wrote is replaced: another client's stays on the server as it is,
         // and a new draft, Missive's own, is made from it (`kept`).
-        let (mut draft, message_id, kept, source) = match &request.draft {
-            None => (Draft::default(), None, None, None),
+        let (mut draft, message_id, kept, source, stored_followup) = match &request.draft {
+            None => (Draft::default(), None, None, None, Followup::default()),
             Some(id) => match store.find_draft(key, id) {
                 Ok(Some(stored)) => match Draft::read(&stored.raw) {
-                    Ok(draft) if compose::is_own_draft(&stored.raw) => {
-                        (draft, stored.message_id, None, None)
-                    }
+                    Ok(draft) if compose::is_own_draft(&stored.raw) => (
+                        draft,
+                        stored.message_id,
+                        None,
+                        None,
+                        Followup::read(&stored.raw),
+                    ),
                     // Named by its own Message-ID, whichever way the request named it.
                     Ok(draft) => (
                         draft,
                         None,
                         Some(id.clone()),
                         Some(stored.message_id.unwrap_or_else(|| id.clone())),
+                        Followup::default(),
                     ),
                     Err(why) => return Answer::error(Some(name), "bad-request", why),
                 },
@@ -813,7 +822,16 @@ impl Daemon {
                 Err(e) => return failed(e.to_string()),
             }
         }
-        let changed = request.to.is_some()
+        // What the request names replaces what the draft kept; a request that names nothing
+        // leaves the draft's link as it is, so that a draft picked up later still marks the
+        // message it answers.
+        let followup = if asked == Followup::default() {
+            stored_followup.clone()
+        } else {
+            asked
+        };
+        let changed = followup != stored_followup
+            || request.to.is_some()
             || request.cc.is_some()
             || request.bcc.is_some()
             || request.subject.is_some()
@@ -841,13 +859,14 @@ impl Daemon {
                 html_dropped = draft.set_body(body);
             }
             if let Some(attachments) = request.attachments {
-                draft.attachments = attachments
+                let attachments = attachments
                     .into_iter()
                     .map(|a| Attachment {
                         name: a.name,
                         data: a.data,
                     })
                     .collect();
+                html_dropped |= draft.set_attachments(attachments);
             }
             if let Some(id) = request.in_reply_to {
                 draft.in_reply_to = vec![id];
@@ -871,7 +890,7 @@ impl Daemon {
         // A draft sent as it is needs no new version.
         let save = !request.send || (request.draft.is_some() && changed);
         if save {
-            let saved = store.save_draft(key, &built.message_id, &built.as_draft());
+            let saved = store.save_draft(key, &built.message_id, &built.as_draft(&followup));
             if let Err(e) = saved {
                 return failed(e.to_string());
             }
@@ -917,7 +936,7 @@ impl Daemon {
         let draft = (save || (request.draft.is_some() && kept.is_none()))
             .then_some(built.message_id.as_str());
         let sent_copy = !account.server_saves_sent;
-        let followed = followed(request.answers.as_deref(), request.forwards.as_deref());
+        let followed = followed(followup.answers.as_deref(), followup.forwards.as_deref());
         let queued = match (&source, followed) {
             (Some(source), followed) => {
                 store.enqueue_kept(key, &built, sent_copy, draft, followed, source)
@@ -947,6 +966,46 @@ impl Daemon {
             html_dropped,
             ..Answer::default()
         }
+    }
+
+    /// The message a request says it answers or forwards, checked: it names one message of the
+    /// copy, whichever account's (a reply may be written from another account), and no more
+    /// than an identifier. The answer to give when it does not.
+    fn followup(
+        &self,
+        store: &Store,
+        name: &str,
+        answers: &Option<String>,
+        forwards: &Option<String>,
+    ) -> Result<Followup, Box<Answer>> {
+        let asked = Followup {
+            answers: answers.clone(),
+            forwards: forwards.clone(),
+        };
+        for id in asked.answers.iter().chain(&asked.forwards) {
+            match store.check_message(id) {
+                Ok(Ok(())) => {}
+                Ok(Err(refused)) => {
+                    return Err(Box::new(Answer::error(
+                        Some(name),
+                        refused.error,
+                        refused.message,
+                    )));
+                }
+                Err(e) => {
+                    log!("cannot read the local copy ({e})");
+                    return Err(Box::new(Answer::error(
+                        Some(name),
+                        "failed",
+                        format!("the local copy could not be read ({e})"),
+                    )));
+                }
+            }
+        }
+        asked
+            .check()
+            .map_err(|why| Box::new(Answer::error(Some(name), "bad-request", why)))?;
+        Ok(asked)
     }
 
     /// Builds a message and writes it to its account's outbox, then wakes the account's SMTP
@@ -1012,6 +1071,20 @@ impl Daemon {
             Ok(built) => built,
             Err(why) => return Answer::error(Some(name), "bad-request", why),
         };
+        let checked = match Store::open(&self.store) {
+            Ok(store) => self.followup(&store, name, &send.answers, &send.forwards),
+            Err(e) => {
+                log!("cannot read the local copy ({e})");
+                return Answer::error(
+                    Some(name),
+                    "failed",
+                    format!("the local copy could not be read ({e})"),
+                );
+            }
+        };
+        if let Err(refused) = checked {
+            return *refused;
+        }
         let queued = Store::open(&self.store).and_then(|store| {
             let key = store.account(&send.account)?;
             let sent_copy = !account.server_saves_sent;

@@ -1590,6 +1590,66 @@ async fn with_a_display_mailto_and_compose_open_the_window_on_the_draft_saved_fi
     assert!(!args.exists(), "no window without a display");
 }
 
+/// `missive` run as a desktop session runs it, a display set and a fake `missive-window` on the
+/// `PATH` (see [`fake_window`]).
+fn with_display(env: &Env, missive: &Path, path: &Path) -> Command {
+    let mut real = Command::new(missive);
+    real.env_clear()
+        .env("HOME", env.home.path())
+        .env("XDG_CONFIG_HOME", env.path("config"))
+        .env("XDG_DATA_HOME", env.path("data"))
+        .env("XDG_STATE_HOME", env.path("state"))
+        .env("XDG_RUNTIME_DIR", env.path("runtime"))
+        .env("DBUS_SESSION_BUS_ADDRESS", env.keyring.address())
+        .env("PATH", path)
+        .env("WAYLAND_DISPLAY", "wayland-fake")
+        .stdin(Stdio::null());
+    real
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_window_saves_the_draft_and_opens_nothing_even_with_a_display() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let (missive, path, args) = fake_window(&env);
+
+    for command in [
+        vec!["compose", "--json", "--to", RECIPIENT, "--no-window"],
+        vec![
+            "mailto",
+            "--json",
+            "--no-window",
+            "mailto:zoe@example.com?subject=Linked",
+        ],
+    ] {
+        let output = with_display(&env, &missive, &path)
+            .args(&command)
+            .output()
+            .await
+            .unwrap();
+        succeeded(&output);
+        let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let id = saved["id"].as_str().unwrap();
+        // The draft is saved all the same.
+        let listed = env.drafts().await;
+        assert!(
+            listed.iter().any(|d| d["id"] == id),
+            "{command:?}: {listed:?}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!args.exists(), "a script that saves a draft gets no window");
+
+    // Without the flag, the same display opens it.
+    let output = with_display(&env, &missive, &path)
+        .args(["compose", "--json", "--to", RECIPIENT])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    eventually(10, "the window started", || written(&args)).await;
+}
+
 // ---- #73: a draft the server does not hold yet, cleared fields, the HTML part ----
 
 /// `show` and `open` of an unsent draft read it from the copy, named by its Message-ID.
@@ -1903,7 +1963,7 @@ async fn a_new_text_drops_the_html_part_and_says_so() {
 
     succeeded(&output);
     assert!(
-        stderr(&output).contains("HTML part is dropped"),
+        stderr(&output).contains("HTML part, which is dropped"),
         "{}",
         stderr(&output)
     );
@@ -2027,4 +2087,59 @@ async fn an_edit_to_a_draft_whose_send_is_uncertain_survives_its_resend_as_a_new
             .count(),
         1
     );
+}
+
+/// A draft of another client whose HTML draws its logo from a part of the message.
+fn foreign_html_with_a_logo() -> String {
+    format!(
+        "From: Alice Example <{USER}>\r\nTo: {NAME} <{RECIPIENT}>\r\n\
+         Subject: With a logo\r\nMessage-ID: <logo@example.com>\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/related; boundary=\"r1\"\r\n\r\n\
+         --r1\r\nContent-Type: multipart/alternative; boundary=\"a1\"\r\n\r\n\
+         --a1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{BODY}\r\n\
+         --a1\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+         <p>{BODY}</p><img src=\"cid:logo@example.org\">\r\n\
+         --a1--\r\n\
+         --r1\r\nContent-Type: image/png; name=\"logo.png\"\r\n\
+         Content-Disposition: inline; filename=\"logo.png\"\r\n\
+         Content-ID: <logo@example.org>\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+         iVBORw0KGgo=\r\n\
+         --r1--\r\n"
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn taking_the_attachments_off_a_draft_whose_html_draws_from_one_drops_the_html_too() {
+    let server = with_drafts(
+        Folder::new("Drafts")
+            .special_use(SpecialUse::Drafts)
+            .message(Message::new(foreign_html_with_a_logo()).flag("\\Draft")),
+    )
+    .start()
+    .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.drafts().await[0]["id"].as_str().unwrap().to_owned();
+    // Picked up as it is, the logo and the HTML that draws it stay together.
+    env.save(&["--draft", &id, "--subject", "Kept"]).await;
+    let kept = newest_draft(&server, 2).await;
+    assert!(html_of(&kept).unwrap().contains("cid:logo@example.org"));
+    assert_eq!(
+        MessageParser::default()
+            .parse(&kept)
+            .unwrap()
+            .attachment_count(),
+        1
+    );
+
+    let output = env.run(&["compose", "--draft", &id, "--no-attach"]).await;
+
+    succeeded(&output);
+    assert!(stderr(&output).contains("HTML part"), "{}", stderr(&output));
+    eventually(30, "the new version", || server_drafts(&server).len() == 3).await;
+    let raw = newest_draft(&server, 3).await;
+    let parsed = MessageParser::default().parse(&raw).unwrap();
+    assert_eq!(html_of(&raw), None, "no image left to draw");
+    assert_eq!(parsed.attachment_count(), 0);
+    assert!(!String::from_utf8_lossy(&raw).contains("cid:"));
+    assert!(parsed.body_text(0).unwrap().contains(BODY));
 }

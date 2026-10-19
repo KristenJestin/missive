@@ -352,7 +352,7 @@ impl std::fmt::Display for NotFound {
     }
 }
 
-fn has_flag(flags: &str, flag: &str) -> bool {
+pub(crate) fn has_flag(flags: &str, flag: &str) -> bool {
     flags.split(' ').any(|f| f.eq_ignore_ascii_case(flag))
 }
 
@@ -900,7 +900,10 @@ impl Copy {
     /// server: the draft's version waiting in the copy, else the message waiting in the outbox
     /// (or sent from it and not yet in the Sent folder). Shown as a message of the account's
     /// Drafts folder, with no UID: its identifier is the Message-ID. `None` when no row holds it.
-    pub fn waiting(&self, id: &str) -> Result<Option<Stored>> {
+    /// A Message-ID is random, so two accounts hold it only by accident: `account`, when given,
+    /// says whose; without it the answer is still always the same one (drafts before the outbox,
+    /// then the account first added).
+    pub fn waiting(&self, account: Option<&str>, id: &str) -> Result<Option<Stored>> {
         if self.version < DRAFTS_VERSION {
             return Ok(None);
         }
@@ -908,15 +911,18 @@ impl Copy {
         let found: Option<(String, i64, Vec<u8>)> = self
             .connection
             .query_row(
-                "SELECT account.id, account.key, draft.raw FROM draft
-                   JOIN account ON account.key = draft.account
-                  WHERE draft.message_id = ?1 AND draft.raw IS NOT NULL
-                  UNION ALL
-                 SELECT account.id, account.key, outbox.raw FROM outbox
-                   JOIN account ON account.key = outbox.account
-                  WHERE outbox.message_id = ?1
-                  LIMIT 1",
-                [message_id],
+                "SELECT id, key, raw FROM (
+                    SELECT account.id AS id, account.key AS key, draft.raw AS raw,
+                           0 AS source, draft.rowid AS row FROM draft
+                       JOIN account ON account.key = draft.account
+                      WHERE draft.message_id = ?1 AND draft.raw IS NOT NULL
+                        AND (?2 IS NULL OR account.id = ?2)
+                    UNION ALL
+                    SELECT account.id, account.key, outbox.raw, 1, outbox.id FROM outbox
+                       JOIN account ON account.key = outbox.account
+                      WHERE outbox.message_id = ?1 AND (?2 IS NULL OR account.id = ?2))
+                  ORDER BY source, key, row DESC LIMIT 1",
+                params![message_id, account],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -1198,6 +1204,81 @@ mod tests {
         assert_eq!(copy.draft("alice", "d@example.org").unwrap(), Some(waiting));
         assert_eq!(copy.draft("alice", "x@example.org").unwrap(), None);
         assert_eq!(copy.draft("bob", "d@example.org").unwrap(), None);
+    }
+
+    #[test]
+    fn a_message_waiting_is_found_for_the_account_asked_and_in_a_fixed_order() {
+        use crate::compose::Built;
+        let (_dir, mut store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        let bob = store.account("bob").unwrap();
+        let raw = |subject: &str| {
+            format!("Message-ID: <d@example.org>\r\nSubject: {subject}\r\n\r\nText\r\n")
+                .into_bytes()
+        };
+        let built = |subject: &str| Built {
+            sender: "alice@example.org".to_owned(),
+            recipients: vec!["zoe@example.com".to_owned()],
+            message_id: "d@example.org".to_owned(),
+            raw: raw(subject),
+            bcc_header: None,
+        };
+        // Bob's account holds the same Message-ID, in its outbox and as a draft; Alice's, in
+        // its outbox first and then as a draft.
+        store
+            .enqueue(alice, &built("alice outbox"), false, None)
+            .unwrap();
+        store
+            .enqueue(bob, &built("bob outbox"), false, None)
+            .unwrap();
+        store
+            .save_draft(bob, "d@example.org", &raw("bob draft"))
+            .unwrap();
+        store
+            .save_draft(alice, "d@example.org", &raw("alice draft"))
+            .unwrap();
+        let subject = |account: Option<&str>| {
+            copy.waiting(account, "d@example.org")
+                .unwrap()
+                .map(|stored| (stored.hit.account, stored.hit.subject.unwrap()))
+        };
+
+        // The account asked for gets its own, its draft before its outbox.
+        assert_eq!(
+            subject(Some("bob")),
+            Some(("bob".to_owned(), "bob draft".to_owned()))
+        );
+        assert_eq!(
+            subject(Some("alice")),
+            Some(("alice".to_owned(), "alice draft".to_owned()))
+        );
+        assert_eq!(subject(Some("carol")), None);
+        // Without one, the answer is the same every time: drafts first, then the first account.
+        for _ in 0..5 {
+            assert_eq!(
+                subject(None),
+                Some(("alice".to_owned(), "alice draft".to_owned()))
+            );
+        }
+        // A message only in the outbox of each: still the account asked for, else the first.
+        let queued = |subject: &str| Built {
+            message_id: "o@example.org".to_owned(),
+            ..built(subject)
+        };
+        store
+            .enqueue(bob, &queued("bob queued"), false, None)
+            .unwrap();
+        store
+            .enqueue(alice, &queued("alice queued"), false, None)
+            .unwrap();
+        let queued_subject = |account: Option<&str>| {
+            copy.waiting(account, "o@example.org")
+                .unwrap()
+                .map(|stored| stored.hit.account)
+        };
+        assert_eq!(queued_subject(Some("bob")).as_deref(), Some("bob"));
+        assert_eq!(queued_subject(Some("alice")).as_deref(), Some("alice"));
+        assert_eq!(queued_subject(None).as_deref(), Some("alice"));
     }
 
     #[test]

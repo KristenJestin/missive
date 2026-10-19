@@ -81,6 +81,9 @@ pub struct ComposeArgs {
     /// the server took it. Without it the message is saved as a draft.
     #[arg(long)]
     send: bool,
+    /// Open no compose window, even when a display is set: the draft is only saved.
+    #[arg(long)]
+    no_window: bool,
     /// One JSON object on standard output (see docs/cli.md).
     #[arg(long)]
     json: bool,
@@ -249,8 +252,8 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         in_reply_to: draft.in_reply_to.first().cloned(),
         references: draft.references,
         send: args.send,
-        answers: None,
-        forwards: None,
+        answers: a.answers,
+        forwards: a.forwards,
     }))
     .await?;
     let answer = answered(answer)?;
@@ -265,8 +268,8 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
     }
     if answer.html_dropped {
         eprintln!(
-            "The draft had an HTML part: the text you gave replaces it, so the HTML part is \
-             dropped."
+            "The draft had an HTML part, which is dropped: the text you gave replaces it, or an \
+             attachment it draws from was taken off."
         );
     }
     if args.send {
@@ -276,7 +279,9 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         return queued(outbox, message_id, args.json);
     }
     // Saved first: the window shows the draft, and nothing is lost if it cannot start.
-    crate::window::compose(&account, &message_id);
+    if !args.no_window {
+        crate::window::compose(&account, &message_id);
+    }
     if args.json {
         println!("{}", serde_json::to_string(&Saved { id: message_id })?);
     } else {

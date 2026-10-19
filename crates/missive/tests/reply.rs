@@ -838,6 +838,102 @@ async fn a_forward_marks_the_original_forwarded_once_it_is_sent_and_not_answered
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_keyword_a_server_cannot_keep_is_taken_back_in_the_copy_without_reading_the_folder_again()
+{
+    let server = mailbox().without_keywords().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    let log_before = server.imap_log().len();
+
+    succeeded(
+        &env.run(&[
+            "compose",
+            "--forward",
+            &id,
+            "--to",
+            "ina@example.net",
+            "--send",
+        ])
+        .await,
+    );
+    took(&server, 1).await;
+    eventually(30, "the action dropped", || {
+        let copy =
+            Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        copy.query_row("SELECT count(*) FROM action", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+            == 0
+    })
+    .await;
+    // Let a resync, if one were asked for, happen.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // The copy forgot the flag at once, and the folder's flags were not read again for it.
+    let shown = env.run(&["show", "--json", &id]).await;
+    succeeded(&shown);
+    assert!(!String::from_utf8_lossy(&shown.stdout).contains("Forwarded"));
+    let log = server.imap_log();
+    assert!(
+        !log[log_before..]
+            .iter()
+            .any(|line| line == "UID FETCH 1:* (FLAGS)"),
+        "{:?}",
+        &log[log_before..]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyword_the_message_already_has_stays_in_the_copy_where_the_server_keeps_no_keywords() {
+    let server = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .without_keywords()
+        .folder(
+            Folder::new("INBOX").message(Message::new(ORIGINAL).flag("$Forwarded").flag("\\Seen")),
+        )
+        .folder(Folder::new("Sent").special_use(SpecialUse::Sent))
+        .folder(Folder::new("Drafts").special_use(SpecialUse::Drafts))
+        .start()
+        .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    // `show` does not tell keywords: the copy's own flags do.
+    let copy_flags = || {
+        let copy =
+            Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        copy.query_row("SELECT flags FROM message", [], |r| r.get::<_, String>(0))
+            .unwrap()
+    };
+    assert!(copy_flags().contains("$Forwarded"), "{}", copy_flags());
+
+    succeeded(
+        &env.run(&[
+            "compose",
+            "--forward",
+            &id,
+            "--to",
+            "ina@example.net",
+            "--send",
+        ])
+        .await,
+    );
+    took(&server, 1).await;
+    eventually(30, "the queue empty", || {
+        let copy =
+            Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        copy.query_row("SELECT count(*) FROM action", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+            == 0
+    })
+    .await;
+    // Let a resync, if one were asked for, happen.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // The server has the keyword, and the copy still says so: nothing took it back.
+    assert!(flags(&server).contains(&"$Forwarded".to_owned()));
+    assert!(copy_flags().contains("$Forwarded"), "{}", copy_flags());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_server_that_keeps_no_keywords_is_not_asked_to_and_nothing_is_said() {
     let server = mailbox().without_keywords().start().await;
     let (env, _daemon) = started(&Setup::of(&server)).await;
@@ -879,4 +975,211 @@ async fn a_server_that_keeps_no_keywords_is_not_asked_to_and_nothing_is_said() {
     succeeded(&shown);
     assert!(!String::from_utf8_lossy(&shown.stdout).contains("Forwarded"));
     assert!(!env.logs().contains("refused"), "{}", env.logs());
+}
+
+/// A header of the message the server holds in Drafts, as text.
+fn header_of(raw: &[u8], name: &str) -> Option<String> {
+    MessageParser::default()
+        .parse_headers(raw)
+        .and_then(|parsed| {
+            parsed
+                .header(name)
+                .and_then(|value| value.as_text().map(str::to_owned))
+        })
+}
+
+/// Saves `args` as a draft with `compose --json`, waits until the server holds it, and gives
+/// its identifier.
+async fn saved_draft(env: &Env, server: &FakeServer, args: &[&str]) -> String {
+    let mut all = vec!["compose"];
+    all.extend(args);
+    all.push("--json");
+    let output = env.run(&all).await;
+    succeeded(&output);
+    let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    eventually(30, "the draft on the server", || {
+        !server.uids("Drafts").is_empty()
+    })
+    .await;
+    // The copy then holds the server's version of it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    saved["id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_draft_picked_up_again_and_sent_marks_the_original_and_sends_no_trace_of_it() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    let draft = saved_draft(&env, &server, &["--reply", &id, "--body", "Later"]).await;
+
+    let kept = server.raw("Drafts", 1).unwrap();
+    assert_eq!(header_of(&kept, "X-Missive-Answers"), Some(id.clone()));
+    assert!(!flags(&server).contains(&"\\Answered".to_owned()));
+
+    // Sent later, from the draft alone: it names nothing but the draft.
+    let sent = ask(
+        &env,
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "alice", "draft": draft,
+            "body": "Noon works.", "send": true,
+        }),
+    )
+    .await;
+    assert_eq!(sent["ok"], true, "{sent}");
+    took(&server, 1).await;
+    let message = &server.smtp_messages()[0].data;
+    assert_eq!(header_of(message, "X-Missive-Answers"), None);
+    assert!(!String::from_utf8_lossy(message).contains("X-Missive"));
+    eventually(30, "the original marked answered", || {
+        flags(&server).contains(&"\\Answered".to_owned())
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_draft_picked_up_again_and_sent_marks_the_original_forwarded() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    let draft = saved_draft(
+        &env,
+        &server,
+        &["--forward", &id, "--to", "ina@example.net"],
+    )
+    .await;
+    assert_eq!(
+        header_of(&server.raw("Drafts", 1).unwrap(), "X-Missive-Forwards"),
+        Some(id)
+    );
+
+    let sent = ask(
+        &env,
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "alice", "draft": draft, "send": true,
+        }),
+    )
+    .await;
+    assert_eq!(sent["ok"], true, "{sent}");
+    took(&server, 1).await;
+    assert!(!String::from_utf8_lossy(&server.smtp_messages()[0].data).contains("X-Missive"));
+    eventually(30, "the original marked forwarded", || {
+        flags(&server).contains(&"$Forwarded".to_owned())
+    })
+    .await;
+    assert!(!flags(&server).contains(&"\\Answered".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_with_no_link_changes_nothing_when_sent_and_the_link_is_kept_by_each_version() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    // A draft that answers nothing is sent without marking anything.
+    let plain = saved_draft(&env, &server, &["--to", "ina@example.net", "--body", "Hi"]).await;
+    assert_eq!(
+        header_of(&server.raw("Drafts", 1).unwrap(), "X-Missive-Answers"),
+        None
+    );
+    let sent = ask(
+        &env,
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "alice", "draft": plain, "send": true,
+        }),
+    )
+    .await;
+    assert_eq!(sent["ok"], true, "{sent}");
+    took(&server, 1).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(flags(&server).is_empty(), "{:?}", flags(&server));
+
+    // A reply draft changed by the window, which gives the link again or not, keeps it.
+    let reply = saved_draft(&env, &server, &["--reply", &id, "--body", "One"]).await;
+    for body in ["Two", "Three"] {
+        let saved = ask(
+            &env,
+            serde_json::json!({
+                "protocol": 1, "request": "draft", "account": "alice", "draft": reply, "body": body,
+            }),
+        )
+        .await;
+        assert_eq!(saved["ok"], true, "{saved}");
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let uids = server.uids("Drafts");
+    let newest = server.raw("Drafts", *uids.last().unwrap()).unwrap();
+    assert_eq!(header_of(&newest, "X-Missive-Answers"), Some(id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identifier_that_names_no_message_is_refused_and_nothing_is_saved_or_sent() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    let unknown = id.replace("/1", "/99");
+    assert_ne!(unknown, id);
+
+    for (field, value) in [
+        ("answers", unknown.as_str()),
+        ("forwards", "not an identifier"),
+    ] {
+        for send in [false, true] {
+            let mut request = serde_json::json!({
+                "protocol": 1, "request": "draft", "account": "alice",
+                "to": ["ina@example.net"], "subject": "Hi", "body": "Hello", "send": send,
+            });
+            request[field] = value.into();
+            let refused = ask(&env, request).await;
+            assert_eq!(refused["ok"], false, "{field} {send}: {refused}");
+            assert_eq!(refused["error"], "no-such-message", "{refused}");
+            assert!(
+                refused["message"].as_str().unwrap().contains(value),
+                "{refused}"
+            );
+        }
+        let refused = ask(
+            &env,
+            serde_json::json!({
+                "protocol": 1, "request": "send", "account": "alice", "to": ["ina@example.net"],
+                "subject": "Hi", "body": "Hello", field: value,
+            }),
+        )
+        .await;
+        assert_eq!(refused["error"], "no-such-message", "{field}: {refused}");
+    }
+    // Both at once: a message answers or forwards another, not both.
+    let both = ask(
+        &env,
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "alice", "to": ["ina@example.net"],
+            "answers": id, "forwards": id,
+        }),
+    )
+    .await;
+    assert_eq!(both["error"], "bad-request", "{both}");
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(server.smtp_messages().is_empty());
+    assert!(server.uids("Drafts").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identifier_of_another_account_is_taken_as_it_is_a_cross_account_reply_stays_allowed() {
+    let (alice, bob, env, _daemon) = alice_and_bob(ORIGINAL).await;
+    let id = original(&env).await;
+
+    let sent = ask(
+        &env,
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "bob", "to": ["zoe@example.com"],
+            "subject": "Re: Lunch?", "body": "Noon.", "answers": id, "send": true,
+        }),
+    )
+    .await;
+    assert_eq!(sent["ok"], true, "{sent}");
+    took(&bob, 1).await;
+    eventually(30, "the original marked answered on Alice's server", || {
+        flags(&alice).contains(&"\\Answered".to_owned())
+    })
+    .await;
 }
