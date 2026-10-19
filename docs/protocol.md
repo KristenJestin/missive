@@ -208,7 +208,8 @@ and asks again sends nothing twice.
 A `draft` naming a draft another client wrote (one without Missive's `X-Missive-Draft` header)
 does not replace it: the daemon makes a new draft from it, under a new `message_id`, and the
 answer also has `kept`, the `draft` given, which stays on the server as it is (and is not removed
-once the message is sent).
+once the message is sent). It is answered `busy` too while a message sent from it waits in the
+outbox, whether it is named by its identifier in `list` or by its `Message-ID`.
 
 ### `subscribe`
 

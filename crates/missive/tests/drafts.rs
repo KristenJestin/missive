@@ -799,6 +799,47 @@ async fn a_foreign_html_reply_draft_picked_up_and_sent_stays_byte_identical_on_t
     assert!(removals(&server).is_empty(), "{:?}", removals(&server));
 }
 
+/// Asks the daemon on its socket, as the window does, and reads its answer.
+async fn ask(env: &Env, request: serde_json::Value) -> serde_json::Value {
+    let stream = UnixStream::connect(env.socket()).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut line = request.to_string();
+    line.push('\n');
+    write.write_all(line.as_bytes()).await.unwrap();
+    let mut answer = String::new();
+    BufReader::new(read).read_line(&mut answer).await.unwrap();
+    serde_json::from_str(&answer).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_draft_sent_twice_while_queued_queues_one_message() {
+    let (server, env, _daemon, id) = with_a_foreign_draft().await;
+    // The first message waits at the server: it is still in the outbox when the second send comes.
+    server.smtp_delay("MAIL", Duration::from_secs(4));
+    let send = |draft: &str| {
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "alice", "draft": draft, "send": true,
+        })
+    };
+
+    let first = ask(&env, send(&id)).await;
+    assert_eq!(first["ok"], true, "{first}");
+    eventually(10, "the first message at MAIL FROM", || {
+        server.smtp_delayed() == 1
+    })
+    .await;
+    // A send asked again after a lost answer, by the identifier the window used or by the
+    // draft's Message-ID: the same draft, so the same answer.
+    for again in [id.as_str(), "other@example.com"] {
+        let second = ask(&env, send(again)).await;
+        assert_eq!(second["ok"], false, "{second}");
+        assert_eq!(second["error"], "busy", "{second}");
+    }
+
+    took(&server, 1).await;
+    drafts_on_server(&server, &["Re: Other client"]).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_near_miss_message_id_beside_the_draft_survives_a_replacement() {
     let own = |id: &str, subject: &str| {
