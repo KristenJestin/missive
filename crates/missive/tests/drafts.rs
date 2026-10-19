@@ -799,6 +799,47 @@ async fn a_foreign_html_reply_draft_picked_up_and_sent_stays_byte_identical_on_t
     assert!(removals(&server).is_empty(), "{:?}", removals(&server));
 }
 
+/// Asks the daemon on its socket, as the window does, and reads its answer.
+async fn ask(env: &Env, request: serde_json::Value) -> serde_json::Value {
+    let stream = UnixStream::connect(env.socket()).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut line = request.to_string();
+    line.push('\n');
+    write.write_all(line.as_bytes()).await.unwrap();
+    let mut answer = String::new();
+    BufReader::new(read).read_line(&mut answer).await.unwrap();
+    serde_json::from_str(&answer).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_draft_sent_twice_while_queued_queues_one_message() {
+    let (server, env, _daemon, id) = with_a_foreign_draft().await;
+    // The first message waits at the server: it is still in the outbox when the second send comes.
+    server.smtp_delay("MAIL", Duration::from_secs(4));
+    let send = |draft: &str| {
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "alice", "draft": draft, "send": true,
+        })
+    };
+
+    let first = ask(&env, send(&id)).await;
+    assert_eq!(first["ok"], true, "{first}");
+    eventually(10, "the first message at MAIL FROM", || {
+        server.smtp_delayed() == 1
+    })
+    .await;
+    // A send asked again after a lost answer, by the identifier the window used or by the
+    // draft's Message-ID: the same draft, so the same answer.
+    for again in [id.as_str(), "other@example.com"] {
+        let second = ask(&env, send(again)).await;
+        assert_eq!(second["ok"], false, "{second}");
+        assert_eq!(second["error"], "busy", "{second}");
+    }
+
+    took(&server, 1).await;
+    drafts_on_server(&server, &["Re: Other client"]).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_near_miss_message_id_beside_the_draft_survives_a_replacement() {
     let own = |id: &str, subject: &str| {
@@ -1247,4 +1288,100 @@ async fn mailto_refuses_a_link_that_would_inject_a_header_and_saves_nothing() {
     }
     assert!(env.drafts().await.is_empty());
     drafts_on_server(&server, &[]).await;
+}
+
+/// Whether the fake window wrote its five arguments.
+fn written(args: &Path) -> bool {
+    std::fs::read_to_string(args)
+        .is_ok_and(|text| text.lines().count() == 5 && text.ends_with('\n'))
+}
+
+/// A copy of `missive` alone in a folder, so that no real `missive-window` sits beside it, and a
+/// fake `missive-window` in another folder, for the `PATH`, that writes its arguments to `args`,
+/// one per line, with the shell's builtins alone (the `PATH` holds nothing else).
+fn fake_window(env: &Env) -> (PathBuf, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.path("bin");
+    let path = env.path("path");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&path).unwrap();
+    let missive = bin.join("missive");
+    std::fs::copy(env!("CARGO_BIN_EXE_missive"), &missive).unwrap();
+    let args = env.path("args");
+    let window = path.join("missive-window");
+    std::fs::write(
+        &window,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", args.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&window, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (missive, path, args)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_a_display_mailto_and_compose_open_the_window_on_the_draft_saved_first() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let (missive, path, args) = fake_window(&env);
+
+    let run = |command: &[&str]| {
+        let mut real = Command::new(&missive);
+        real.args(command)
+            .env_clear()
+            .env("HOME", env.home.path())
+            .env("XDG_CONFIG_HOME", env.path("config"))
+            .env("XDG_DATA_HOME", env.path("data"))
+            .env("XDG_STATE_HOME", env.path("state"))
+            .env("XDG_RUNTIME_DIR", env.path("runtime"))
+            .env("DBUS_SESSION_BUS_ADDRESS", env.keyring.address())
+            .env("PATH", &path)
+            .env("WAYLAND_DISPLAY", "wayland-fake")
+            .stdin(Stdio::null());
+        real
+    };
+    let output = run(&["mailto", "--json", "mailto:zoe@example.com?subject=Linked"])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = saved["id"].as_str().unwrap().to_owned();
+    eventually(10, "the window started", || written(&args)).await;
+    assert_eq!(
+        std::fs::read_to_string(&args).unwrap(),
+        format!("compose\n--account\nalice\n--draft\n{id}\n")
+    );
+    // The draft the window is started on is in the copy already.
+    let listed = env.drafts().await;
+    assert!(listed.iter().any(|d| d["id"] == id.as_str()), "{listed:?}");
+
+    std::fs::remove_file(&args).unwrap();
+    let output = run(&["compose", "--json", "--to", RECIPIENT])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    eventually(10, "the window started", || written(&args)).await;
+    assert!(
+        std::fs::read_to_string(&args)
+            .unwrap()
+            .ends_with(&format!("--draft\n{}\n", saved["id"].as_str().unwrap()))
+    );
+
+    // Sending opens nothing; without a display, nothing opens either.
+    std::fs::remove_file(&args).unwrap();
+    let output = run(&["compose", "--json", "--to", RECIPIENT, "--send"])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    let output = run(&["mailto", "mailto:zoe@example.com"])
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!args.exists(), "no window without a display");
 }

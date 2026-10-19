@@ -63,19 +63,36 @@ impl Store {
         sent_copy: bool,
         draft: Option<&str>,
     ) -> rusqlite::Result<i64> {
-        self.insert_outbox(account, built, sent_copy, draft, None)
+        self.insert_outbox(account, built, sent_copy, draft, None, None)
     }
 
-    /// Puts a reply in the account's outbox. Once the server took it, the message it answers
-    /// (`answers`, its identifier) is marked `\Answered`, through the queue of actions.
+    /// Puts a reply in the account's outbox, sent from a draft or not, as [`Store::enqueue`].
+    /// Once the server took it, the message it answers (`answers`, its identifier) is marked
+    /// `\Answered`, through the queue of actions.
     pub fn enqueue_reply(
         &self,
         account: i64,
         built: &Built,
         sent_copy: bool,
+        draft: Option<&str>,
         answers: &str,
     ) -> rusqlite::Result<i64> {
-        self.insert_outbox(account, built, sent_copy, None, Some(answers))
+        self.insert_outbox(account, built, sent_copy, draft, Some(answers), None)
+    }
+
+    /// Puts in the outbox a message sent from the draft of another client, named `source`
+    /// ([`Store::source_sending`]), as [`Store::enqueue`] or, with `answers`,
+    /// [`Store::enqueue_reply`] does.
+    pub fn enqueue_kept(
+        &self,
+        account: i64,
+        built: &Built,
+        sent_copy: bool,
+        draft: Option<&str>,
+        answers: Option<&str>,
+        source: &str,
+    ) -> rusqlite::Result<i64> {
+        self.insert_outbox(account, built, sent_copy, draft, answers, Some(source))
     }
 
     fn insert_outbox(
@@ -85,11 +102,12 @@ impl Store {
         sent_copy: bool,
         draft: Option<&str>,
         answers: Option<&str>,
+        source: Option<&str>,
     ) -> rusqlite::Result<i64> {
         self.connection.query_row(
             "INSERT INTO outbox (account, sender, recipients, message_id, raw, bcc_header,
-                                 sent_copy, queued_at, draft, answers)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch(), ?8, ?9)
+                                 sent_copy, queued_at, draft, answers, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch(), ?8, ?9, ?10)
              RETURNING id",
             params![
                 account,
@@ -100,7 +118,8 @@ impl Store {
                 built.bcc_header,
                 sent_copy,
                 draft,
-                answers
+                answers,
+                source
             ],
             |r| r.get(0),
         )
@@ -631,7 +650,7 @@ mod tests {
         let (_dir, mut store, account) = open();
         let (inbox, original) = with_a_message(&mut store, account);
         let reply = store
-            .enqueue_reply(account, &built(1), false, &original)
+            .enqueue_reply(account, &built(1), false, None, &original)
             .unwrap();
 
         // Waiting to be sent, it marks nothing.
@@ -658,7 +677,7 @@ mod tests {
         let (_dir, mut store, account) = open();
         let (inbox, original) = with_a_message(&mut store, account);
         let reply = store
-            .enqueue_reply(account, &built(1), true, &original)
+            .enqueue_reply(account, &built(1), true, None, &original)
             .unwrap();
         store.rebuild(inbox, 11).unwrap();
 

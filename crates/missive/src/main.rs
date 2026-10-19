@@ -6,6 +6,7 @@ mod open;
 mod outbox;
 mod read;
 mod watch;
+mod window;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;

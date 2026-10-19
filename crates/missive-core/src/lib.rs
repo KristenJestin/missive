@@ -4,6 +4,7 @@
 pub mod account;
 pub mod actions;
 pub mod body;
+pub mod chooser;
 pub mod client;
 pub mod compose;
 pub mod connect;
