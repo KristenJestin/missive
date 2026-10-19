@@ -9,7 +9,9 @@
 //!   message ([`crate::store::Store::send_again`]).
 //! - `claimed`: a worker took it, before its first command: no other worker takes it. Nothing
 //!   was sent for it yet, so a daemon killed then leaves it to the next one, which puts it back
-//!   in the queue ([`crate::store::Store::release_claimed`]).
+//!   in the queue ([`crate::store::Store::release_claimed`]). A worker that cannot write the
+//!   outbox for five tries leaves it so until the next start: `status` calls a message claimed
+//!   for more than [`CLAIM_STUCK_MS`] stuck.
 //! - `sending`: written just before the end of data is, and only when the message was written
 //!   whole: what follows may reach the server. A daemon killed then leaves the row so; the next
 //!   one makes it `uncertain` ([`crate::store::Store::sending_left`]).
@@ -28,13 +30,15 @@
 //!
 //! After the server's `250`, recording that it was sent is tried again for a while when the copy
 //! is busy: a row left `sending` would be reported `uncertain` by the next daemon, for a message
-//! that was sent.
+//! that was sent. A daemon that stops meanwhile finishes it, for a short while ([`record`] is
+//! apart from [`submit_next`] for that).
 //!
 //! The copy in Sent is appended by the account's IMAP connection, through the verified write
 //! path (`APPEND` counts only with its tagged `OK`), flagged `\Seen`, with the message's Bcc
 //! recipients in it (see [`crate::compose`]). A try whose answer was lost, or that a killed daemon
 //! left, may have appended it: each try is counted before its `APPEND`, and every try after the
-//! first searches the Sent folder for its `Message-ID` first. Missive never creates a Sent folder.
+//! first searches the Sent folder for its `Message-ID` first (a search that fails is not a try).
+//! Missive never creates a Sent folder.
 //! After [`MAX_ATTEMPTS`] tries the copy is given up (the message was sent).
 
 use std::sync::Arc;
@@ -53,6 +57,10 @@ use crate::sync::{self, Done, SyncError};
 /// copy is busy: each try already waits for the copy as long as its busy timeout says.
 const RECORD_TRIES: u32 = 5;
 const RECORD_PAUSE: Duration = Duration::from_secs(1);
+
+/// How long a message stays `claimed` before `status` calls it stuck, in milliseconds: more than
+/// a submission can take (each command waits at most 5 minutes, the data 10).
+pub const CLAIM_STUCK_MS: i64 = 60 * 60 * 1000;
 
 /// Now, in milliseconds since the epoch: the outbox's clock.
 pub fn now() -> i64 {
@@ -91,6 +99,16 @@ pub enum Tried {
     },
 }
 
+/// A message submitted, and what the server said: not recorded yet.
+#[derive(Debug)]
+pub struct Submission {
+    id: i64,
+    message_id: String,
+    /// Whether a copy is to go in Sent (the server does not keep one itself).
+    sent_copy: bool,
+    submitted: Result<Submitted, ConnectError>,
+}
+
 /// Submits the account's first message whose time has come, if there is one, and records what
 /// came of it.
 pub async fn send_next(
@@ -100,6 +118,22 @@ pub async fn send_next(
     password: &Password,
     tls: Arc<ClientConfig>,
 ) -> rusqlite::Result<Option<Tried>> {
+    match submit_next(store, key, account, password, tls).await? {
+        Some(submission) => record(store, key, submission).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The first half of [`send_next`]: claims the account's first message whose time has come, if
+/// there is one, and submits it. A caller that stops its worker may drop this future; it must not
+/// drop [`record`], which only the server's answer, known here, makes possible.
+pub async fn submit_next(
+    store: &mut Store,
+    key: i64,
+    account: &Account,
+    password: &Password,
+    tls: Arc<ClientConfig>,
+) -> rusqlite::Result<Option<Submission>> {
     let Some(message) = store.claim_next(key, now())? else {
         return Ok(None);
     };
@@ -122,12 +156,36 @@ pub async fn send_next(
         },
     )
     .await;
-    let message_id = message.message_id;
-    Ok(Some(match submitted {
+    Ok(Some(Submission {
+        id,
+        message_id: message.message_id,
+        sent_copy: message.sent_copy,
+        submitted,
+    }))
+}
+
+/// The second half of [`send_next`]: records what came of a submission, a few local writes.
+pub async fn record(
+    store: &mut Store,
+    key: i64,
+    submission: Submission,
+) -> rusqlite::Result<Tried> {
+    let Submission {
+        id,
+        message_id,
+        sent_copy: copy,
+        submitted,
+    } = submission;
+    Ok(match submitted {
         Ok(Submitted::Sent) => {
-            let sent_copy = if !message.sent_copy {
+            // A folder that cannot be read is not an answer: the copy is left to the IMAP worker,
+            // which looks again. What was sent is recorded whatever these reads say.
+            let sent_copy = if !copy {
                 "server"
-            } else if store.sent_folder(key)?.is_none() && store.knows_folders(key)? {
+            } else if matches!(
+                (store.sent_folder(key), store.knows_folders(key)),
+                (Ok(None), Ok(true))
+            ) {
                 "none"
             } else {
                 "append"
@@ -167,7 +225,7 @@ pub async fn send_next(
             recorded(store, |store| store.send_again(id, &why, now())).await?;
             Tried::Login { id, error }
         }
-    }))
+    })
 }
 
 /// Records what came of a submission, trying again while the copy is busy: the server's answer
@@ -259,14 +317,33 @@ async fn copy_each(
             });
             continue;
         };
-        let attempts = store.copy_trying(id)?;
-        let tried = tokio::time::timeout(timeout, async {
-            if copy.attempts > 0 && already_there(session, &name, &copy.message_id).await? {
-                return Ok(Done::Ok(None));
+        // Only an append started counts: a search that fails (the connection dropped) says
+        // nothing of the copy, and the next pass searches again.
+        if copy.attempts > 0 {
+            let searched =
+                tokio::time::timeout(timeout, already_there(session, &name, &copy.message_id))
+                    .await;
+            match searched {
+                Ok(Ok(true)) => {
+                    store.copy_done(id)?;
+                    copies.copied.push(Copied::Appended { id });
+                    copies.resync = Some(folder);
+                    continue;
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    copies.timed_out = true;
+                    return Err(SyncError::Connection(ConnectError::Unreachable(
+                        "the IMAP server did not answer SEARCH in time".to_owned(),
+                    )));
+                }
             }
-            sync::append(session, &quoted, "\\Seen", &copy.raw).await
-        })
-        .await;
+        }
+        let attempts = store.copy_trying(id)?;
+        let tried =
+            tokio::time::timeout(timeout, sync::append(session, &quoted, "\\Seen", &copy.raw))
+                .await;
         let done = match tried {
             Ok(Ok(done)) => done,
             Ok(Err(error)) => {

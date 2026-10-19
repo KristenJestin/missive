@@ -52,6 +52,10 @@ const OUTBOX_VERSION: i64 = 6;
 /// The first schema version that has the drafts waiting for the server.
 const DRAFTS_VERSION: i64 = 7;
 
+/// The first schema version that records when a queued message is tried next (and, for a claimed
+/// one, when it was claimed).
+const RETRY_VERSION: i64 = 9;
+
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +165,9 @@ pub struct Outgoing {
     /// The tries that failed before the end of data.
     pub attempts: u32,
     pub last_error: Option<String>,
+    /// `claimed` for longer than a submission takes: its worker could not put it back in the
+    /// queue, and it stays so until the next start of the daemon.
+    pub stuck: bool,
 }
 
 /// A draft of an account kept in the local copy until the server holds it, as `missive status`
@@ -500,16 +507,26 @@ impl Copy {
         if self.version < OUTBOX_VERSION {
             return Ok(Vec::new());
         }
-        let mut statement = self.connection.prepare_cached(
+        // A claimed message holds the time of its claim where a queued one holds its next try.
+        let claimed_at = if self.version >= RETRY_VERSION {
+            "outbox.next_attempt_at"
+        } else {
+            "NULL"
+        };
+        let mut statement = self.connection.prepare(&format!(
             "SELECT outbox.id, outbox.state, outbox.message_id, outbox.queued_at,
-                    outbox.attempts, outbox.last_error
+                    outbox.attempts, outbox.last_error, {claimed_at}
                FROM outbox JOIN account ON account.key = outbox.account
-              WHERE account.id = ?1 ORDER BY outbox.id",
-        )?;
+              WHERE account.id = ?1 ORDER BY outbox.id"
+        ))?;
+        let limit = crate::outbox::now() - crate::outbox::CLAIM_STUCK_MS;
         let rows = statement.query_map([account], |r| {
+            let state: String = r.get(1)?;
+            let claimed_at: Option<i64> = r.get(6)?;
             Ok(Outgoing {
                 id: r.get(0)?,
-                state: r.get(1)?,
+                stuck: state == "claimed" && claimed_at.is_some_and(|at| at < limit),
+                state,
                 message_id: r.get(2)?,
                 queued_at: r.get(3)?,
                 attempts: r.get(4)?,
