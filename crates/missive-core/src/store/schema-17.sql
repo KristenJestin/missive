@@ -1,17 +1,14 @@
--- What tells a half-moved message from another (the copy's `message_id`, `size` and
--- `internal_date`, which `UID COPY` keeps), as `find_copy` trusts a copy found again: once a folder
--- is renumbered, its UIDs name other messages, and the message is found again by these. NULL when
--- the copy did not have the message under the action's UIDVALIDITY.
-ALTER TABLE half_move ADD COLUMN message_id TEXT;
-ALTER TABLE half_move ADD COLUMN size INTEGER;
-ALTER TABLE half_move ADD COLUMN internal_date INTEGER;
-UPDATE half_move SET (message_id, size, internal_date) = (
-    SELECT message.message_id, message.size, message.internal_date
-      FROM message JOIN folder ON folder.id = message.folder
-     WHERE message.folder = half_move.folder AND message.uid = half_move.uid
-       AND folder.uidvalidity = half_move.uidvalidity);
-
--- How many times the server refused to take the flag back since the row was written (the row
--- leaves once it is taken back, so the count never restarts): past the limit of an action,
--- `missive status` says the flag may stay until it is cleared elsewhere.
-ALTER TABLE deleted_left ADD COLUMN refusals INTEGER NOT NULL DEFAULT 0;
+-- The drafts Missive wrote itself, by account and Message-ID, with the message each one answers
+-- or forwards: the only drafts whose `X-Missive-Answers` and `X-Missive-Forwards` headers are
+-- believed. Anyone who can write to the Drafts folder can put those headers in a draft; one that
+-- Missive did not write is picked up and sent as it is, and marks nothing. A header is trusted
+-- only when it says what was recorded here, so a version of the same draft written by another
+-- client does not carry a link over. The row leaves with the draft, once its message was sent.
+CREATE TABLE own_draft (
+    account INTEGER NOT NULL REFERENCES account (key) ON DELETE CASCADE,
+    -- Without its angle brackets.
+    message_id TEXT NOT NULL,
+    answers TEXT,
+    forwards TEXT,
+    PRIMARY KEY (account, message_id)
+) STRICT, WITHOUT ROWID;

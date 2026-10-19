@@ -6,6 +6,8 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use missive_core::draft_lock;
+
 /// Whether a display is there to open a window on: Wayland's, or X11's.
 pub fn display() -> bool {
     ["WAYLAND_DISPLAY", "DISPLAY"]
@@ -14,9 +16,18 @@ pub fn display() -> bool {
 }
 
 /// Starts the compose window on the draft `draft` of `account`, when there is a display. Its
-/// failure to start is said on standard error: the draft is saved either way.
+/// failure to start is said on standard error: the draft is saved either way. A draft already
+/// open in a compose window, of this process or another, gets no second one: the command says so
+/// instead of leaving it to a window that has no terminal to say it on.
 pub fn compose(account: &str, draft: &str) {
     if !display() {
+        return;
+    }
+    if draft_lock::is_held(account, draft) {
+        eprintln!(
+            "The draft {draft} is already open in a compose window, so no second one is opened; \
+             the draft is saved."
+        );
         return;
     }
     let started = std::env::current_exe().and_then(|exe| {

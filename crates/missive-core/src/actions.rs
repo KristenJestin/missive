@@ -186,12 +186,16 @@ pub enum Wanted {
 /// Why a request was refused before anything was recorded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused {
-    /// `no-such-message`, `no-such-folder`, `no-trash`, `in-trash`, `not-in-trash`, `busy` or
-    /// `unsupported`.
+    /// `no-such-message`, `original-gone`, `no-such-folder`, `no-trash`, `in-trash`,
+    /// `not-in-trash`, `busy` or `unsupported`.
     pub error: &'static str,
     /// For people.
     pub message: String,
 }
+
+/// The error of a `draft` or a `send` that answers or forwards a message the copy no longer
+/// holds (moved or deleted since the reply was started).
+pub const ORIGINAL_GONE: &str = "original-gone";
 
 impl Refused {
     pub fn new(error: &'static str, message: impl Into<String>) -> Refused {

@@ -14,6 +14,8 @@ use gpui_kit::{
     SharedString, Window, WindowBounds, WindowHandle, WindowOptions, actions, div, px, size,
 };
 
+use missive_core::draft_lock::{DraftLock, Taking};
+
 use crate::compose::{self, Compose, Field, State};
 use crate::view::{Asker, Palette, button, is_dark};
 
@@ -36,13 +38,26 @@ pub fn bind_keys(cx: &mut App) {
 /// when the user cancels. Called off the window's thread.
 pub type Chooser = Arc<dyn Fn() -> Result<Vec<PathBuf>, String> + Send + Sync>;
 
-/// Opens a compose window.
+/// Takes the lock of a draft (its account, its `Message-ID`): `missive_core::draft_lock::take`,
+/// or a test's own, so that no test touches the real runtime folder.
+pub type Locker = Arc<dyn Fn(&str, &str) -> Taking + Send + Sync>;
+
+/// Opens a compose window, unless another process has one open on the same draft: the window
+/// holds the draft's lock for as long as it is open.
 pub fn open(
     compose: Compose,
     asker: Asker,
     chooser: Chooser,
+    locker: Locker,
     cx: &mut App,
-) -> gpui_kit::Result<WindowHandle<ComposeWindow>> {
+) -> Result<WindowHandle<ComposeWindow>, String> {
+    let lock = match compose.draft_key().map(|key| locker(&compose.account, key)) {
+        Some(Taking::Elsewhere) => {
+            return Err("this draft is already open in another compose window".to_owned());
+        }
+        Some(Taking::Ours(lock)) => Some(lock),
+        _ => None,
+    };
     let bounds = Bounds::centered(None, size(px(800.), px(680.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -50,8 +65,9 @@ pub fn open(
         ..Default::default()
     };
     cx.open_window(options, |window, cx| {
-        cx.new(|cx| ComposeWindow::new(compose, asker, chooser, window, cx))
+        cx.new(|cx| ComposeWindow::new(compose, asker, chooser, window, cx).holding(lock, locker))
     })
+    .map_err(|e| e.to_string())
 }
 
 pub struct ComposeWindow {
@@ -64,6 +80,9 @@ pub struct ComposeWindow {
     /// Whether a request waits for the daemon's answer.
     asking: bool,
     font: Option<SharedString>,
+    /// The draft's lock, held while this window is open (see [`ComposeWindow::holding`]).
+    lock: Option<DraftLock>,
+    locker: Option<Locker>,
 }
 
 impl ComposeWindow {
@@ -146,10 +165,34 @@ impl ComposeWindow {
             body,
             asking: false,
             font,
+            lock: None,
+            locker: None,
         };
         this.title(window);
         this.lock_fields(cx);
         this
+    }
+
+    /// Holds `lock`, the lock of the draft this window was opened on, until the window closes;
+    /// a new message takes `locker`'s once the daemon has saved it and given it a `Message-ID`.
+    pub fn holding(mut self, lock: Option<DraftLock>, locker: Locker) -> Self {
+        self.lock = lock;
+        self.locker = Some(locker);
+        self
+    }
+
+    /// Takes the lock of the draft once it has a `Message-ID` and the window holds none. Nobody
+    /// else knows the draft before its first save, so it is free; if it is not, the window goes
+    /// on without: the text is safe in the draft.
+    fn lock_draft(&mut self) {
+        if self.lock.is_some() {
+            return;
+        }
+        if let (Some(locker), Some(key)) = (&self.locker, self.model.draft_key())
+            && let Taking::Ours(lock) = locker(&self.model.account, key)
+        {
+            self.lock = Some(lock);
+        }
     }
 
     /// After the model changed: the save timer starts, the next request goes to the daemon, and
@@ -175,6 +218,7 @@ impl ComposeWindow {
                 this.update_in(cx, |this, window, cx| {
                     this.asking = false;
                     this.model.answered(answer);
+                    this.lock_draft();
                     this.changed(window, cx);
                 })
             })

@@ -9,6 +9,7 @@ pub mod client;
 pub mod compose;
 pub mod connect;
 pub mod copy;
+pub mod draft_lock;
 pub mod drafts;
 pub mod events;
 #[cfg(feature = "fake")]

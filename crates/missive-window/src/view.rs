@@ -19,9 +19,10 @@ use missive_core::copy::{Person, local_time};
 use missive_core::opener::followable;
 use missive_core::protocol::{Answer, Command};
 
-use crate::compose_view::{self, Chooser, ComposeWindow};
+use crate::compose_view::{self, Chooser, ComposeWindow, Locker};
 use crate::images::MessageImages;
 use crate::model::{Body, Daemon, Model, Opened, Reader, Start};
+use missive_core::draft_lock::Taking;
 
 actions!(
     missive_window,
@@ -100,6 +101,7 @@ pub struct MailWindow {
     font: Option<SharedString>,
     /// The file chooser of the compose windows this window opens.
     chooser: Chooser,
+    locker: Locker,
     /// The compose windows it opened, still open or not yet noticed closed: a draft that has one
     /// is brought forward rather than opened a second time, where each window's save would
     /// replace the other's.
@@ -134,6 +136,7 @@ impl MailWindow {
             asker,
             asking: false,
             chooser: Arc::new(|| Err("the file chooser is not available".to_owned())),
+            locker: Arc::new(|_, _| Taking::Unavailable),
             composing: Vec::new(),
         }
     }
@@ -144,12 +147,24 @@ impl MailWindow {
         self
     }
 
+    /// Where the compose windows take the lock of their draft.
+    pub fn with_locker(mut self, locker: Locker) -> Self {
+        self.locker = locker;
+        self
+    }
+
     /// Opens a compose window for `start`, when the model has something to start from.
     pub fn compose(&mut self, start: Start, cx: &mut Context<Self>) {
         if let Some(compose) = self.model.compose(start)
             && !self.bring_forward(compose.draft_key(), cx)
         {
-            match compose_view::open(compose, self.asker.clone(), self.chooser.clone(), cx) {
+            match compose_view::open(
+                compose,
+                self.asker.clone(),
+                self.chooser.clone(),
+                self.locker.clone(),
+                cx,
+            ) {
                 Ok(window) => self.composing.push(window),
                 Err(e) => {
                     self.model.notice = Some(format!("The compose window cannot open: {e}."));

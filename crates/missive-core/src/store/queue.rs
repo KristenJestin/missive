@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{NewMessage, Store};
-use crate::actions::{Kind, Queued, Refused, Wanted, unsupported, with_flag};
+use crate::actions::{Kind, ORIGINAL_GONE, Queued, Refused, Wanted, unsupported, with_flag};
 use crate::copy::{MessageId, NotFound, has_flag};
 use crate::sync::CopyUid;
 
@@ -117,8 +117,15 @@ impl Store {
 
 impl Store {
     /// Whether `id` names a message of the copy now, as an action would find it: the refusal
-    /// says why when it does not. For a request that names a message without acting on it.
+    /// says why when it does not. For a request that names a message without acting on it (the
+    /// message a reply answers): one that is gone is `original-gone`, so that a client can tell
+    /// it from a request that is wrong; what is no identifier at all stays `no-such-message`.
     pub fn check_message(&self, id: &str) -> rusqlite::Result<Result<(), Refused>> {
+        let gone = |why| {
+            let mut refused = not_found(id, why);
+            refused.error = ORIGINAL_GONE;
+            refused
+        };
         let Some(parsed) = MessageId::parse(id) else {
             return Ok(Err(not_found(id, NotFound::Invalid)));
         };
@@ -133,10 +140,10 @@ impl Store {
             )
             .optional()?;
         let Some((uidvalidity, name)) = folder else {
-            return Ok(Err(not_found(id, NotFound::Unknown)));
+            return Ok(Err(gone(NotFound::Unknown)));
         };
         if uidvalidity.unwrap_or(0) != parsed.uidvalidity {
-            return Ok(Err(not_found(id, NotFound::Renumbered(name))));
+            return Ok(Err(gone(NotFound::Renumbered(name))));
         }
         let found: Option<i64> = self
             .connection
@@ -146,9 +153,7 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(found
-            .map(drop)
-            .ok_or_else(|| not_found(id, NotFound::Unknown)))
+        Ok(found.map(drop).ok_or_else(|| gone(NotFound::Unknown)))
     }
 }
 
@@ -1741,9 +1746,15 @@ mod tests {
         let f = fixture();
         assert!(f.store.check_message(&f.id(f.inbox, 2)).unwrap().is_ok());
         let id = f.id(f.inbox, 99);
-        for bad in [id.as_str(), "alice/999/1/1", "not an id", "other/1/1/1"] {
+        // A message that is gone has its own code; what is no identifier does not.
+        for (bad, code) in [
+            (id.as_str(), "original-gone"),
+            ("alice/999/1/1", "original-gone"),
+            ("not an id", "no-such-message"),
+            ("other/1/1/1", "original-gone"),
+        ] {
             let refused = f.store.check_message(bad).unwrap().unwrap_err();
-            assert_eq!(refused.error, "no-such-message", "{bad}");
+            assert_eq!(refused.error, code, "{bad}");
             assert!(refused.message.starts_with(bad), "{}", refused.message);
         }
         assert_eq!(f.actions(), 0);

@@ -763,13 +763,14 @@ impl Daemon {
             None => (Draft::default(), None, None, None, Followup::default()),
             Some(id) => match store.find_draft(key, id) {
                 Ok(Some(stored)) => match Draft::read(&stored.raw) {
-                    Ok(draft) if compose::is_own_draft(&stored.raw) => (
-                        draft,
-                        stored.message_id,
-                        None,
-                        None,
-                        Followup::read(&stored.raw),
-                    ),
+                    Ok(draft) if compose::is_own_draft(&stored.raw) => {
+                        // Its links are believed only if Missive saved them.
+                        let followup = match store.followup(key, &stored.raw) {
+                            Ok(followup) => followup,
+                            Err(e) => return failed(e.to_string()),
+                        };
+                        (draft, stored.message_id, None, None, followup)
+                    }
                     // Named by its own Message-ID, whichever way the request named it.
                     Ok(draft) => (
                         draft,
@@ -825,12 +826,12 @@ impl Daemon {
         // What the request names replaces what the draft kept; a request that names nothing
         // leaves the draft's link as it is, so that a draft picked up later still marks the
         // message it answers.
-        let followup = if asked == Followup::default() {
+        let asked = if asked == Followup::default() {
             stored_followup.clone()
         } else {
             asked
         };
-        let changed = followup != stored_followup
+        let changed = asked != stored_followup
             || request.to.is_some()
             || request.cc.is_some()
             || request.bcc.is_some()
@@ -840,6 +841,13 @@ impl Daemon {
             || request.in_reply_to.is_some();
         let mailboxes = |list: &[String]| -> Result<Vec<Mailbox>, String> {
             list.iter().map(|text| Mailbox::parse(text)).collect()
+        };
+        // The changes of a draft already sent are kept as a new draft: a message of its own,
+        // which answers nothing (the original was marked, or will be, with the one that went).
+        let followup = if sent_already {
+            Followup::default()
+        } else {
+            asked
         };
         let mut html_dropped = false;
         let fields = (|| {
@@ -866,7 +874,7 @@ impl Daemon {
                         data: a.data,
                     })
                     .collect();
-                html_dropped |= draft.set_attachments(attachments);
+                draft.set_attachments(attachments);
             }
             if let Some(id) = request.in_reply_to {
                 draft.in_reply_to = vec![id];
@@ -1055,6 +1063,7 @@ impl Daemon {
                 subject: send.subject,
                 body: send.body,
                 html: None,
+                inline: Vec::new(),
                 attachments: send
                     .attachments
                     .into_iter()
