@@ -914,6 +914,7 @@ fn refused(action: &ActionEvent) -> String {
         "flagged" => "Flagging",
         "unflagged" => "Taking the flag off",
         "answered" => "Marking answered",
+        "forwarded" => "Marking forwarded",
         "move" => "Moving",
         "delete" => "Moving to the trash",
         "delete-permanently" => "Deleting for good",

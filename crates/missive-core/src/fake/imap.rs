@@ -505,7 +505,11 @@ impl Session {
             if read_only {
                 "* OK [PERMANENTFLAGS ()] read only".to_owned()
             } else {
-                format!("* OK [PERMANENTFLAGS {SYSTEM_FLAGS}] flags allowed")
+                let keywords = if self.shared.keywords { " \\*" } else { "" };
+                format!(
+                    "* OK [PERMANENTFLAGS {}{keywords})] flags allowed",
+                    SYSTEM_FLAGS.trim_end_matches(')')
+                )
             },
             format!("* OK [UIDVALIDITY {}] UIDs valid", folder.uidvalidity),
             format!("* {} EXISTS", folder.messages.len()),

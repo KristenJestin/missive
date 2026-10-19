@@ -71,6 +71,9 @@ pub enum Kind {
     Unflagged,
     /// Set by a reply once it is sent, never asked for with `mark`.
     Answered,
+    /// Set by a forward once it is sent, never asked for with `mark`. A keyword (`$Forwarded`,
+    /// RFC 5788), which a server may not keep: see [`Kind::keyword`].
+    Forwarded,
     Move,
     /// A move to the account's trash.
     Delete,
@@ -78,12 +81,13 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 8] = [
+    pub const ALL: [Kind; 9] = [
         Kind::Read,
         Kind::Unread,
         Kind::Flagged,
         Kind::Unflagged,
         Kind::Answered,
+        Kind::Forwarded,
         Kind::Move,
         Kind::Delete,
         Kind::DeletePermanently,
@@ -97,6 +101,7 @@ impl Kind {
             Kind::Flagged => "flagged",
             Kind::Unflagged => "unflagged",
             Kind::Answered => "answered",
+            Kind::Forwarded => "forwarded",
             Kind::Move => "move",
             Kind::Delete => "delete",
             Kind::DeletePermanently => "delete-permanently",
@@ -115,8 +120,15 @@ impl Kind {
             Kind::Flagged => Some(("\\Flagged", true)),
             Kind::Unflagged => Some(("\\Flagged", false)),
             Kind::Answered => Some(("\\Answered", true)),
+            Kind::Forwarded => Some(("$Forwarded", true)),
             _ => None,
         }
+    }
+
+    /// Whether the flag it sets is a keyword, which a folder keeps only when it says so
+    /// (`\*` in its PERMANENTFLAGS, RFC 3501 6.3.1) rather than a system flag.
+    pub fn keyword(self) -> bool {
+        matches!(self, Kind::Forwarded)
     }
 
     /// Whether it takes the messages to another folder.
@@ -250,6 +262,8 @@ pub(crate) struct Server<'a> {
     timeout: Duration,
     /// Whether a command got no answer in time.
     pub(crate) timed_out: bool,
+    /// Whether the folder last selected keeps keywords.
+    keywords: bool,
 }
 
 impl<'a> Server<'a> {
@@ -258,6 +272,7 @@ impl<'a> Server<'a> {
             session,
             timeout,
             timed_out: false,
+            keywords: true,
         }
     }
 }
@@ -291,7 +306,9 @@ impl Server<'_> {
         name: &str,
     ) -> std::result::Result<Option<u32>, SyncError> {
         let result = tokio::time::timeout(self.timeout, sync::select(self.session, name)).await;
-        self.timed(result)
+        let selected = self.timed(result)?;
+        self.keywords = selected.is_none_or(|(_, keywords)| keywords);
+        Ok(selected.map(|(uidvalidity, _)| uidvalidity))
     }
 
     async fn examine_uidvalidity(
@@ -425,6 +442,11 @@ async fn round(
                 let copied = refuse(store, &action, applied)?;
                 refused(reason, message.to_owned(), copied)
             }
+            Step::Skipped => {
+                // The copy took its flag at once: the folder is read again to forget it.
+                refuse(store, &action, applied)?;
+                continue;
+            }
         };
         applied.outcomes.push(outcome(result));
     }
@@ -470,6 +492,8 @@ enum Step {
     },
     /// The server answered `NO`; why, for the queue.
     No(&'static str),
+    /// The server cannot keep what the action sets: dropped, with no outcome to tell.
+    Skipped,
     Refused(&'static str, &'static str),
 }
 
@@ -498,6 +522,11 @@ async fn one(
         None => return Ok(Step::No("select")),
         Some(uidvalidity) if uidvalidity != action.uidvalidity => return Ok(RENUMBERED),
         Some(_) => {}
+    }
+    // A server that keeps no keywords is not asked for one: it would refuse, or take it and
+    // forget it. Nothing is said, the message just is not marked.
+    if action.kind.keyword() && !server.keywords {
+        return Ok(Step::Skipped);
     }
     let set = sync::uid_set(&action.uids);
     if let Some((flag, add)) = action.kind.flag() {

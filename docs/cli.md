@@ -772,7 +772,8 @@ error, and the draft stays saved. Without a display, nothing is opened.
 print it) and start a new message from that message of the local copy. They combine with the
 other options (`--body`, `--attach`, `--send`, or a draft without `--send`), exclude one another
 and `--draft`, and exit with 3 when the identifier names no message. The account is the one that
-received the message, unless `--account` says otherwise.
+received the message, unless `--account` says otherwise; a reply all then leaves out the address
+of the account that sends it, not the one of the account that received the message.
 
 What is worked out from the message is replaced, field by field, by what is given: `--to`
 replaces the recipients, `--cc` the copies of a reply all, `--subject` the subject. `--body` is
@@ -796,12 +797,21 @@ the text above the quote.
   it is shown at once in the local copy, and the flag is applied on the server through the
   queue of actions, as `missive mark` does. A reply that is only saved as a draft marks nothing,
   and neither does one the server refuses. A message that was moved or deleted meanwhile is not
-  marked.
+  marked. The flag goes to the account that owns the message, which wakes at once even when
+  another account sends the reply.
+- A message that is odd is answered all the same, and one line on the error output says what was
+  changed (counts and kinds, never what the message says): line breaks in its subject (an
+  encoded subject can decode to some) become spaces, and the identifiers (`Message-ID`,
+  `In-Reply-To`, `References`) that cannot be written back, because they hold a space or are
+  longer than a line (900 bytes), are left out of the thread.
 - **Forward** has a subject `Fwd: ` (a subject that already starts with `Fwd:` or `Fw:` is kept),
   no `In-Reply-To` and no `References`, and the message goes along as an attachment of type
   `message/rfc822`, named after its subject (`<subject>.eml`), byte for byte as the local copy
   keeps it (it is encoded in base64 on the wire, as every attachment is). `--to` names the
-  recipients. A forward does not mark the message.
+  recipients. After a forward is **sent**, the message gets the keyword `$Forwarded` (RFC 5788) the
+  same way, through the queue of actions. A server whose folder keeps no keywords (no `\*` in its
+  `PERMANENTFLAGS`) is not asked: the action is dropped and nothing is said, the copy forgets the
+  flag it showed. A forward does not mark the message answered.
 
 The exit status is 1 when the message cannot be written as asked: no recipient (with `--send`),
 an address that is not one, a file that cannot be read, an account that is not configured. It is

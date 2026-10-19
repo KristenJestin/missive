@@ -118,6 +118,10 @@ pub struct SaveDraft {
     /// the server took the reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers: Option<String>,
+    /// With `send`: the identifier of the message the draft forwards, marked forwarded
+    /// (`$Forwarded`) once the server took the forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwards: Option<String>,
 }
 
 /// A message to send: addresses as `name@example.org` or `Name <name@example.org>`.
@@ -146,6 +150,10 @@ pub struct Send {
     /// that message is marked answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers: Option<String>,
+    /// The identifier of the message this one forwards: once the server took the forward, that
+    /// message is marked forwarded (`$Forwarded`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwards: Option<String>,
 }
 
 /// A file attached to a message: its name, and its content in base64.
@@ -449,6 +457,31 @@ mod tests {
                 .unwrap(),
             "bad-request"
         );
+    }
+
+    #[test]
+    fn a_forward_request_names_the_message_it_forwards() {
+        let line = r#"{"protocol":1,"request":"send","account":"alice","body":"","forwards":"alice/1/2/3"}"#;
+        let request = Request {
+            protocol: 1,
+            command: Command::Send(Send {
+                account: "alice".to_owned(),
+                forwards: Some("alice/1/2/3".to_owned()),
+                ..Send::default()
+            }),
+        };
+        assert_eq!(read_request(line), Ok(request.clone()));
+        assert_eq!(serde_json::to_string(&request).unwrap(), line);
+
+        let line = r#"{"protocol":1,"request":"draft","account":"alice","draft":"1@example.org","send":true,"forwards":"alice/1/2/3"}"#;
+        let Ok(Request {
+            command: Command::Draft(draft),
+            ..
+        }) = read_request(line)
+        else {
+            panic!("a draft request")
+        };
+        assert_eq!(draft.forwards.as_deref(), Some("alice/1/2/3"));
     }
 
     #[test]

@@ -712,6 +712,9 @@ struct Examined {
     uidvalidity: u32,
     exists: u32,
     highest_modseq: Option<u64>,
+    /// Whether the folder keeps keywords of its own, such as `$Forwarded`: `\*` among its
+    /// PERMANENTFLAGS (RFC 3501, 6.3.1). A server that does not say is believed to.
+    keywords: bool,
 }
 
 /// `EXAMINE`: `None` when the server refused it, or when its answer holds no UIDVALIDITY or
@@ -720,12 +723,12 @@ async fn examine(session: &mut ImapSession, name: &str) -> Result<Option<Examine
     open(session, name, "EXAMINE").await
 }
 
-/// `SELECT`, read-write, to apply an action: the folder's UIDVALIDITY, or `None` as for
-/// [`examine`]. A `BAD` is an error.
-pub(crate) async fn select(session: &mut ImapSession, name: &str) -> Result<Option<u32>> {
+/// `SELECT`, read-write, to apply an action: the folder's UIDVALIDITY and whether it keeps
+/// keywords, or `None` as for [`examine`]. A `BAD` is an error.
+pub(crate) async fn select(session: &mut ImapSession, name: &str) -> Result<Option<(u32, bool)>> {
     Ok(open(session, name, "SELECT")
         .await?
-        .map(|examined| examined.uidvalidity))
+        .map(|examined| (examined.uidvalidity, examined.keywords)))
 }
 
 /// [`examine`], for its UIDVALIDITY.
@@ -765,6 +768,7 @@ async fn open_folder(
         return Ok(Err(Skip::Unusable));
     };
     let (mut uidvalidity, mut exists, mut highest_modseq) = (None, None, None);
+    let mut keywords = true;
     let ended = run(
         session,
         &format!("{command} {name}"),
@@ -775,6 +779,9 @@ async fn open_folder(
             } => match outcome.code {
                 Some(ResponseCode::UidValidity(value)) => uidvalidity = Some(value),
                 Some(ResponseCode::HighestModSeq(value)) => highest_modseq = Some(value),
+                Some(ResponseCode::PermanentFlags(ref flags)) => {
+                    keywords = flags.iter().any(|flag| flag == "\\*");
+                }
                 _ => {}
             },
             Response::MailboxData(MailboxDatum::Exists(value)) => exists = Some(*value),
@@ -791,6 +798,7 @@ async fn open_folder(
             uidvalidity,
             exists,
             highest_modseq,
+            keywords,
         })
         .ok_or(Skip::Unusable))
 }

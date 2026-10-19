@@ -53,7 +53,7 @@ use missive_core::outbox::{self, Copied, Tried};
 use missive_core::protocol::{
     self, AccountState, Answer, Command, PROTOCOL, pid_path, read_request, runtime_dir, socket_path,
 };
-use missive_core::store::{Retaken, SkippedFolder, Store};
+use missive_core::store::{Followed, Retaken, SkippedFolder, Store};
 use missive_core::sync::{self, Capabilities, Changes, Folder, Skip, SyncError};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -158,7 +158,7 @@ pub async fn run(options: Options) -> Result<(), String> {
         events: Arc::new(Events::new(&store)),
         store,
         stopping,
-        workers: Mutex::new(BTreeMap::new()),
+        workers: Arc::new(Mutex::new(BTreeMap::new())),
         senders: Mutex::new(BTreeMap::new()),
         rechecks: Mutex::new(BTreeMap::new()),
         tasks: Mutex::new(JoinSet::new()),
@@ -304,7 +304,7 @@ struct Daemon {
     store: PathBuf,
     stopping: watch::Receiver<bool>,
     /// Where to send each account's requests, by identifier.
-    workers: Mutex<BTreeMap<String, mpsc::UnboundedSender<Request>>>,
+    workers: Arc<Mutex<BTreeMap<String, mpsc::UnboundedSender<Request>>>>,
     /// Where to wake each account's SMTP worker, by identifier.
     senders: Mutex<BTreeMap<String, mpsc::UnboundedSender<()>>>,
     /// Where to tell each account's SMTP worker that the user asked for a sync, which is how a
@@ -425,6 +425,7 @@ impl Daemon {
                 wake: woken,
                 recheck: recheck.clone(),
                 imap: requests.downgrade(),
+                workers: self.workers.clone(),
                 stop: self.stopping.clone(),
                 events: self.events.clone(),
             };
@@ -593,7 +594,10 @@ impl Daemon {
             }
             Command::Subscribe => unreachable!("`serve` answers a subscription itself"),
             Command::Mark { messages, mark_as } => match Kind::parse(&mark_as) {
-                Some(kind) if kind.flag().is_some() && kind != Kind::Answered => {
+                Some(kind)
+                    if kind.flag().is_some()
+                        && !matches!(kind, Kind::Answered | Kind::Forwarded) =>
+                {
                     self.record(name, &messages, Wanted::Mark(kind))
                 }
                 _ => Answer::error(
@@ -853,11 +857,14 @@ impl Daemon {
         let draft = (save || (request.draft.is_some() && kept.is_none()))
             .then_some(built.message_id.as_str());
         let sent_copy = !account.server_saves_sent;
-        let queued = match (&source, &request.answers) {
-            (Some(source), answers) => {
-                store.enqueue_kept(key, &built, sent_copy, draft, answers.as_deref(), source)
+        let followed = followed(request.answers.as_deref(), request.forwards.as_deref());
+        let queued = match (&source, followed) {
+            (Some(source), followed) => {
+                store.enqueue_kept(key, &built, sent_copy, draft, followed, source)
             }
-            (None, Some(answers)) => store.enqueue_reply(key, &built, sent_copy, draft, answers),
+            (None, Some(followed)) => {
+                store.enqueue_followup(key, &built, sent_copy, draft, followed)
+            }
             (None, None) => store.enqueue(key, &built, sent_copy, draft),
         };
         let outbox = match queued {
@@ -948,8 +955,10 @@ impl Daemon {
             let sent_copy = !account.server_saves_sent;
             Ok((
                 key,
-                match &send.answers {
-                    Some(answers) => store.enqueue_reply(key, &built, sent_copy, None, answers)?,
+                match followed(send.answers.as_deref(), send.forwards.as_deref()) {
+                    Some(followed) => {
+                        store.enqueue_followup(key, &built, sent_copy, None, followed)?
+                    }
                     None => store.enqueue(key, &built, sent_copy, None)?,
                 },
             ))
@@ -1913,6 +1922,14 @@ impl Worker {
     }
 }
 
+/// The message a request to send answers or forwards, to mark once it is sent. A request naming
+/// both is a reply: a forward is never also a reply.
+fn followed<'a>(answers: Option<&'a str>, forwards: Option<&'a str>) -> Option<Followed<'a>> {
+    answers
+        .map(Followed::Answered)
+        .or_else(|| forwards.map(Followed::Forwarded))
+}
+
 /// Submits an account's outbox: see [`missive_core::outbox`]. It never talks to the IMAP
 /// server; it wakes the IMAP worker when a copy is to be appended to Sent.
 struct SmtpWorker {
@@ -1928,6 +1945,8 @@ struct SmtpWorker {
     recheck: Arc<Notify>,
     /// The account's IMAP worker; weak, so that it still ends when its account is removed.
     imap: mpsc::WeakUnboundedSender<Request>,
+    /// Every account's IMAP worker: a message answered or forwarded may be another account's.
+    workers: Arc<Mutex<BTreeMap<String, mpsc::UnboundedSender<Request>>>>,
     stop: watch::Receiver<bool>,
     events: Arc<Events>,
 }
@@ -2146,17 +2165,23 @@ impl SmtpWorker {
                 id,
                 message_id,
                 sent_copy,
-                answered,
+                marked,
             } => {
                 log!(
-                    "account {}: message {id} sent (copy in Sent: {sent_copy}, answered: \
-                     {answered})",
-                    self.key
+                    "account {}: message {id} sent (copy in Sent: {sent_copy}, original marked \
+                     in {} accounts)",
+                    self.key,
+                    marked.len()
                 );
-                if (sent_copy == "append" || answered)
+                if sent_copy == "append"
                     && let Some(imap) = self.imap.upgrade()
                 {
                     let _ = imap.send(Request::Actions);
+                }
+                // The original's account applies its flag now, not at its next pass.
+                let workers = locked(&self.workers);
+                for worker in marked.iter().filter_map(|account| workers.get(account)) {
+                    let _ = worker.send(Request::Actions);
                 }
                 self.events.send(Event::Sent(Sent {
                     account,

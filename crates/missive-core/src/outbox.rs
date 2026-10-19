@@ -83,9 +83,10 @@ pub enum Tried {
         message_id: String,
         /// `append`, `server` or `none`: see [`crate::events::Sent`].
         sent_copy: &'static str,
-        /// Whether the message it answers was marked `\Answered`: the account's IMAP worker has
-        /// that action to apply.
-        answered: bool,
+        /// The accounts whose IMAP worker has an action to apply: the message it answers was
+        /// marked `\Answered`, or the one it forwards `$Forwarded`. The original's account,
+        /// which is not always the sender's.
+        marked: Vec<String>,
     },
     /// It stays to send: the server took nothing.
     Again { id: i64, reason: String },
@@ -203,12 +204,12 @@ pub async fn record(
             } else {
                 "append"
             };
-            let answered = recorded(store, |store| store.sent(id, sent_copy == "append")).await?;
+            let marked = recorded(store, |store| store.sent(id, sent_copy == "append")).await?;
             Tried::Sent {
                 id,
                 message_id,
                 sent_copy,
-                answered,
+                marked,
             }
         }
         Ok(Submitted::Again { reason }) => {
