@@ -98,7 +98,7 @@
 //! ```
 //!
 //! Version 15 tells which new UIDs of a move the server gave, so that the actions asked after it
-//! follow its messages:
+//! follow its messages, and keeps the `\Deleted` flags Missive set and has not taken back yet:
 //!
 //! ```sql
 #![doc = include_str!("store/schema-15.sql")]
@@ -148,7 +148,7 @@ mod queue;
 pub use drafts::{DraftRow, Stored};
 pub use outbox::{Followed, Left, Retaken, SentCopy, ToSend};
 pub(crate) use queue::HALF_MOVE_LEFT;
-pub use queue::{Action, ActionFolder, Dropped, Fingerprint};
+pub use queue::{Action, ActionFolder, DeletedLeft, Dropped, Fingerprint};
 
 /// The local copy, opened for writing.
 pub struct Store {

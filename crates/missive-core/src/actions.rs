@@ -36,6 +36,11 @@
 //! before the removal (`UID SEARCH DELETED UID <uids>` asks which): a `\Deleted` another client
 //! set stays.
 //!
+//! A removal records the `\Deleted` it sets itself before it sets it: when the connection is lost
+//! before the flag is taken back, the next try still knows it is its own. An action refused for
+//! good that leaves it there keeps it in [`Store::deleted_left`], and it is taken back at the
+//! next connection.
+//!
 //! An action asked while a move of its messages waits is recorded on them as the server still has
 //! them, apart from the messages that are not moving, and follows them to their new UIDs once the
 //! move is applied, but only when the server told those UIDs (`COPYUID`) for exactly those
@@ -277,6 +282,8 @@ pub struct Applied {
     /// Whether a command got no answer in time: what the connection says next cannot be trusted,
     /// so it has to be dropped.
     pub timed_out: bool,
+    /// How many messages got back the `\Deleted` a refused action had left on them.
+    pub taken_back: usize,
 }
 
 /// The session, each of whose commands is given [`COMMAND_TIMEOUT`] (or the timeout asked).
@@ -399,6 +406,7 @@ async fn round(
     capabilities: Capabilities,
     applied: &mut Applied,
 ) -> std::result::Result<(), SyncError> {
+    take_back(server, store, account, applied).await?;
     loop {
         let Some(action) = store.next_action(account)? else {
             return Ok(());
@@ -544,8 +552,8 @@ fn refuse(
     Ok(dropped)
 }
 
-/// What a refused action says, for people: `why`, and for a move that had copied the messages,
-/// where they are now.
+/// What a refused action says, for people: `why`, for a move that had copied the messages,
+/// where they are now, and the `\Deleted` flags it could not take back.
 fn refused(reason: &'static str, why: String, dropped: &Dropped) -> Result {
     let mut message = why;
     if dropped.copied {
@@ -554,11 +562,57 @@ fn refused(reason: &'static str, why: String, dropped: &Dropped) -> Result {
              folders now: nothing was removed, delete or move one of the two",
         );
     }
+    if dropped.deleted_left > 0 {
+        message.push_str(&format!(
+            "; {} of them keep the \\Deleted flag Missive set on the server, which it takes \
+             back at the next connection",
+            dropped.deleted_left
+        ));
+    }
     Result::Refused {
         reason,
         message,
         copied: dropped.copied,
     }
+}
+
+/// Takes back the `\Deleted` flags refused actions left on the server ([`Store::deleted_left`]),
+/// unless the folder was renumbered since: its UIDs then name other messages. One the server
+/// refuses now is tried again at the next connection.
+async fn take_back(
+    server: &mut Server<'_>,
+    store: &mut Store,
+    account: i64,
+    applied: &mut Applied,
+) -> std::result::Result<(), SyncError> {
+    for left in store.deleted_left(account)? {
+        if left.folder.uidvalidity != Some(left.uidvalidity) {
+            store.taken_back(left.id)?;
+            continue;
+        }
+        match server.select(&left.folder.name).await? {
+            None => continue,
+            Some(uidvalidity) if uidvalidity != left.uidvalidity => {
+                store.taken_back(left.id)?;
+                continue;
+            }
+            Some(_) => {}
+        }
+        let done = server
+            .run_done(
+                &format!(
+                    "UID STORE {} -FLAGS.SILENT (\\Deleted)",
+                    sync::uid_set(&left.uids)
+                ),
+                |_| {},
+            )
+            .await?;
+        if matches!(done, Done::Ok(_)) {
+            store.taken_back(left.id)?;
+            applied.taken_back += left.uids.len();
+        }
+    }
+    Ok(())
 }
 
 /// What one try of an action came to.
@@ -647,7 +701,7 @@ async fn one(
         });
     }
     if action.kind == Kind::DeletePermanently {
-        return Ok(match remove(server, &action.uids).await? {
+        return Ok(match removing(server, store, action).await? {
             Done::Ok(_) => {
                 store.applied_delete(action)?;
                 Step::Applied {
@@ -696,10 +750,42 @@ pub(crate) async fn remove(
     server: &mut Server<'_>,
     uids: &[u32],
 ) -> std::result::Result<Done, SyncError> {
+    remove_marking(server, uids, &[], |_| Ok(())).await
+}
+
+/// [`remove`] for an action, which records the `\Deleted` it sets itself: a connection lost
+/// before the flag is taken back leaves it on the server, and the next try, which then finds it
+/// set, must still know it is Missive's own.
+async fn removing(
+    server: &mut Server<'_>,
+    store: &mut Store,
+    action: &Action,
+) -> std::result::Result<Done, SyncError> {
+    // Held as `&mut`: a `&Store` cannot cross an await of a task that may move between threads.
+    remove_marking(server, &action.uids, &action.marked_deleted, move |uids| {
+        Ok(store.marked_deleted(action.id, uids)?)
+    })
+    .await
+}
+
+/// [`remove`]; `earlier` are the UIDs an earlier try marked itself, and `mark` records those
+/// whose flag is Missive's own, before it is set and once it is taken back.
+async fn remove_marking(
+    server: &mut Server<'_>,
+    uids: &[u32],
+    earlier: &[u32],
+    mut mark: impl FnMut(&[u32]) -> std::result::Result<(), SyncError>,
+) -> std::result::Result<Done, SyncError> {
     let set = sync::uid_set(uids);
     let Some(marked) = server.search(&format!("DELETED UID {set}")).await? else {
         return Ok(Done::No { try_create: false });
     };
+    let ours: Vec<u32> = uids
+        .iter()
+        .copied()
+        .filter(|uid| !marked.contains(uid) || earlier.contains(uid))
+        .collect();
+    mark(&ours)?;
     let done = server
         .run_done(
             &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
@@ -707,18 +793,20 @@ pub(crate) async fn remove(
         )
         .await?;
     if !matches!(done, Done::Ok(_)) {
+        // Nothing was set: only what an earlier try set is still there.
+        let still: Vec<u32> = ours
+            .iter()
+            .copied()
+            .filter(|uid| marked.contains(uid))
+            .collect();
+        mark(&still)?;
         return Ok(done);
     }
     let done = server
         .run_done(&format!("UID EXPUNGE {set}"), |_| {})
         .await?;
-    let ours: Vec<u32> = uids
-        .iter()
-        .copied()
-        .filter(|uid| !marked.contains(uid))
-        .collect();
     if !matches!(done, Done::Ok(_)) && !ours.is_empty() {
-        server
+        let taken_back = server
             .run_done(
                 &format!(
                     "UID STORE {} -FLAGS.SILENT (\\Deleted)",
@@ -727,6 +815,9 @@ pub(crate) async fn remove(
                 |_| {},
             )
             .await?;
+        if matches!(taken_back, Done::Ok(_)) {
+            mark(&[])?;
+        }
     }
     Ok(done)
 }
@@ -783,7 +874,7 @@ async fn copy_then_remove(
         }
     }
     // Copied: only the removal from the source is left, which can be tried again as it is.
-    Ok(match remove(server, &action.uids).await? {
+    Ok(match removing(server, store, &action).await? {
         Done::Ok(_) => {
             let (resync, moved) =
                 store.applied_move(&action, action.copied.as_ref(), action.copyuid)?;

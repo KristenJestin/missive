@@ -42,6 +42,8 @@ pub struct Action {
     pub copied: Option<CopyUid>,
     /// Whether `copied` is the server's COPYUID, not what was found again after a lost answer.
     pub copyuid: bool,
+    /// The UIDs this action marked `\Deleted` itself, while the flag may still be set.
+    pub marked_deleted: Vec<u32>,
     pub attempts: u32,
 }
 
@@ -50,8 +52,19 @@ pub struct Action {
 pub struct Dropped {
     /// A move refused once its messages were copied: they are in both folders.
     pub copied: bool,
+    /// How many messages keep the `\Deleted` the action set, until the next connection.
+    pub deleted_left: usize,
     /// The actions asked after it on its messages that cannot apply without it, to refuse too.
     pub behind: Vec<i64>,
+}
+
+/// `\Deleted` flags to take back: see [`Store::deleted_left`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletedLeft {
+    pub id: i64,
+    pub folder: ActionFolder,
+    pub uidvalidity: u32,
+    pub uids: Vec<u32>,
 }
 
 /// What the copy kept of a message that a copy of it on the server has too: `UID COPY` keeps the
@@ -337,7 +350,8 @@ impl Store {
                     "SELECT action.id, action.kind, source.id, source.name, source.uidvalidity,
                             action.uidvalidity, action.uids, target.id, target.name,
                             target.uidvalidity, action.state, action.target_uidnext,
-                            action.copied, action.attempts, action.copyuid
+                            action.copied, action.attempts, action.copyuid,
+                            action.marked_deleted
                        FROM action
                        JOIN folder AS source ON source.id = action.folder
                        LEFT JOIN folder AS target ON target.id = action.target
@@ -356,6 +370,7 @@ impl Store {
                         None => None,
                     };
                     let copied: Option<String> = r.get(12)?;
+                    let marked: Option<String> = r.get(15)?;
                     Ok(Action {
                         id: r.get(0)?,
                         // Written by this module only.
@@ -372,6 +387,9 @@ impl Store {
                         target_uidnext: r.get(11)?,
                         copied: copied.and_then(|c| serde_json::from_str(&c).ok()),
                         copyuid: r.get(14)?,
+                        marked_deleted: marked
+                            .and_then(|m| serde_json::from_str(&m).ok())
+                            .unwrap_or_default(),
                         attempts: r.get(13)?,
                     })
                 },
@@ -410,6 +428,50 @@ impl Store {
                 copyuid && copied.is_some()
             ],
         )?;
+        Ok(())
+    }
+
+    /// Records the UIDs the action marked `\Deleted` itself and may not have taken the flag back
+    /// from: written before the flag is set, emptied once it is taken back.
+    pub fn marked_deleted(&self, action: i64, uids: &[u32]) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE action SET marked_deleted = ?2 WHERE id = ?1",
+            params![
+                action,
+                (!uids.is_empty()).then(|| serde_json::to_string(uids).expect("numbers serialize"))
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The `\Deleted` flags the account's refused actions left on the server, to take back.
+    pub fn deleted_left(&self, account: i64) -> rusqlite::Result<Vec<DeletedLeft>> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT deleted_left.id, folder.id, folder.name, folder.uidvalidity,
+                    deleted_left.uidvalidity, deleted_left.uids
+               FROM deleted_left JOIN folder ON folder.id = deleted_left.folder
+              WHERE deleted_left.account = ?1 ORDER BY deleted_left.id",
+        )?;
+        let rows = statement.query_map([account], |r| {
+            let uids: String = r.get(5)?;
+            Ok(DeletedLeft {
+                id: r.get(0)?,
+                folder: ActionFolder {
+                    id: r.get(1)?,
+                    name: r.get(2)?,
+                    uidvalidity: r.get(3)?,
+                },
+                uidvalidity: r.get(4)?,
+                uids: serde_json::from_str(&uids).unwrap_or_default(),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// The flags of [`Store::deleted_left`] taken back, or that name other messages now.
+    pub fn taken_back(&self, id: i64) -> rusqlite::Result<()> {
+        self.connection
+            .execute("DELETE FROM deleted_left WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -578,18 +640,31 @@ impl Store {
     /// folders: each is recorded as half moved, and its copy written to the target in the copy
     /// when its new UID is known.
     ///
-    /// A permanent delete asked after a move on its messages is refused with it: it was asked of
-    /// a message shown in the trash, which the server never moved there.
+    /// The `\Deleted` the action set itself and could not take back is kept, to be taken back at
+    /// the next connection. A permanent delete asked after a move on its messages is refused
+    /// with it: it was asked of a message shown in the trash, which the server never moved there.
     pub fn refused(&mut self, action: &Action) -> rusqlite::Result<Dropped> {
         let transaction = self.connection.transaction()?;
-        let row: Option<(i64, String, Option<String>)> = transaction
+        let row: Option<(i64, String, Option<String>, Option<String>)> = transaction
             .query_row(
-                "DELETE FROM action WHERE id = ?1 RETURNING account, state, copied",
+                "DELETE FROM action WHERE id = ?1
+                 RETURNING account, state, copied, marked_deleted",
                 [action.id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
         let mut dropped = Dropped::default();
+        if let Some((account, _, _, Some(marked))) = &row {
+            let uids: Vec<u32> = serde_json::from_str(marked).unwrap_or_default();
+            if !uids.is_empty() {
+                transaction.execute(
+                    "INSERT INTO deleted_left (account, folder, uidvalidity, uids)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![account, action.folder.id, action.uidvalidity, marked],
+                )?;
+                dropped.deleted_left = uids.len();
+            }
+        }
         if action.kind.flag().is_some() {
             transaction.execute(
                 "UPDATE folder SET highest_modseq = NULL WHERE id = ?1",
@@ -604,7 +679,7 @@ impl Store {
                 .filter(|(_, kind, _)| *kind == Kind::DeletePermanently)
                 .map(|(id, _, _)| id)
                 .collect();
-            if let Some((account, state, copied)) = row
+            if let Some((account, state, copied, _)) = row
                 && state == "copied"
             {
                 let copied: Option<CopyUid> = copied.and_then(|c| serde_json::from_str(&c).ok());

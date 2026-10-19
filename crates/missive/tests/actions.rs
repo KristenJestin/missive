@@ -2356,3 +2356,53 @@ async fn an_action_behind_a_move_whose_copy_was_only_found_again_is_not_remapped
     assert_eq!(server.flags("Archive", 1), Some(Vec::new()));
     assert_eq!(server.uids("INBOX"), [1, 2, 4]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_left_by_a_cut_connection_is_reported_and_taken_back_at_the_next_connection()
+{
+    // The flag is never taken back: the server never answers, nor runs, that command.
+    let (server, env, _daemon) = started_with(
+        mailbox()
+            .without_move()
+            .refuse("UID EXPUNGE")
+            .stall("UID STORE 3 -FLAGS"),
+        &["--action-timeout", "1"],
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    let event = loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            break event;
+        }
+        succeeded(&sync_soon(&env).await);
+    };
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(event["reason"], "connection", "{event}");
+    let message = event["message"].as_str().unwrap();
+    assert!(message.contains("\\Deleted"), "{message}");
+    // Every try set it again and tried to take it back, and none could: it is still there.
+    assert_eq!(server.flags("INBOX", 3), flags(&["\\Deleted"]));
+    assert_eq!(
+        env.status_of_alice().await["deleted_left"],
+        serde_json::json!([three])
+    );
+    let text = stdout(&env.act(&["status"]).await);
+    assert!(text.contains("\\Deleted"), "{text}");
+
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    eventually(20, "the flag taken back", || {
+        server.flags("INBOX", 3) == Some(Vec::new())
+    })
+    .await;
+    assert_eq!(
+        env.status_of_alice().await["deleted_left"],
+        serde_json::json!([])
+    );
+    // What another client marked is left alone.
+    assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+}

@@ -207,9 +207,10 @@ the daemon runs.
       "half_moved": [
         { "message": "alice/1/1745112/4", "copy": "alice/2/1745113/9", "folder": "inbox",
           "target": "archive" }
-      ] },
+      ],
+      "deleted_left": [] },
     { "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0,
-      "skipped": [], "outbox": [], "drafts": [], "half_moved": [] }
+      "skipped": [], "outbox": [], "drafts": [], "half_moved": [], "deleted_left": [] }
   ]
 }
 ```
@@ -244,6 +245,7 @@ the daemon runs.
 | `accounts[].half_moved[].message` | string | the message's identifier, in the folder it was to leave |
 | `accounts[].half_moved[].copy` | string or `null` | the identifier of its copy in the target; `null` when the server did not tell its UID (the copy is in the target all the same) |
 | `accounts[].half_moved[].folder`, `.target` | string | the folder it was to leave and its target: their roles, else their names |
+| `accounts[].deleted_left` | array of strings | the messages an action refused for good left marked `\Deleted` on the server, by their identifiers: Missive set the flag itself and lost the connection before it could take it back. It takes it back at the next connection; `[]` when none |
 
 `ready` does not mean the copy is complete: a folder the server refuses is skipped, the others are
 synced, and the account is `ready` all the same. `skipped` is what keeps that from being silent. It
@@ -277,7 +279,9 @@ Drafts folder`), and one line for each draft whose last try failed. Each message
 has a line: `	half moved: alice/1/1745112/4 is in both inbox and archive, since the server refused to
 remove it after copying it; delete or move one of the two`. A message leaves `half_moved` once one
 of the two is gone from the copy (the user deleted or moved it, or another client did); a copy
-written before this field existed says `[]`.
+written before this field existed says `[]`. Each message of `deleted_left` has a line too:
+`	still marked \Deleted: alice/1/1745112/4, by an action that was then refused; Missive takes
+the flag back at the next connection`.
 
 ### `missive unread [--json]`
 

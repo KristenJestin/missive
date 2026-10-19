@@ -1795,6 +1795,7 @@ async fn the_copy_is_in_wal_mode_with_a_schema_version() {
             "account",
             "action",
             "action_sequence",
+            "deleted_left",
             "draft",
             "folder",
             "half_move",

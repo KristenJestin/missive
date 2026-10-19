@@ -62,6 +62,9 @@ const HALF_MOVE_VERSION: i64 = 10;
 /// The first schema version that counts the searches of Sent that failed.
 const SENT_SEARCH_VERSION: i64 = 12;
 
+/// The first schema version that keeps the `\Deleted` flags a refused action left.
+const DELETED_LEFT_VERSION: i64 = 15;
+
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -553,6 +556,25 @@ impl Copy {
                 folder: r.get(6)?,
                 target: r.get(7)?,
             })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The messages an action refused for good left marked `\Deleted` on the server, by their
+    /// identifiers, oldest first: Missive set the flag itself, and takes it back at the next
+    /// connection. Empty in a copy older than them.
+    pub fn deleted_left(&self, account: &str) -> Result<Vec<String>> {
+        if self.version < DELETED_LEFT_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare_cached(
+            "SELECT deleted_left.folder, deleted_left.uidvalidity, json_each.value
+               FROM deleted_left JOIN account ON account.key = deleted_left.account,
+                    json_each(deleted_left.uids)
+              WHERE account.id = ?1 ORDER BY deleted_left.id, json_each.key",
+        )?;
+        let rows = statement.query_map([account], |r| {
+            Ok(message_id(account, r.get(0)?, r.get(1)?, r.get(2)?))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
