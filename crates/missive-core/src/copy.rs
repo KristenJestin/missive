@@ -56,6 +56,9 @@ const DRAFTS_VERSION: i64 = 7;
 /// one, when it was claimed).
 const RETRY_VERSION: i64 = 9;
 
+/// The first schema version that counts the searches of Sent that failed.
+const SENT_SEARCH_VERSION: i64 = 10;
+
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +171,9 @@ pub struct Outgoing {
     /// `claimed` for longer than a submission takes: its worker could not put it back in the
     /// queue, and it stays so until the next start of the daemon.
     pub stuck: bool,
+    /// For a `sent` message: how many times looking for its copy in Sent failed so far; at five
+    /// the copy is given up.
+    pub copy_search_failures: u32,
 }
 
 /// A draft of an account kept in the local copy until the server holds it, as `missive status`
@@ -513,9 +519,14 @@ impl Copy {
         } else {
             "NULL"
         };
+        let failures = if self.version >= SENT_SEARCH_VERSION {
+            "outbox.copy_search_failures"
+        } else {
+            "0"
+        };
         let mut statement = self.connection.prepare(&format!(
             "SELECT outbox.id, outbox.state, outbox.message_id, outbox.queued_at,
-                    outbox.attempts, outbox.last_error, {claimed_at}
+                    outbox.attempts, outbox.last_error, {claimed_at}, {failures}
                FROM outbox JOIN account ON account.key = outbox.account
               WHERE account.id = ?1 ORDER BY outbox.id"
         ))?;
@@ -533,6 +544,7 @@ impl Copy {
                 queued_at: r.get(3)?,
                 attempts: r.get(4)?,
                 last_error: r.get(5)?,
+                copy_search_failures: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

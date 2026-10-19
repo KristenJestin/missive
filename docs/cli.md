@@ -228,6 +228,7 @@ the daemon runs.
 | `accounts[].outbox[].queued_at` | number | when it was written, in seconds since the epoch |
 | `accounts[].outbox[].attempts` | number | the tries that failed before the end of its data (tried again later) |
 | `accounts[].outbox[].last_error` | string or `null` | the last error, for people |
+| `accounts[].outbox[].copy_search_failures` | number | for a `sent` message: how many times looking for its copy in Sent failed (the connection was lost, or the server refused the search); the copy is given up at five, with a `sent-copy-failed` event. `0` for any other state |
 | `accounts[].outbox[].stuck` | boolean | the message has been `claimed` for more than an hour: the daemon's worker could not write the outbox to put it back in the queue (five tries), and it stays so until the daemon starts again, which queues it again. `false` for any other state, for a claim that is being tried, and for a claim without a time (made by a daemon older than the claim time) |
 | `accounts[].drafts` | array | the drafts the copy keeps until the server holds them, oldest first (see [Drafts](#drafts)) |
 | `accounts[].drafts[].id` | string | the draft's identifier (its `Message-ID`, without angle brackets), as `compose --json` printed it |
@@ -260,10 +261,11 @@ bob	never synced	0 messages
 
 A line reads `unknown (the daemon is not running)` in the place of the state when `state` is
 `null` for the second reason above. An account whose outbox holds messages has a line more,
-`	outbox: 1 queued, 1 failed`, and one line for each failed or uncertain message, with why, and
-for each stuck one (`stuck` above). An account whose drafts wait in the copy has a line more too, `	drafts: 1 to write to the Drafts
-folder` (or `kept in the local copy: the account has no Drafts folder`), and one line for each
-draft whose last try failed.
+`	outbox: 1 queued, 1 failed`, and one line for each failed or uncertain message, with why, for
+each stuck one (`stuck` above) and for each sent one whose copy could not be looked for in Sent
+(`copy_search_failures` above). An account whose drafts wait in the copy has a line more too,
+`	drafts: 1 to write to the Drafts folder` (or `kept in the local copy: the account has no
+Drafts folder`), and one line for each draft whose last try failed.
 
 ### `missive unread [--json]`
 

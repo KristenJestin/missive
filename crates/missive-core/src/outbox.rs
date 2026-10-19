@@ -37,9 +37,10 @@
 //! path (`APPEND` counts only with its tagged `OK`), flagged `\Seen`, with the message's Bcc
 //! recipients in it (see [`crate::compose`]). A try whose answer was lost, or that a killed daemon
 //! left, may have appended it: each try is counted before its `APPEND`, and every try after the
-//! first searches the Sent folder for its `Message-ID` first (a search that fails is not a try).
-//! Missive never creates a Sent folder.
-//! After [`MAX_ATTEMPTS`] tries the copy is given up (the message was sent).
+//! first searches the Sent folder for its `Message-ID` first (a search that fails is not a try,
+//! but is counted apart). Missive never creates a Sent folder.
+//! After [`MAX_ATTEMPTS`] tries, or [`MAX_ATTEMPTS`] failed searches, the copy is given up (the
+//! message was sent).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -329,7 +330,7 @@ async fn copy_each(
             continue;
         };
         // Only an append started counts: a search that fails (the connection dropped) says
-        // nothing of the copy, and the next pass searches again.
+        // nothing of the copy, and the next pass searches again, a few times.
         if copy.attempts > 0 {
             let searched =
                 tokio::time::timeout(timeout, already_there(session, &name, &copy.message_id))
@@ -342,8 +343,12 @@ async fn copy_each(
                     continue;
                 }
                 Ok(Ok(false)) => {}
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => {
+                    search_failed(store, id, copy.message_id, copies)?;
+                    return Err(error);
+                }
                 Err(_) => {
+                    search_failed(store, id, copy.message_id, copies)?;
                     copies.timed_out = true;
                     return Err(SyncError::Connection(ConnectError::Unreachable(
                         "the IMAP server did not answer SEARCH in time".to_owned(),
@@ -408,6 +413,25 @@ fn failed(
         });
     } else {
         copies.copied.push(Copied::Retried { id, attempts });
+    }
+    Ok(())
+}
+
+/// A look in Sent for a copy failed: the copy stays, and is given up after [`MAX_ATTEMPTS`] of
+/// them, as after as many failed appends.
+fn search_failed(
+    store: &mut Store,
+    id: i64,
+    message_id: String,
+    copies: &mut Copies,
+) -> rusqlite::Result<()> {
+    if store.copy_search_failed(id)? >= MAX_ATTEMPTS {
+        store.copy_done(id)?;
+        copies.copied.push(Copied::GivenUp {
+            id,
+            message_id,
+            why: "looking for it in Sent failed too many times",
+        });
     }
     Ok(())
 }

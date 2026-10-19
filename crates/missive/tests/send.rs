@@ -1376,10 +1376,11 @@ async fn a_failed_search_of_sent_is_not_one_of_the_tries_of_the_copy() {
             .ok()
     };
     eventually(20, "the first try counted", || tries() == Some(1)).await;
-    // From now on the search of Sent fails, at more passes than the copy has tries.
+    // From now on the search of Sent fails, at more passes than the copy has tries but fewer than
+    // it has failed searches.
     server.heal();
     server.cut("UID SEARCH", 0);
-    for _ in 0..7 {
+    for _ in 0..4 {
         env.run(&["sync"]).await;
     }
 
@@ -1397,6 +1398,71 @@ async fn a_failed_search_of_sent_is_not_one_of_the_tries_of_the_copy() {
         env.run(&["sync"]).await;
     }
     assert!(env.outbox().is_empty());
+    assert_eq!(server.uids("Sent").len(), 1);
+}
+
+/// A message sent whose copy was appended once, the answer lost: the next tries search Sent first.
+async fn appended_without_an_answer(server: &FakeServer, env: &Env) -> Watcher {
+    let mut watcher = env.watch().await;
+    server.cut_after_append();
+    succeeded(&env.compose(&["--body", BODY]).await);
+    watcher.next("sent").await;
+    eventually(20, "the copy taken by the server", || {
+        server.uids("Sent").len() == 1
+    })
+    .await;
+    eventually(20, "the first try counted", || {
+        Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row("SELECT copy_attempts FROM outbox", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .is_ok_and(|tries| tries == 1)
+    })
+    .await;
+    server.heal();
+    watcher
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_whose_search_of_sent_keeps_failing_is_given_up_and_status_counts_the_failures() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = appended_without_an_answer(&server, &env).await;
+    server.cut("UID SEARCH", 0);
+
+    env.run(&["sync"]).await;
+    let status = env.status().await;
+    let waiting = &status["accounts"][0]["outbox"][0];
+    assert_eq!(waiting["state"], "sent", "{status}");
+    assert!(
+        waiting["copy_search_failures"].as_u64().unwrap() >= 1,
+        "{status}"
+    );
+    let output = env.run(&["status"]).await;
+    assert!(
+        stdout(&output).contains("message 1 sent: its copy for Sent is not written yet"),
+        "{}",
+        stdout(&output)
+    );
+
+    // The bound is the one of the appends: five.
+    for _ in 0..10 {
+        if env.outbox().is_empty() {
+            break;
+        }
+        env.run(&["sync"]).await;
+    }
+    assert!(env.outbox().is_empty(), "{:?}", env.outbox());
+    let given_up = watcher.next("sent-copy-failed").await;
+    assert!(
+        given_up["message"]
+            .as_str()
+            .unwrap()
+            .contains("looking for it in Sent failed too many times"),
+        "{given_up}"
+    );
+    // Given up, not appended again: the copy that is there stays the only one.
     assert_eq!(server.uids("Sent").len(), 1);
 }
 

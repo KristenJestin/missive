@@ -312,6 +312,12 @@ pub fn status(json: bool) -> Result<()> {
                             .as_deref()
                             .unwrap_or("no reason recorded")
                     );
+                } else if message.state == "sent" && message.copy_search_failures > 0 {
+                    println!(
+                        "\t\tmessage {} sent: its copy for Sent is not written yet, looking for it \
+                         in Sent failed {} times",
+                        message.id, message.copy_search_failures
+                    );
                 } else if message.stuck {
                     println!(
                         "\t\tmessage {} claimed: stuck, the daemon could not put it back in the \

@@ -1,4 +1,4 @@
-//! The outbox (schema versions 6, 8 and 9): the messages to send, and where each one is between
+//! The outbox (schema versions 6, 8, 9 and 10): the messages to send, and where each one is between
 //! its writing and its server's answer. See [`crate::outbox`].
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -356,6 +356,17 @@ impl Store {
         self.connection.query_row(
             "UPDATE outbox SET copy_attempts = copy_attempts + 1 WHERE id = ?1
              RETURNING copy_attempts",
+            [id],
+            |r| r.get(0),
+        )
+    }
+
+    /// Looking for a copy in Sent failed; returns how many times it did so far, this one
+    /// included.
+    pub fn copy_search_failed(&self, id: i64) -> rusqlite::Result<u32> {
+        self.connection.query_row(
+            "UPDATE outbox SET copy_search_failures = copy_search_failures + 1 WHERE id = ?1
+             RETURNING copy_search_failures",
             [id],
             |r| r.get(0),
         )
