@@ -336,13 +336,18 @@ async fn copy_each(
                 tokio::time::timeout(timeout, already_there(session, &name, &copy.message_id))
                     .await;
             match searched {
-                Ok(Ok(true)) => {
+                Ok(Ok(Some(true))) => {
                     store.copy_done(id)?;
                     copies.copied.push(Copied::Appended { id });
                     copies.resync = Some(folder);
                     continue;
                 }
-                Ok(Ok(false)) => {}
+                Ok(Ok(Some(false))) => {}
+                // A refusal is not an answer: appending again could double the copy.
+                Ok(Ok(None)) => {
+                    search_failed(store, id, copy.message_id, copies)?;
+                    continue;
+                }
                 Ok(Err(error)) => {
                     search_failed(store, id, copy.message_id, copies)?;
                     return Err(error);
@@ -437,21 +442,21 @@ fn search_failed(
 }
 
 /// Whether Sent holds a message with this Message-ID: a try whose answer was lost may have
-/// appended it.
+/// appended it. `None` when the server refused to say.
 async fn already_there(
     session: &mut ImapSession,
     name: &str,
     message_id: &str,
-) -> Result<bool, SyncError> {
+) -> Result<Option<bool>, SyncError> {
     if sync::examine_uidvalidity(session, name).await?.is_none() {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(quoted) = sync::quote(&format!("<{message_id}>")) else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     Ok(
         sync::search(session, &format!("HEADER Message-ID {quoted}"))
             .await?
-            .is_some_and(|found| !found.is_empty()),
+            .map(|found| !found.is_empty()),
     )
 }

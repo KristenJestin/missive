@@ -1466,6 +1466,41 @@ async fn a_copy_whose_search_of_sent_keeps_failing_is_given_up_and_status_counts
     assert_eq!(server.uids("Sent").len(), 1);
 }
 
+/// The server answers `NO` to `command` while the copy is looked for in Sent: that is not an
+/// answer, so the copy that went in once is not appended again.
+async fn a_refused_look_in_sent_does_not_append_the_copy_again(command: &str) {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    appended_without_an_answer(&server, &env).await;
+    server.refuse(command);
+
+    env.run(&["sync"]).await;
+    env.run(&["sync"]).await;
+
+    assert_eq!(server.uids("Sent").len(), 1, "appended a second time");
+    assert_eq!(env.outbox().len(), 1, "the copy was dropped");
+    // The server answers again: the copy is found in Sent, and nothing is appended.
+    server.heal();
+    for _ in 0..5 {
+        if env.outbox().is_empty() {
+            break;
+        }
+        env.run(&["sync"]).await;
+    }
+    assert!(env.outbox().is_empty());
+    assert_eq!(server.uids("Sent").len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_search_of_sent_the_server_refuses_does_not_append_the_copy_again() {
+    a_refused_look_in_sent_does_not_append_the_copy_again("UID SEARCH").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_examine_of_sent_the_server_refuses_does_not_append_the_copy_again() {
+    a_refused_look_in_sent_does_not_append_the_copy_again("EXAMINE").await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn status_says_that_a_message_stays_claimed_for_good() {
     let (_server, _relay, env) = smtp_down().await;
