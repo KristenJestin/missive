@@ -883,6 +883,57 @@ async fn a_keyword_a_server_cannot_keep_is_taken_back_in_the_copy_without_readin
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_keyword_the_message_already_has_stays_in_the_copy_where_the_server_keeps_no_keywords() {
+    let server = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .without_keywords()
+        .folder(
+            Folder::new("INBOX").message(Message::new(ORIGINAL).flag("$Forwarded").flag("\\Seen")),
+        )
+        .folder(Folder::new("Sent").special_use(SpecialUse::Sent))
+        .folder(Folder::new("Drafts").special_use(SpecialUse::Drafts))
+        .start()
+        .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    // `show` does not tell keywords: the copy's own flags do.
+    let copy_flags = || {
+        let copy =
+            Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        copy.query_row("SELECT flags FROM message", [], |r| r.get::<_, String>(0))
+            .unwrap()
+    };
+    assert!(copy_flags().contains("$Forwarded"), "{}", copy_flags());
+
+    succeeded(
+        &env.run(&[
+            "compose",
+            "--forward",
+            &id,
+            "--to",
+            "ina@example.net",
+            "--send",
+        ])
+        .await,
+    );
+    took(&server, 1).await;
+    eventually(30, "the queue empty", || {
+        let copy =
+            Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        copy.query_row("SELECT count(*) FROM action", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+            == 0
+    })
+    .await;
+    // Let a resync, if one were asked for, happen.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // The server has the keyword, and the copy still says so: nothing took it back.
+    assert!(flags(&server).contains(&"$Forwarded".to_owned()));
+    assert!(copy_flags().contains("$Forwarded"), "{}", copy_flags());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_server_that_keeps_no_keywords_is_not_asked_to_and_nothing_is_said() {
     let server = mailbox().without_keywords().start().await;
     let (env, _daemon) = started(&Setup::of(&server)).await;

@@ -346,7 +346,7 @@ impl std::fmt::Display for NotFound {
     }
 }
 
-fn has_flag(flags: &str, flag: &str) -> bool {
+pub(crate) fn has_flag(flags: &str, flag: &str) -> bool {
     flags.split(' ').any(|f| f.eq_ignore_ascii_case(flag))
 }
 

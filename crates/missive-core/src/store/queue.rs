@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{NewMessage, Store};
 use crate::actions::{Kind, Queued, Refused, Wanted, unsupported, with_flag};
-use crate::copy::{MessageId, NotFound};
+use crate::copy::{MessageId, NotFound, has_flag};
 use crate::sync::CopyUid;
 
 /// The roles a move can name a folder by.
@@ -304,6 +304,26 @@ pub(super) fn queue_in(
                 (Kind::DeletePermanently, None)
             }
         };
+        if let Some((flag, add)) = kind.flag() {
+            // A flag change a message already has is no change: recorded, a skipped action
+            // would take the flag back from the copy though the server has it.
+            let folder = group.folder;
+            let mut kept = Vec::new();
+            for uid in &group.uids {
+                let flags: String = transaction.query_row(
+                    "SELECT flags FROM message WHERE folder = ?1 AND uid = ?2",
+                    params![folder, uid],
+                    |r| r.get(0),
+                )?;
+                if has_flag(&flags, flag) != add {
+                    kept.push(*uid);
+                }
+            }
+            if kept.is_empty() {
+                continue;
+            }
+            group.uids = kept;
+        }
         let capabilities: (Option<bool>, Option<bool>) = transaction.query_row(
             "SELECT can_move, can_uidplus FROM account WHERE key = ?1",
             [group.account],
@@ -1183,6 +1203,55 @@ mod tests {
         // Nothing asks for the folder to be read again.
         let row = f.store.folder(1, "INBOX", Some("inbox")).unwrap();
         assert_eq!(row.highest_modseq, Some(9));
+    }
+
+    #[test]
+    fn a_flag_a_message_already_has_is_not_queued_so_a_skipped_action_cannot_take_it_back() {
+        let mut f = fixture();
+        f.store
+            .apply_listing(
+                f.inbox,
+                &[],
+                &[(2, "$Forwarded \\Answered".to_owned())],
+                Some(9),
+            )
+            .unwrap();
+
+        for kind in [Kind::Forwarded, Kind::Answered] {
+            let queued = f.queue(&[f.id(f.inbox, 2)], Wanted::Mark(kind)).unwrap();
+            assert!(queued.actions.is_empty(), "{kind:?}");
+        }
+        // Taking a flag away from a message that has not got it is as much of a no-op.
+        let queued = f
+            .queue(&[f.id(f.inbox, 2)], Wanted::Mark(Kind::Unread))
+            .unwrap();
+        assert!(queued.actions.is_empty());
+
+        assert_eq!(f.actions(), 0);
+        assert_eq!(f.flags(f.inbox)[&2], "$Forwarded \\Answered");
+    }
+
+    #[test]
+    fn a_mark_is_queued_for_the_messages_that_lack_the_flag_only() {
+        let mut f = fixture();
+        f.store
+            .apply_listing(f.inbox, &[], &[(2, "$Forwarded".to_owned())], Some(9))
+            .unwrap();
+
+        let queued = f
+            .queue(
+                &[f.id(f.inbox, 2), f.id(f.inbox, 3)],
+                Wanted::Mark(Kind::Forwarded),
+            )
+            .unwrap();
+
+        assert_eq!(queued.actions.len(), 1);
+        assert_eq!(queued.messages.len(), 2, "both are named in the answer");
+        let forwarded = f.next();
+        assert_eq!(forwarded.uids, [3]);
+        f.store.skipped(&forwarded).unwrap();
+        assert_eq!(f.flags(f.inbox)[&2], "$Forwarded");
+        assert_eq!(f.flags(f.inbox)[&3], "");
     }
 
     #[test]
