@@ -2,6 +2,8 @@
 //! with its change to the copy, and what becomes of it once the server answered. See
 //! [`crate::actions`].
 
+use std::collections::BTreeSet;
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{NewMessage, Store};
@@ -38,7 +40,31 @@ pub struct Action {
     pub state: String,
     pub target_uidnext: Option<u32>,
     pub copied: Option<CopyUid>,
+    /// Whether `copied` is the server's COPYUID, not what was found again after a lost answer.
+    pub copyuid: bool,
+    /// The UIDs this action marked `\Deleted` itself, while the flag may still be set.
+    pub marked_deleted: Vec<u32>,
     pub attempts: u32,
+}
+
+/// What dropping an action left to tell.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Dropped {
+    /// A move refused once its messages were copied: they are in both folders.
+    pub copied: bool,
+    /// How many messages keep the `\Deleted` the action set, until the next connection.
+    pub deleted_left: usize,
+    /// The actions asked after it on its messages that cannot apply without it, to refuse too.
+    pub behind: Vec<i64>,
+}
+
+/// `\Deleted` flags to take back: see [`Store::deleted_left`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletedLeft {
+    pub id: i64,
+    pub folder: ActionFolder,
+    pub uidvalidity: u32,
+    pub uids: Vec<u32>,
 }
 
 /// What the copy kept of a message that a copy of it on the server has too: `UID COPY` keeps the
@@ -56,6 +82,11 @@ struct Group {
     account: i64,
     account_id: String,
     folder: i64,
+    /// The move that waits for these messages, if one does: an action asked after it follows
+    /// the messages once it is applied, so it is not mixed with messages that are not moving.
+    mover: Option<i64>,
+    /// Where they are shown: the target of that move, else their folder.
+    shown: i64,
     role: Option<String>,
     uidvalidity: u32,
     uids: Vec<u32>,
@@ -119,15 +150,35 @@ pub(super) fn queue_in(
         let Some(moving) = moving else {
             return Ok(Err(not_found(id, NotFound::Unknown)));
         };
-        if moving.is_some() {
-            return Ok(Err(Refused::new(
-                "busy",
-                format!(
-                    "{id}: a move of this message waits for the server; ask again once it is \
-                         applied (missive watch tells when)"
-                ),
-            )));
-        }
+        let (mover, shown, role) = match moving {
+            None => (None, parsed.folder, role),
+            Some(target) => {
+                // Without UIDPLUS the server does not say where the move takes the message, so
+                // what is asked after it could not follow it.
+                let uidplus: Option<bool> = transaction.query_row(
+                    "SELECT can_uidplus FROM account WHERE key = ?1",
+                    [account],
+                    |r| r.get(0),
+                )?;
+                if uidplus == Some(false) {
+                    return Ok(Err(Refused::new(
+                        "busy",
+                        format!(
+                            "{id}: a move of this message waits for the server, which will not \
+                             tell its new UID (it has no UIDPLUS); ask again once it is applied \
+                             (missive watch tells when)"
+                        ),
+                    )));
+                }
+                let mover = last_move(transaction, parsed.folder, parsed.uidvalidity, parsed.uid)?;
+                let role: Option<String> = transaction.query_row(
+                    "SELECT role FROM folder WHERE id = ?1",
+                    [target],
+                    |r| r.get(0),
+                )?;
+                (mover, target, role)
+            }
+        };
         if queued.messages.contains(id) {
             continue;
         }
@@ -135,12 +186,17 @@ pub(super) fn queue_in(
         if !queued.accounts.contains(&parsed.account) {
             queued.accounts.push(parsed.account.clone());
         }
-        match groups.iter_mut().find(|g| g.folder == parsed.folder) {
+        match groups
+            .iter_mut()
+            .find(|g| g.folder == parsed.folder && g.mover == mover)
+        {
             Some(group) => group.uids.push(parsed.uid),
             None => groups.push(Group {
                 account,
                 account_id: parsed.account.clone(),
                 folder: parsed.folder,
+                mover,
+                shown,
                 role,
                 uidvalidity: parsed.uidvalidity,
                 uids: vec![parsed.uid],
@@ -168,7 +224,7 @@ pub(super) fn queue_in(
                         ),
                     )));
                 };
-                if target == group.folder {
+                if target == group.shown {
                     // Already there: nothing to do.
                     continue;
                 }
@@ -279,18 +335,29 @@ pub(super) fn queue_in(
 impl Store {
     /// The account's first action, the one to apply next.
     pub fn next_action(&self, account: i64) -> rusqlite::Result<Option<Action>> {
+        self.action_where("action.account = ?1 ORDER BY action.id LIMIT 1", account)
+    }
+
+    /// The action of this number, while it is in the queue.
+    pub fn action(&self, id: i64) -> rusqlite::Result<Option<Action>> {
+        self.action_where("action.id = ?1", id)
+    }
+
+    fn action_where(&self, condition: &str, value: i64) -> rusqlite::Result<Option<Action>> {
         self.connection
             .query_row(
-                "SELECT action.id, action.kind, source.id, source.name, source.uidvalidity,
-                        action.uidvalidity, action.uids, target.id, target.name,
-                        target.uidvalidity, action.state, action.target_uidnext, action.copied,
-                        action.attempts
-                   FROM action
-                   JOIN folder AS source ON source.id = action.folder
-                   LEFT JOIN folder AS target ON target.id = action.target
-                  WHERE action.account = ?1
-                  ORDER BY action.id LIMIT 1",
-                [account],
+                &format!(
+                    "SELECT action.id, action.kind, source.id, source.name, source.uidvalidity,
+                            action.uidvalidity, action.uids, target.id, target.name,
+                            target.uidvalidity, action.state, action.target_uidnext,
+                            action.copied, action.attempts, action.copyuid,
+                            action.marked_deleted
+                       FROM action
+                       JOIN folder AS source ON source.id = action.folder
+                       LEFT JOIN folder AS target ON target.id = action.target
+                      WHERE {condition}"
+                ),
+                [value],
                 |r| {
                     let kind: String = r.get(1)?;
                     let uids: String = r.get(6)?;
@@ -303,6 +370,7 @@ impl Store {
                         None => None,
                     };
                     let copied: Option<String> = r.get(12)?;
+                    let marked: Option<String> = r.get(15)?;
                     Ok(Action {
                         id: r.get(0)?,
                         // Written by this module only.
@@ -318,6 +386,10 @@ impl Store {
                         state: r.get(10)?,
                         target_uidnext: r.get(11)?,
                         copied: copied.and_then(|c| serde_json::from_str(&c).ok()),
+                        copyuid: r.get(14)?,
+                        marked_deleted: marked
+                            .and_then(|m| serde_json::from_str(&m).ok())
+                            .unwrap_or_default(),
                         attempts: r.get(13)?,
                     })
                 },
@@ -335,24 +407,71 @@ impl Store {
         )
     }
 
-    /// Records how far a move without MOVE got: see the schema.
+    /// Records how far a move without MOVE got: see the schema. `copyuid`: whether `copied` is
+    /// what the server said.
     pub fn copy_state(
         &self,
         action: i64,
         state: &str,
         target_uidnext: Option<u32>,
         copied: Option<&CopyUid>,
+        copyuid: bool,
     ) -> rusqlite::Result<()> {
         self.connection.execute(
             "UPDATE action SET state = ?2, target_uidnext = coalesce(?3, target_uidnext),
-                    copied = ?4 WHERE id = ?1",
+                    copied = ?4, copyuid = ?5 WHERE id = ?1",
             params![
                 action,
                 state,
                 target_uidnext,
-                copied.map(|c| serde_json::to_string(c).expect("numbers serialize"))
+                copied.map(|c| serde_json::to_string(c).expect("numbers serialize")),
+                copyuid && copied.is_some()
             ],
         )?;
+        Ok(())
+    }
+
+    /// Records the UIDs the action marked `\Deleted` itself and may not have taken the flag back
+    /// from: written before the flag is set, emptied once it is taken back.
+    pub fn marked_deleted(&self, action: i64, uids: &[u32]) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE action SET marked_deleted = ?2 WHERE id = ?1",
+            params![
+                action,
+                (!uids.is_empty()).then(|| serde_json::to_string(uids).expect("numbers serialize"))
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The `\Deleted` flags the account's refused actions left on the server, to take back.
+    pub fn deleted_left(&self, account: i64) -> rusqlite::Result<Vec<DeletedLeft>> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT deleted_left.id, folder.id, folder.name, folder.uidvalidity,
+                    deleted_left.uidvalidity, deleted_left.uids
+               FROM deleted_left JOIN folder ON folder.id = deleted_left.folder
+              WHERE deleted_left.account = ?1 ORDER BY deleted_left.id",
+        )?;
+        let rows = statement.query_map([account], |r| {
+            let uids: String = r.get(5)?;
+            Ok(DeletedLeft {
+                id: r.get(0)?,
+                folder: ActionFolder {
+                    id: r.get(1)?,
+                    name: r.get(2)?,
+                    uidvalidity: r.get(3)?,
+                },
+                uidvalidity: r.get(4)?,
+                uids: serde_json::from_str(&uids).unwrap_or_default(),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// The flags of [`Store::deleted_left`] taken back, or that name other messages now.
+    pub fn taken_back(&self, id: i64) -> rusqlite::Result<()> {
+        self.connection
+            .execute("DELETE FROM deleted_left WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -411,11 +530,18 @@ impl Store {
     /// target when `copied` gives it (and the target in the copy has the UIDVALIDITY it names).
     /// Else the row leaves the copy, and the target is returned, to be synced now: its sync
     /// brings the message under its new UID.
+    ///
+    /// The actions asked after it on its messages follow them to their new UIDs, but only when
+    /// `copyuid` says the server gave them (COPYUID) for exactly those messages: a UID found
+    /// again by other means could name another message, which a delete would remove. A message
+    /// the server did not move (it no longer had it) leaves them. Returns the folders to sync,
+    /// and the actions that could not follow, to refuse.
     pub fn applied_move(
         &mut self,
         action: &Action,
         copied: Option<&CopyUid>,
-    ) -> rusqlite::Result<Vec<i64>> {
+        copyuid: bool,
+    ) -> rusqlite::Result<(Vec<i64>, Vec<i64>)> {
         let target = action.target.as_ref().expect("a move has a target");
         let transaction = self.connection.transaction()?;
         transaction.execute("DELETE FROM action WHERE id = ?1", [action.id])?;
@@ -460,8 +586,49 @@ impl Store {
                 resync = true;
             }
         }
+        let mut behind = Vec::new();
+        for (id, _, uids) in later(&transaction, action)? {
+            // Asked on messages that were all moving with this one (see `queue_in`).
+            let new: BTreeSet<u32> = match copied.filter(|_| copyuid) {
+                Some(copied) => uids
+                    .iter()
+                    .filter_map(|uid| copied.pairs.iter().find(|(old, _)| old == uid))
+                    .map(|(_, new)| *new)
+                    .collect(),
+                None => BTreeSet::new(),
+            };
+            if new.is_empty() {
+                behind.push(id);
+                continue;
+            }
+            let new: Vec<u32> = new.into_iter().collect();
+            transaction.execute(
+                "UPDATE action SET folder = ?2, uidvalidity = ?3, uids = ?4 WHERE id = ?1",
+                params![
+                    id,
+                    target.id,
+                    copied.map(|c| c.uidvalidity),
+                    serde_json::to_string(&new).expect("numbers serialize")
+                ],
+            )?;
+            for uid in new {
+                moving_again(&transaction, target.id, uid)?;
+            }
+        }
         transaction.commit()?;
-        Ok(if resync { vec![target.id] } else { Vec::new() })
+        Ok((if resync { vec![target.id] } else { Vec::new() }, behind))
+    }
+
+    /// A move whose messages are where it takes them already (a move back, asked while the
+    /// move before it waited, which the server then refused): it leaves the queue, and nothing
+    /// is sent.
+    pub fn settled(&mut self, action: &Action) -> rusqlite::Result<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM action WHERE id = ?1", [action.id])?;
+        for uid in &action.uids {
+            moving_again(&transaction, action.folder.id, *uid)?;
+        }
+        transaction.commit()
     }
 
     /// An action refused for good: it leaves the queue and its change leaves the copy. A message
@@ -471,17 +638,33 @@ impl Store {
     ///
     /// A move refused once the server had copied its messages (without MOVE) leaves them in both
     /// folders: each is recorded as half moved, and its copy written to the target in the copy
-    /// when its new UID is known. Returns whether it was so.
-    pub fn refused(&mut self, action: &Action) -> rusqlite::Result<bool> {
+    /// when its new UID is known.
+    ///
+    /// The `\Deleted` the action set itself and could not take back is kept, to be taken back at
+    /// the next connection. A permanent delete asked after a move on its messages is refused
+    /// with it: it was asked of a message shown in the trash, which the server never moved there.
+    pub fn refused(&mut self, action: &Action) -> rusqlite::Result<Dropped> {
         let transaction = self.connection.transaction()?;
-        let row: Option<(i64, String, Option<String>)> = transaction
+        let row: Option<(i64, String, Option<String>, Option<String>)> = transaction
             .query_row(
-                "DELETE FROM action WHERE id = ?1 RETURNING account, state, copied",
+                "DELETE FROM action WHERE id = ?1
+                 RETURNING account, state, copied, marked_deleted",
                 [action.id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let mut half_moved = false;
+        let mut dropped = Dropped::default();
+        if let Some((account, _, _, Some(marked))) = &row {
+            let uids: Vec<u32> = serde_json::from_str(marked).unwrap_or_default();
+            if !uids.is_empty() {
+                transaction.execute(
+                    "INSERT INTO deleted_left (account, folder, uidvalidity, uids)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![account, action.folder.id, action.uidvalidity, marked],
+                )?;
+                dropped.deleted_left = uids.len();
+            }
+        }
         if action.kind.flag().is_some() {
             transaction.execute(
                 "UPDATE folder SET highest_modseq = NULL WHERE id = ?1",
@@ -489,21 +672,23 @@ impl Store {
             )?;
         } else if action.kind.moves() {
             for uid in &action.uids {
-                transaction.execute(
-                    "UPDATE message SET moving_to = NULL WHERE folder = ?1 AND uid = ?2",
-                    params![action.folder.id, uid],
-                )?;
+                moving_again(&transaction, action.folder.id, *uid)?;
             }
-            if let Some((account, state, copied)) = row
+            dropped.behind = later(&transaction, action)?
+                .into_iter()
+                .filter(|(_, kind, _)| *kind == Kind::DeletePermanently)
+                .map(|(id, _, _)| id)
+                .collect();
+            if let Some((account, state, copied, _)) = row
                 && state == "copied"
             {
                 let copied: Option<CopyUid> = copied.and_then(|c| serde_json::from_str(&c).ok());
                 half_move(&transaction, account, action, copied.as_ref())?;
-                half_moved = true;
+                dropped.copied = true;
             }
         }
         transaction.commit()?;
-        Ok(half_moved)
+        Ok(dropped)
     }
 }
 
@@ -596,6 +781,68 @@ fn half_move(
         )?;
     }
     Ok(())
+}
+
+/// The latest move or delete waiting for a message, which an action asked on it now comes after.
+fn last_move(
+    connection: &Connection,
+    folder: i64,
+    uidvalidity: u32,
+    uid: u32,
+) -> rusqlite::Result<Option<i64>> {
+    connection
+        .query_row(
+            "SELECT action.id FROM action, json_each(action.uids)
+              WHERE action.folder = ?1 AND action.uidvalidity = ?2
+                AND action.kind IN ('move', 'delete') AND json_each.value = ?3
+              ORDER BY action.id DESC LIMIT 1",
+            params![folder, uidvalidity, uid],
+            |r| r.get(0),
+        )
+        .optional()
+}
+
+/// Shows a message in the target of the latest move still waiting for it, or in its folder.
+fn moving_again(connection: &Connection, folder: i64, uid: u32) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE message SET moving_to = (
+             SELECT action.target FROM action JOIN folder ON folder.id = action.folder,
+                    json_each(action.uids)
+              WHERE action.folder = ?1 AND action.uidvalidity = folder.uidvalidity
+                AND action.kind IN ('move', 'delete') AND json_each.value = ?2
+              ORDER BY action.id DESC LIMIT 1)
+          WHERE folder = ?1 AND uid = ?2",
+        params![folder, uid],
+    )?;
+    Ok(())
+}
+
+/// The actions asked after `action` on some of its messages, with their kind and UIDs, in order.
+fn later(connection: &Connection, action: &Action) -> rusqlite::Result<Vec<(i64, Kind, Vec<u32>)>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT id, kind, uids FROM action
+          WHERE folder = ?1 AND uidvalidity = ?2 AND id > ?3 ORDER BY id",
+    )?;
+    let rows = statement.query_map(
+        params![action.folder.id, action.uidvalidity, action.id],
+        |r| {
+            let kind: String = r.get(1)?;
+            let uids: String = r.get(2)?;
+            Ok((
+                r.get(0)?,
+                Kind::parse(&kind).expect("a known action"),
+                serde_json::from_str(&uids).unwrap_or_default(),
+            ))
+        },
+    )?;
+    let mut later = Vec::new();
+    for row in rows {
+        let (id, kind, uids): (i64, Kind, Vec<u32>) = row?;
+        if uids.iter().any(|uid| action.uids.contains(uid)) {
+            later.push((id, kind, uids));
+        }
+    }
+    Ok(later)
 }
 
 fn not_found(id: &str, why: NotFound) -> Refused {
@@ -928,7 +1175,7 @@ mod tests {
         .unwrap();
         let moved = f.next();
 
-        let resync = f
+        let (resync, _) = f
             .store
             .applied_move(
                 &moved,
@@ -936,6 +1183,7 @@ mod tests {
                     uidvalidity: 20,
                     pairs: vec![(2, 41), (3, 42)],
                 }),
+                true,
             )
             .unwrap();
 
@@ -968,7 +1216,7 @@ mod tests {
                 .unwrap();
             let moved = f.next();
 
-            let resync = f.store.applied_move(&moved, copied.as_ref()).unwrap();
+            let (resync, _) = f.store.applied_move(&moved, copied.as_ref(), true).unwrap();
 
             assert_eq!(resync, [f.archive]);
             assert_eq!(f.listed().len(), 2);
@@ -1078,12 +1326,17 @@ mod tests {
         assert_eq!(f.actions(), 0);
         assert_eq!(f.flags(f.inbox)[&2], "");
 
-        // A message whose move waits takes no other action until the server moved it.
+        // A message whose move waits takes no other action until the server moved it, when the
+        // server is known not to tell where it moved it.
         f.queue(
             std::slice::from_ref(&good),
             Wanted::Move("archive".to_owned()),
         )
         .unwrap();
+        f.store
+            .connection
+            .execute("UPDATE account SET can_move = 1, can_uidplus = 0", [])
+            .unwrap();
         let refused = f
             .queue(std::slice::from_ref(&good), Wanted::Mark(Kind::Read))
             .unwrap_err();
@@ -1153,10 +1406,11 @@ mod tests {
                     uidvalidity: 20,
                     pairs: vec![(2, 41)],
                 }),
+                true,
             )
             .unwrap();
 
-        assert!(f.store.refused(&moved).unwrap());
+        assert!(f.store.refused(&moved).unwrap().copied);
 
         let half = |f: &Fixture| -> Vec<(String, Option<String>)> {
             f.copy
@@ -1199,7 +1453,7 @@ mod tests {
         f.queue(&[f.id(f.inbox, 2)], Wanted::Move("archive".to_owned()))
             .unwrap();
         let moved = f.next();
-        assert!(!f.store.refused(&moved).unwrap());
+        assert!(!f.store.refused(&moved).unwrap().copied);
         assert!(f.copy.half_moved("alice").unwrap().is_empty());
     }
 }
