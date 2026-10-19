@@ -13,9 +13,10 @@ use gpui_kit::{
     AnyWindowHandle, ExternalPaths, FileDropEvent, Modifiers, TestAppContext, VisualContext,
     VisualTestContext,
 };
+use missive_core::draft_lock;
 use missive_core::protocol::{Answer, Command, PROTOCOL, SaveDraft};
 use missive_window::compose::{Compose, Field, SAVE_AFTER, State};
-use missive_window::compose_view::{Chooser, ComposeWindow};
+use missive_window::compose_view::{Chooser, ComposeWindow, Locker};
 use missive_window::view::{self, Asker, MailWindow, Opener};
 
 type Asked = Arc<Mutex<Vec<SaveDraft>>>;
@@ -398,4 +399,89 @@ fn files_dropped_on_the_window_are_attached_and_the_unreadable_ones_are_named(
     assert!(saves, "the draft is saved with them once the typing stops");
     // They are shown, each with its Remove button.
     assert!(cx.debug_bounds("remove-1").is_some());
+}
+
+/// A locker over a private folder, as the window's own is over the runtime folder.
+fn locker(folder: &tempfile::TempDir) -> Locker {
+    let folder = folder.path().to_owned();
+    Arc::new(move |account, id| draft_lock::take_in(&folder, account, id))
+}
+
+#[gpui_kit::test]
+fn a_new_message_takes_the_lock_of_its_draft_once_saved_and_gives_it_back_on_closing(
+    cx: &mut TestAppContext,
+) {
+    let folder = tempfile::tempdir().unwrap();
+    let (asker, _) = asker();
+    cx.update(|cx| {
+        gpui_kit::base::init(cx);
+        view::bind_keys(cx);
+    });
+    let locks = locker(&folder);
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        ComposeWindow::new(new_message(), asker, no_chooser(), window, cx).holding(None, locks)
+    });
+    cx.run_until_parked();
+    let held = || draft_lock::is_held_in(folder.path(), ID, "d@example.org");
+    assert!(!held(), "nobody can know a draft that is not saved");
+
+    cx.simulate_input("zoe@example.com");
+    advance(cx, SAVE_AFTER);
+    // The daemon named it `d@example.org`: a second window on it, anywhere, is refused.
+    assert!(held());
+
+    cx.simulate_keystrokes("ctrl-w");
+    cx.run_until_parked();
+    assert!(!open(cx));
+    assert!(!held(), "closed windows hold nothing");
+}
+
+#[gpui_kit::test]
+fn a_draft_open_in_another_process_is_not_opened_a_second_time(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let drafts = missive_core::fake::Folder::new("Drafts")
+        .special_use(missive_core::fake::SpecialUse::Drafts)
+        .message(missive_core::fake::Message::new(
+            "X-Missive-Draft: 1\r\nFrom: alice@example.org\r\nTo: zoe@example.com\r\n\
+             Subject: One draft\r\nMessage-ID: <one@example.org>\r\n\r\nHello\r\n",
+        ));
+    let mail = runtime.block_on(Mail::new(mailbox().folder(drafts)));
+    let (asker, _) = asker();
+    cx.update(|cx| {
+        gpui_kit::base::init(cx);
+        view::bind_keys(cx);
+    });
+    let folder = tempfile::tempdir().unwrap();
+    // The window of another process, which holds the draft's lock.
+    let draft_lock::Taking::Ours(elsewhere) =
+        draft_lock::take_in(folder.path(), ID, "one@example.org")
+    else {
+        panic!("free to take");
+    };
+    let opener: Opener = Arc::new(|_| {});
+    let mut model = mail.model();
+    let id = model.accounts[0]
+        .folders
+        .iter()
+        .find(|f| f.folder.role.as_deref() == Some("drafts"))
+        .unwrap()
+        .folder
+        .id;
+    model.select_folder(ID, id);
+    let locks = locker(&folder);
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        MailWindow::new(model, opener, asker, window, cx).with_locker(locks)
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("e");
+    cx.run_until_parked();
+    assert_eq!(compose_windows(cx).len(), 0, "the draft is open elsewhere");
+
+    // That window closes (or crashes): the draft opens here.
+    drop(elsewhere);
+    cx.simulate_keystrokes("e");
+    cx.run_until_parked();
+    assert_eq!(compose_windows(cx).len(), 1);
+    assert!(draft_lock::is_held_in(folder.path(), ID, "one@example.org"));
 }

@@ -790,6 +790,13 @@ command returns at once). The output is the same; a window that cannot start is 
 error, and the draft stays saved. Without a display, nothing is opened; **`--no-window`** opens
 nothing even with one, for a script that only wants the draft saved.
 
+A draft has **one compose window**, whichever process opened it: a window holds a lock on the draft
+(see `docs/protocol.md`) for as long as it is open, and the lock goes with the process, so a window
+that crashed does not keep its draft shut. `compose --draft` on a draft that is open in a window
+does not open a second one: it saves the draft, and says on standard error that the draft is
+already open (it does not bring the first window forward). The reader's `E` says the same in its
+notice, and `missive-window compose --draft …` run by hand exits with status 1.
+
 #### Replying and forwarding
 
 `--reply`, `--reply-all` and `--forward` take a message's identifier (as `search` and `list`

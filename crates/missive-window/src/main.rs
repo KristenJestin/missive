@@ -7,8 +7,8 @@ use futures_util::StreamExt;
 use gpui_kit::prelude::*;
 use gpui_kit::{App, Bounds, WindowBounds, WindowOptions, px, size};
 use missive_core::protocol::socket_path;
-use missive_core::{chooser, opener};
-use missive_window::compose_view::{self, Chooser};
+use missive_core::{chooser, draft_lock, opener};
+use missive_window::compose_view::{self, Chooser, Locker};
 use missive_window::launch::{self, Launch};
 use missive_window::model::{Model, Sources};
 use missive_window::view::{self, Asker, MailWindow, Opening};
@@ -30,6 +30,7 @@ fn main() {
     let asker: Asker =
         missive_window::ask::from_env().unwrap_or_else(|e| Arc::new(move |_| Err(e.clone())));
     let chooser: Chooser = Arc::new(choose);
+    let locker: Locker = Arc::new(draft_lock::take);
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::base::init(cx);
         view::bind_keys(cx);
@@ -41,16 +42,19 @@ fn main() {
         })
         .detach();
         match launch {
-            Launch::Reader => reader(sources, asker, chooser, cx),
+            Launch::Reader => reader(sources, asker, chooser, locker, cx),
             Launch::Compose { account, draft } => {
                 let compose = launch::compose(&sources, account, draft);
-                compose_view::open(compose, asker, chooser, cx).expect("a window");
+                if let Err(e) = compose_view::open(compose, asker, chooser, locker, cx) {
+                    eprintln!("missive-window: {e}");
+                    std::process::exit(1);
+                }
             }
         }
     });
 }
 
-fn reader(sources: Sources, asker: Asker, chooser: Chooser, cx: &mut App) {
+fn reader(sources: Sources, asker: Asker, chooser: Chooser, locker: Locker, cx: &mut App) {
     let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -62,6 +66,7 @@ fn reader(sources: Sources, asker: Asker, chooser: Chooser, cx: &mut App) {
             cx.new(|cx| {
                 MailWindow::new(Model::new(sources), Arc::new(open), asker, window, cx)
                     .with_chooser(chooser)
+                    .with_locker(locker)
             })
         })
         .expect("a window");

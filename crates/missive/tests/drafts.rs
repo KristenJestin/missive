@@ -2205,3 +2205,54 @@ async fn taking_the_attachments_off_a_draft_whose_html_draws_from_one_keeps_the_
     assert_eq!(parsed.attachment_count(), 1);
     assert!(parsed.body_text(0).unwrap().contains(BODY));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_open_in_a_window_is_not_opened_a_second_time_from_the_shell() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let (missive, path, args) = fake_window(&env);
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+
+    // Free: the window is started, as on any draft.
+    let output = with_display(&env, &missive, &path)
+        .args(["compose", "--draft", &id, "--subject", "Second"])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    eventually(10, "the window started", || written(&args)).await;
+    std::fs::remove_file(&args).unwrap();
+
+    // A compose window of another process holds the draft's lock (the runtime folder is the
+    // test's own): no second window, the draft is saved all the same, and the command says so.
+    let runtime = env.path("runtime").join("missive");
+    let missive_core::draft_lock::Taking::Ours(window) =
+        missive_core::draft_lock::take_in(&runtime, "alice", &id)
+    else {
+        panic!("the draft is free");
+    };
+    let output = with_display(&env, &missive, &path)
+        .args(["compose", "--draft", &id, "--subject", "Third"])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    assert!(
+        stderr(&output).contains("already open") && stderr(&output).contains(&id),
+        "{}",
+        stderr(&output)
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!args.exists(), "no second window");
+    drafts_on_server(&server, &["Third"]).await;
+
+    // The window closes (or crashes): the next one opens.
+    drop(window);
+    let output = with_display(&env, &missive, &path)
+        .args(["compose", "--draft", &id, "--subject", "Fourth"])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    eventually(10, "the window started", || written(&args)).await;
+}

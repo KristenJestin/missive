@@ -10,6 +10,7 @@ or removed without a new protocol version.
 |---|---|
 | `$XDG_RUNTIME_DIR/missive/daemon.sock` | the socket |
 | `$XDG_RUNTIME_DIR/missive/daemon.pid` | the running daemon's pid; empty once it stopped cleanly |
+| `$XDG_RUNTIME_DIR/missive/compose-<hash>.lock` | one per draft opened in a compose window, named by a hash of the account and the draft's `Message-ID`: the window holds it locked (`flock`) while it is open, empty, left in place when it closes; a second window on the same draft finds it locked and is not opened. Only the windows and `missive compose` read it |
 
 There is one daemon per user. It holds `daemon.pid` locked for as long as it runs, so a second
 daemon refuses to start (`a daemon is already running (pid …)`), and a daemon that was killed
