@@ -29,6 +29,11 @@ protocol version it was written for:
 {"protocol": 1, "request": "sync", "account": "alice"}
 ```
 
+`missive` and the window wait at most 10 seconds for the answer to a request that records
+something (every one but `sync` and `subscribe`). A daemon that accepts the connection and stays
+silent longer is reported as one that "did not answer"; the request may or may not have been
+recorded.
+
 Every answer carries `protocol`, the request it answers in `answer` (`null` when the request could
 not be read), and `ok`:
 

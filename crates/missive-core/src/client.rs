@@ -83,9 +83,23 @@ fn start(program: &Path, log: &Path) -> Result<std::process::Child, String> {
         .map_err(|e| format!("cannot start the daemon: {e}"))
 }
 
+/// How long a client waits for the daemon's answer once its request is sent. Every request but
+/// `sync` and `subscribe` is answered once it is recorded in the copy, never after the server:
+/// a daemon that stays silent longer is stuck.
+pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Sends one request to the daemon on `socket`, starting `program daemon` when none answers, and
-/// reads its answer.
+/// reads its answer, for at most [`ANSWER_TIMEOUT`].
 pub async fn ask(socket: &Path, program: &Path, command: Command) -> Result<Answer, String> {
+    ask_within(socket, program, command, ANSWER_TIMEOUT).await
+}
+
+async fn ask_within(
+    socket: &Path,
+    program: &Path,
+    command: Command,
+    timeout: Duration,
+) -> Result<Answer, String> {
     let stream = connect(socket, program).await?;
     let (read, mut write) = stream.into_split();
     let mut line = serde_json::to_string(&Request {
@@ -99,10 +113,85 @@ pub async fn ask(socket: &Path, program: &Path, command: Command) -> Result<Answ
         .await
         .map_err(|e| e.to_string())?;
     let mut line = String::new();
-    BufReader::new(read)
-        .read_line(&mut line)
+    tokio::time::timeout(timeout, BufReader::new(read).read_line(&mut line))
         .await
+        .map_err(|_| {
+            format!(
+                "the daemon did not answer within {} seconds",
+                timeout.as_secs().max(1)
+            )
+        })?
         .map_err(|e| e.to_string())?;
     serde_json::from_str(&line)
         .map_err(|_| "the daemon gave an answer this missive cannot read".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    fn answer_line() -> String {
+        let answer = Answer {
+            protocol: PROTOCOL,
+            answer: Some("sync".to_owned()),
+            ok: true,
+            ..Answer::default()
+        };
+        format!("{}\n", serde_json::to_string(&answer).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_never_answers_gives_an_error_after_the_timeout() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // It accepts, reads the request and holds the connection open, silent.
+        let silent = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream);
+            let mut request = String::new();
+            lines.read_line(&mut request).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let started = Instant::now();
+        let asked = ask_within(
+            &socket,
+            Path::new("missive-is-not-started"),
+            Command::Subscribe,
+            Duration::from_millis(200),
+        )
+        .await;
+        let error = asked.expect_err("no answer comes");
+        assert!(error.contains("did not answer"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        silent.abort();
+    }
+
+    #[tokio::test]
+    async fn an_answer_in_time_is_read() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream);
+            let mut request = String::new();
+            lines.read_line(&mut request).await.unwrap();
+            lines
+                .get_mut()
+                .write_all(answer_line().as_bytes())
+                .await
+                .unwrap();
+        });
+        let answer = ask_within(
+            &socket,
+            Path::new("missive-is-not-started"),
+            Command::Subscribe,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(answer.ok);
+    }
 }
