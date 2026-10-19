@@ -76,6 +76,18 @@ impl Mailbox {
     }
 }
 
+/// The longest message identifier written. A line holds 998 bytes at most (RFC 5322, 2.1.1) and
+/// an identifier cannot be folded, so one that fills the line would be refused by servers; this
+/// leaves room for the field name.
+pub const MAX_IDENTIFIER: usize = 900;
+
+/// Whether `id` (without angle brackets) can be written in `In-Reply-To` or `References`.
+pub fn is_identifier(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_IDENTIFIER
+        && !id.contains(|c: char| c.is_control() || c.is_whitespace() || "<>".contains(c))
+}
+
 /// A file to attach: its name (without any folder) and its content.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attachment {
@@ -128,9 +140,7 @@ impl Draft {
             return Err("the subject holds a line break".to_owned());
         }
         for id in self.in_reply_to.iter().chain(&self.references) {
-            if id.is_empty()
-                || id.contains(|c: char| c.is_control() || c.is_whitespace() || "<>".contains(c))
-            {
+            if !is_identifier(id) {
                 return Err(format!("{id:?} is not a message identifier"));
             }
         }
@@ -584,6 +594,22 @@ mod tests {
             ..Draft::default()
         };
         assert!(write(&account(), &broken, 0, None).is_err());
+    }
+
+    #[test]
+    fn a_thread_identifier_that_fills_a_line_is_refused_not_written_unfolded() {
+        let long = format!("{}@example.org", "x".repeat(MAX_IDENTIFIER));
+        let draft = Draft {
+            references: vec![long],
+            ..Draft::default()
+        };
+        assert!(write(&account(), &draft, 0, None).is_err());
+
+        let draft = Draft {
+            references: vec![format!("{}@example.org", "x".repeat(100)); 3],
+            ..Draft::default()
+        };
+        assert!(write(&account(), &draft, 0, None).is_ok());
     }
 
     #[test]

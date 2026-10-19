@@ -147,6 +147,9 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
     }
     // What the user gives replaces what the message answered suggests.
     let a = answering.unwrap_or_default();
+    if let Some(notice) = &a.notice {
+        eprintln!("{notice}");
+    }
     attachments.splice(0..0, a.attachment);
     let texts = |list: Vec<Mailbox>| -> Vec<String> { list.iter().map(Mailbox::to_text).collect() };
     let to = if args.to.is_empty() {
@@ -202,6 +205,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
                 in_reply_to: draft.in_reply_to.first().cloned(),
                 references: draft.references,
                 answers: a.answers,
+                forwards: a.forwards,
             },
             args.json,
         )
@@ -228,6 +232,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         references: draft.references,
         send: args.send,
         answers: None,
+        forwards: None,
     }))
     .await?;
     let answer = answered(answer)?;

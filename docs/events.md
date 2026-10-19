@@ -158,7 +158,7 @@ the daemon tried it on the server.
 | Field | Type | |
 |---|---|---|
 | `account` | string | the account's identifier |
-| `action` | string | `read`, `unread`, `flagged`, `unflagged`, `answered` (set once a reply is sent), `move`, `delete` (a move to the trash) or `delete-permanently` |
+| `action` | string | `read`, `unread`, `flagged`, `unflagged`, `answered` (set once a reply is sent), `forwarded` (set once a forward is sent; never told when the server keeps no keywords), `move`, `delete` (a move to the trash) or `delete-permanently` |
 | `outcome` | string | `applied`, `retried` or `refused` |
 | `messages` | array of strings | the identifiers of the messages, as they were when the action was asked |
 | `id` | number | the action's number, as the answer to its request gave it (`actions`, `docs/protocol.md`): no other action ever has it |

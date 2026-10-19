@@ -74,6 +74,8 @@ pub struct Compose {
     references: Vec<String>,
     /// A reply: the message to mark answered once it is sent.
     answers: Option<String>,
+    /// A forward: the message to mark forwarded once it is sent.
+    forwards: Option<String>,
     /// The draft's identifier, once the daemon saved it.
     pub draft: Option<String>,
     pub state: State,
@@ -111,6 +113,7 @@ impl Compose {
             in_reply_to: None,
             references: Vec::new(),
             answers: None,
+            forwards: None,
             draft: None,
             state: State::Editing,
             edits: 0,
@@ -141,6 +144,8 @@ impl Compose {
         compose.in_reply_to = answering.in_reply_to.into_iter().next();
         compose.references = answering.references;
         compose.answers = answering.answers;
+        compose.forwards = answering.forwards;
+        compose.notice = answering.notice;
         compose
     }
 
@@ -341,6 +346,7 @@ impl Compose {
             references: self.references.clone(),
             send,
             answers: if send { self.answers.clone() } else { None },
+            forwards: if send { self.forwards.clone() } else { None },
         }))
     }
 

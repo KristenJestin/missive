@@ -53,7 +53,7 @@ use missive_core::outbox::{self, Copied, Tried};
 use missive_core::protocol::{
     self, AccountState, Answer, Command, PROTOCOL, pid_path, read_request, runtime_dir, socket_path,
 };
-use missive_core::store::{Retaken, SkippedFolder, Store};
+use missive_core::store::{Followed, Retaken, SkippedFolder, Store};
 use missive_core::sync::{self, Capabilities, Changes, Folder, Skip, SyncError};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -73,6 +73,16 @@ const IDLE_RENEWAL: Duration = Duration::from_secs(25 * 60);
 const IDLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a worker in the middle of a sync is given to finish it when the daemon stops.
 const STOP_GRACE: Duration = Duration::from_secs(3);
+/// How long the daemon waits for its workers once it stops: the longest of the graces a worker
+/// is given (a sync's, the outbox record's), and a second for it to end. Derived from them, so
+/// that the record always fits inside the wait.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(
+    (if STOP_GRACE.as_secs() > outbox::RECORD_GRACE.as_secs() {
+        STOP_GRACE.as_secs()
+    } else {
+        outbox::RECORD_GRACE.as_secs()
+    }) + 1,
+);
 /// The longest wait between two connections to an unreachable server.
 const BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 /// How many events a watcher may be behind by before it misses some: a few minutes of a busy
@@ -94,6 +104,8 @@ pub struct Options {
     pub batch_size: usize,
     /// How long the server is given to answer each command of an action.
     pub action_timeout: Duration,
+    /// The least time between two counted tries of a copy for Sent.
+    pub copy_spacing: Duration,
 }
 
 macro_rules! log {
@@ -158,7 +170,7 @@ pub async fn run(options: Options) -> Result<(), String> {
         events: Arc::new(Events::new(&store)),
         store,
         stopping,
-        workers: Mutex::new(BTreeMap::new()),
+        workers: Arc::new(Mutex::new(BTreeMap::new())),
         senders: Mutex::new(BTreeMap::new()),
         rechecks: Mutex::new(BTreeMap::new()),
         tasks: Mutex::new(JoinSet::new()),
@@ -185,10 +197,7 @@ pub async fn run(options: Options) -> Result<(), String> {
     let _ = stop.send(true);
     let mut tasks = std::mem::take(&mut *locked(&daemon.tasks));
     let all = async { while tasks.join_next().await.is_some() {} };
-    if tokio::time::timeout(STOP_GRACE + Duration::from_secs(3), all)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(JOIN_TIMEOUT, all).await.is_err() {
         log!("a worker did not stop in time and was cut off");
     }
     drop(listener);
@@ -304,7 +313,7 @@ struct Daemon {
     store: PathBuf,
     stopping: watch::Receiver<bool>,
     /// Where to send each account's requests, by identifier.
-    workers: Mutex<BTreeMap<String, mpsc::UnboundedSender<Request>>>,
+    workers: Arc<Mutex<BTreeMap<String, mpsc::UnboundedSender<Request>>>>,
     /// Where to wake each account's SMTP worker, by identifier.
     senders: Mutex<BTreeMap<String, mpsc::UnboundedSender<()>>>,
     /// Where to tell each account's SMTP worker that the user asked for a sync, which is how a
@@ -425,6 +434,7 @@ impl Daemon {
                 wake: woken,
                 recheck: recheck.clone(),
                 imap: requests.downgrade(),
+                workers: self.workers.clone(),
                 stop: self.stopping.clone(),
                 events: self.events.clone(),
             };
@@ -593,7 +603,10 @@ impl Daemon {
             }
             Command::Subscribe => unreachable!("`serve` answers a subscription itself"),
             Command::Mark { messages, mark_as } => match Kind::parse(&mark_as) {
-                Some(kind) if kind.flag().is_some() && kind != Kind::Answered => {
+                Some(kind)
+                    if kind.flag().is_some()
+                        && !matches!(kind, Kind::Answered | Kind::Forwarded) =>
+                {
                     self.record(name, &messages, Wanted::Mark(kind))
                 }
                 _ => Answer::error(
@@ -776,6 +789,24 @@ impl Daemon {
             }
             Err(e) => return failed(e.to_string()),
         }
+        // Without UIDPLUS its last version stays in the Drafts folder, listed: sending it again
+        // would send the same message twice.
+        if request.send
+            && let Some(id) = &message_id
+        {
+            match store.already_sent(key, id) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Answer::error(
+                        Some(name),
+                        "already-sent",
+                        "this draft was already sent (its message is in the Sent folder or was \
+                         sent from the outbox); write a new message instead",
+                    );
+                }
+                Err(e) => return failed(e.to_string()),
+            }
+        }
         let changed = request.to.is_some()
             || request.cc.is_some()
             || request.bcc.is_some()
@@ -853,11 +884,14 @@ impl Daemon {
         let draft = (save || (request.draft.is_some() && kept.is_none()))
             .then_some(built.message_id.as_str());
         let sent_copy = !account.server_saves_sent;
-        let queued = match (&source, &request.answers) {
-            (Some(source), answers) => {
-                store.enqueue_kept(key, &built, sent_copy, draft, answers.as_deref(), source)
+        let followed = followed(request.answers.as_deref(), request.forwards.as_deref());
+        let queued = match (&source, followed) {
+            (Some(source), followed) => {
+                store.enqueue_kept(key, &built, sent_copy, draft, followed, source)
             }
-            (None, Some(answers)) => store.enqueue_reply(key, &built, sent_copy, draft, answers),
+            (None, Some(followed)) => {
+                store.enqueue_followup(key, &built, sent_copy, draft, followed)
+            }
             (None, None) => store.enqueue(key, &built, sent_copy, draft),
         };
         let outbox = match queued {
@@ -948,8 +982,10 @@ impl Daemon {
             let sent_copy = !account.server_saves_sent;
             Ok((
                 key,
-                match &send.answers {
-                    Some(answers) => store.enqueue_reply(key, &built, sent_copy, None, answers)?,
+                match followed(send.answers.as_deref(), send.forwards.as_deref()) {
+                    Some(followed) => {
+                        store.enqueue_followup(key, &built, sent_copy, None, followed)?
+                    }
                     None => store.enqueue(key, &built, sent_copy, None)?,
                 },
             ))
@@ -1546,6 +1582,7 @@ impl Worker {
             &mut self.store,
             self.key,
             self.options.action_timeout,
+            self.options.copy_spacing,
         )
         .await;
         for copy in &copies.copied {
@@ -1913,6 +1950,14 @@ impl Worker {
     }
 }
 
+/// The message a request to send answers or forwards, to mark once it is sent. A request naming
+/// both is a reply: a forward is never also a reply.
+fn followed<'a>(answers: Option<&'a str>, forwards: Option<&'a str>) -> Option<Followed<'a>> {
+    answers
+        .map(Followed::Answered)
+        .or_else(|| forwards.map(Followed::Forwarded))
+}
+
 /// Submits an account's outbox: see [`missive_core::outbox`]. It never talks to the IMAP
 /// server; it wakes the IMAP worker when a copy is to be appended to Sent.
 struct SmtpWorker {
@@ -1928,6 +1973,8 @@ struct SmtpWorker {
     recheck: Arc<Notify>,
     /// The account's IMAP worker; weak, so that it still ends when its account is removed.
     imap: mpsc::WeakUnboundedSender<Request>,
+    /// Every account's IMAP worker: a message answered or forwarded may be another account's.
+    workers: Arc<Mutex<BTreeMap<String, mpsc::UnboundedSender<Request>>>>,
     stop: watch::Receiver<bool>,
     events: Arc<Events>,
 }
@@ -2080,14 +2127,7 @@ impl SmtpWorker {
     /// The account's password from the keyring, read as the IMAP worker reads it. `&mut`
     /// although only read: the copy is not `Sync`, and the future must be `Send`.
     async fn password(&mut self) -> Option<Password> {
-        let found = match Keyring::open().await {
-            Ok(keyring) => keyring.password(&self.id).await,
-            Err(e) => Err(e),
-        };
-        found.unwrap_or_else(|_| {
-            log!("account {}: the keyring cannot be read", self.key);
-            None
-        })
+        read_password(&self.id, self.key).await
     }
 
     /// Waits for `timeout`, or for a message written to (or put back in) the outbox. `false`
@@ -2121,7 +2161,10 @@ impl SmtpWorker {
                     }
                 }
                 _ = self.recheck.notified(), if refused.is_some() => {
-                    let now = self.password().await;
+                    let now = tokio::select! {
+                        now = read_password(&self.id, self.key) => now,
+                        _ = stopped(&mut self.stop) => return false,
+                    };
                     if let (Some(now), Some(refused)) = (now, refused)
                         && now.expose() != refused.expose()
                     {
@@ -2146,17 +2189,23 @@ impl SmtpWorker {
                 id,
                 message_id,
                 sent_copy,
-                answered,
+                marked,
             } => {
                 log!(
-                    "account {}: message {id} sent (copy in Sent: {sent_copy}, answered: \
-                     {answered})",
-                    self.key
+                    "account {}: message {id} sent (copy in Sent: {sent_copy}, original marked \
+                     in {} accounts)",
+                    self.key,
+                    marked.len()
                 );
-                if (sent_copy == "append" || answered)
+                if sent_copy == "append"
                     && let Some(imap) = self.imap.upgrade()
                 {
                     let _ = imap.send(Request::Actions);
+                }
+                // The original's account applies its flag now, not at its next pass.
+                let workers = locked(&self.workers);
+                for worker in marked.iter().filter_map(|account| workers.get(account)) {
+                    let _ = worker.send(Request::Actions);
                 }
                 self.events.send(Event::Sent(Sent {
                     account,
@@ -2216,6 +2265,19 @@ impl SmtpWorker {
     }
 }
 
+/// The SMTP worker's read of the keyring, apart from the worker so that a stop can be raced
+/// against it: a keyring that asks for a passphrase holds the read until someone types it.
+async fn read_password(id: &str, key: i64) -> Option<Password> {
+    let found = match Keyring::open().await {
+        Ok(keyring) => keyring.password(id).await,
+        Err(e) => Err(e),
+    };
+    found.unwrap_or_else(|_| {
+        log!("account {key}: the keyring cannot be read");
+        None
+    })
+}
+
 const UNCERTAIN_LEFT: &str = "the daemon stopped while the message was being sent: it may have \
                               been sent, so it is not sent again";
 
@@ -2232,4 +2294,15 @@ pub async fn connect() -> Result<UnixStream, String> {
     let socket = socket_path().map_err(|e| e.to_string())?;
     let program = std::env::current_exe().map_err(|e| e.to_string())?;
     client::connect(&socket, &program).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wait_for_the_workers_leaves_the_record_all_its_grace_and_a_second() {
+        assert!(JOIN_TIMEOUT >= outbox::RECORD_GRACE + Duration::from_secs(1));
+        assert!(JOIN_TIMEOUT >= STOP_GRACE + Duration::from_secs(1));
+    }
 }

@@ -149,6 +149,22 @@ impl Store {
         )
     }
 
+    /// Whether a message with this Message-ID was already sent: the copy's Sent folder holds it,
+    /// or the outbox sent it or does not know whether the server took it. Without UIDPLUS a
+    /// sent draft's last version stays in the Drafts folder, and sending it again would send
+    /// the same message twice.
+    pub fn already_sent(&self, account: i64, message_id: &str) -> rusqlite::Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM outbox WHERE account = ?1 AND message_id = ?2
+                              AND state IN ('sent', 'uncertain'))
+                 OR EXISTS (SELECT 1 FROM message JOIN folder ON folder.id = message.folder
+                             WHERE folder.account = ?1 AND folder.role = 'sent'
+                               AND message.message_id = ?2)",
+            params![account, message_id],
+            |r| r.get(0),
+        )
+    }
+
     /// Whether a message of the outbox sent from the draft of another client, `source`, is still
     /// to be sent.
     pub fn source_sending(&self, account: i64, source: &str) -> rusqlite::Result<bool> {

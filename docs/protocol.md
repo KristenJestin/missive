@@ -68,6 +68,7 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `not-in-trash` | a `delete` with `permanently` of a message outside the trash, in an account that has one |
 | `unsupported` | a `move`, `delete` or `delete` with `permanently` the account's server cannot apply safely: it has neither `MOVE` nor `UIDPLUS` (a move), or no `UIDPLUS` (a permanent delete). Known from the server's capabilities, recorded at each connection; before the first one, the action is recorded, and refused when tried (`docs/events.md`) |
 | `busy` | a message whose move waits for the server: it takes no other action until then; or a `draft` naming a draft whose message waits in the outbox |
+| `already-sent` | a `draft` with `send` naming a draft whose message was already sent (the Sent folder holds it, or the outbox sent it or does not know whether the server took it): nothing is sent twice |
 | `uncertain` | a `resend` without `yes` of an `uncertain` message: the server may have taken it already |
 | `not-failed` | a `resend` or a `discard` of a message that is neither `failed` nor `uncertain` (`message` says its state) |
 | `bad-request` (`send`, `draft`) | also: the message cannot be sent as written (`message` says why: no recipient, an address that is not one…) |
@@ -150,6 +151,7 @@ reached:
 | `in_reply_to` | string, absent for none | the `Message-ID`, without angle brackets, of the message this one answers, written as its `In-Reply-To` header |
 | `references` | array of strings, empty when absent | the thread's `Message-ID`s without angle brackets, written as the `References` header |
 | `answers` | string, absent for none | the identifier of the message this one is a reply to: once the server took the reply (never before), that message is marked answered (`\Answered`), through the queue of actions, and the `action` event `answered` tells it. A message gone since is not an error |
+| `forwards` | string, absent for none | the identifier of the message this one forwards: once the server took the forward (never before), that message is marked forwarded (`$Forwarded`), through the queue of actions, and the `action` event `forwarded` tells it; a server whose folder keeps no keywords is not asked, and nothing is said. A message gone since is not an error |
 
 The daemon builds the message (see `missive compose` in `docs/cli.md`), writes it to the outbox
 in the local copy, and answers: nothing waits for the server.
@@ -204,6 +206,7 @@ Saves a draft: a new one, or a new version of the draft `draft` names. With `sen
 | `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered unless `answers` names it |
 | `send` | boolean, `false` when absent | send the draft, as it is once changed (at least one recipient then); it is removed from the Drafts folder once the server took the message |
 | `answers` | string, optional | with `send`: the identifier of the message the draft is a reply to, as for `send`; marked answered once the server took the reply |
+| `forwards` | string, optional | with `send`: the identifier of the message the draft forwards, as for `send`; marked forwarded once the server took the forward |
 
 The daemon saves the draft in the local copy (and, with `send`, puts the message in the outbox),
 and answers: nothing waits for the server. It then writes the draft to the account's Drafts
@@ -218,7 +221,8 @@ it went.
 every version of the draft. With `send`, the answer also has `outbox`, as for `send`. A `draft`
 that names no draft of the account is answered `no-such-message`. A `draft` naming a draft whose
 message still waits in the outbox is answered `busy`: a client that lost the answer to its `send`
-and asks again sends nothing twice.
+and asks again sends nothing twice. A `draft` with `send` naming a draft whose message was already
+sent is answered `already-sent`.
 
 A `draft` naming a draft another client wrote (one without Missive's `X-Missive-Draft` header)
 does not replace it: the daemon makes a new draft from it, under a new `message_id`, and the

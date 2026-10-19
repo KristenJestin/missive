@@ -910,6 +910,56 @@ async fn a_message_marked_deleted_by_another_client_in_drafts_survives_a_draft_r
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_expunge_takes_back_only_the_deleted_flag_missive_set() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+    // Another client marked that version for removal, and has not expunged it yet.
+    server.set_flags("Drafts", 1, &["\\Draft", "\\Seen", "\\Deleted"]);
+    server.refuse("UID EXPUNGE");
+
+    env.save(&["--draft", &id, "--subject", "Second"]).await;
+
+    drafts_on_server(&server, &["First", "Second"]).await;
+    settled(&env).await;
+    assert!(
+        server
+            .flags("Drafts", 1)
+            .unwrap()
+            .contains(&"\\Deleted".to_owned()),
+        "{:?}",
+        server.flags("Drafts", 1)
+    );
+    // Ours is taken back from the new version's removal only if it had been set: it had not.
+    assert!(
+        !removals(&server).iter().any(|line| line.contains("-FLAGS")),
+        "{:?}",
+        removals(&server)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_expunge_takes_back_the_deleted_flag_it_set_itself() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+    server.refuse("UID EXPUNGE");
+
+    env.save(&["--draft", &id, "--subject", "Second"]).await;
+
+    drafts_on_server(&server, &["First", "Second"]).await;
+    settled(&env).await;
+    assert!(
+        !server
+            .flags("Drafts", 1)
+            .unwrap()
+            .contains(&"\\Deleted".to_owned())
+    );
+}
+
 /// A server whose IMAP side is reached through a relay, an account on it synced once, and the
 /// relay switched off: the daemon returned is offline.
 async fn imap_down() -> (FakeServer, Relay, Env, Daemon) {
@@ -1114,6 +1164,95 @@ async fn without_uidplus_the_old_version_is_left_in_place_and_the_user_is_told()
     assert!(removals(&server).is_empty());
     let logs = env.logs();
     assert!(logs.contains("UIDPLUS"), "{logs}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_uidplus_a_sent_draft_left_in_drafts_is_not_sent_a_second_time() {
+    let server = mailbox().without_uidplus().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    drafts_on_server(&server, &["First"]).await;
+    eventually(20, "the draft in the copy", || {
+        block(env.drafts()).first().is_some_and(|d| d["uid"] == 1)
+    })
+    .await;
+    succeeded(&env.run(&["compose", "--draft", &id, "--send"]).await);
+    took(&server, 1).await;
+    eventually(20, "the copy in Sent", || !server.uids("Sent").is_empty()).await;
+    settled(&env).await;
+    succeeded(&env.run(&["sync"]).await);
+    // Without UIDPLUS the draft's version cannot be removed: it is still there, and listed.
+    drafts_on_server(&server, &["First"]).await;
+    assert_eq!(env.drafts().await.len(), 1);
+
+    let output = env.run(&["compose", "--draft", &id, "--send"]).await;
+
+    failed(&output);
+    assert!(
+        stderr(&output).contains("already sent"),
+        "{}",
+        stderr(&output)
+    );
+    took(&server, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_ascii_message_id_is_not_put_in_a_quoted_search_and_the_draft_settles() {
+    // A server that answers BAD to a quoted string holding more than ASCII.
+    let server = with_drafts(
+        Folder::new("Drafts")
+            .special_use(SpecialUse::Drafts)
+            .message(
+                Message::new(
+                    "From: Alice Example <alice@example.org>\r\nTo: zoe.recipient@example.com\r\n\
+                     Subject: Elsewhere\r\nMessage-ID: <café-1@example.com>\r\n\
+                     X-Missive-Draft: 1\r\n\r\nA body.\r\n",
+                )
+                .flag("\\Draft"),
+            ),
+    )
+    .bad("UID SEARCH HEADER Message-ID \"<caf\u{e9}")
+    .start()
+    .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.drafts().await[0]["id"].as_str().unwrap().to_owned();
+
+    env.save(&["--draft", &id, "--subject", "Changed"]).await;
+
+    settled(&env).await;
+    drafts_on_server(&server, &["Changed"]).await;
+    let appends = server
+        .imap_log()
+        .iter()
+        .filter(|line| line.starts_with("APPEND"))
+        .count();
+    assert_eq!(appends, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_appended_to_a_folder_the_copy_numbers_otherwise_is_listed_after_a_resync() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    // The server renumbered Drafts; the copy has not heard of it: the UID the APPEND answers
+    // means nothing there.
+    let validity = server.bump_uidvalidity("Drafts");
+
+    env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+
+    drafts_on_server(&server, &["First"]).await;
+    eventually(
+        20,
+        "the draft in the copy, numbered as the server does",
+        || {
+            let listed = block(env.drafts());
+            listed.len() == 1
+                && listed[0]["uid"] == 1
+                && listed[0]["id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains(&validity.to_string()))
+        },
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

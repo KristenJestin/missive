@@ -1787,7 +1787,7 @@ async fn the_copy_is_in_wal_mode_with_a_schema_version() {
         .unwrap();
 
     assert_eq!(mode, "wal");
-    assert_eq!(version, 12);
+    assert_eq!(version, 14);
     // The search index is a virtual table with its shadow tables.
     assert_eq!(
         env.table_names(),

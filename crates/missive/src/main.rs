@@ -119,6 +119,9 @@ struct DaemonArgs {
     /// How long, in seconds, the server is given to answer each command of an action.
     #[arg(long, value_name = "SECONDS", default_value_t = missive_core::actions::COMMAND_TIMEOUT.as_secs(), value_parser = clap::value_parser!(u64).range(1..), hide = true)]
     action_timeout: u64,
+    /// The least time, in milliseconds, between two counted tries of a copy for Sent.
+    #[arg(long, value_name = "MILLISECONDS", default_value_t = missive_core::outbox::COPY_SPACING.as_millis() as u64, hide = true)]
+    copy_spacing: u64,
 }
 
 #[derive(Subcommand)]
@@ -226,6 +229,7 @@ async fn main() -> ExitCode {
             check_interval: Duration::from_secs(args.check_interval),
             batch_size: args.batch_size as usize,
             action_timeout: Duration::from_secs(args.action_timeout),
+            copy_spacing: Duration::from_millis(args.copy_spacing),
         })
         .await
         .map_err(Failure),

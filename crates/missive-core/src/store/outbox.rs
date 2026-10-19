@@ -1,4 +1,4 @@
-//! The outbox (schema versions 6, 8, 9 and 10): the messages to send, and where each one is between
+//! The outbox (schema versions 6, 8, 9, 10 and 13): the messages to send, and where each one is between
 //! its writing and its server's answer. See [`crate::outbox`].
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -6,6 +6,16 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use super::Store;
 use crate::actions::{Kind, Wanted};
 use crate::compose::Built;
+
+/// The message a message of the outbox follows up: once the server took it, that message is
+/// marked, through the queue of actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Followed<'a> {
+    /// A reply: the message (its identifier) gets `\Answered`.
+    Answered(&'a str),
+    /// A forward: the message gets `$Forwarded`.
+    Forwarded(&'a str),
+}
 
 /// A message of the outbox to send.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +38,8 @@ pub struct SentCopy {
     /// How many times appending it was started so far: a try a killed daemon left without its
     /// answer counts.
     pub attempts: u32,
+    /// The time, in milliseconds since the epoch, before which a counted try is not made again.
+    pub next_at: i64,
 }
 
 /// What became of a [`Store::resend`] or a [`Store::discard`].
@@ -66,33 +78,33 @@ impl Store {
         self.insert_outbox(account, built, sent_copy, draft, None, None)
     }
 
-    /// Puts a reply in the account's outbox, sent from a draft or not, as [`Store::enqueue`].
-    /// Once the server took it, the message it answers (`answers`, its identifier) is marked
-    /// `\Answered`, through the queue of actions.
-    pub fn enqueue_reply(
+    /// Puts a reply or a forward in the account's outbox, sent from a draft or not, as
+    /// [`Store::enqueue`]. Once the server took it, the message it follows up (`followed`, its
+    /// identifier) is marked `\Answered` or `$Forwarded`, through the queue of actions.
+    pub fn enqueue_followup(
         &self,
         account: i64,
         built: &Built,
         sent_copy: bool,
         draft: Option<&str>,
-        answers: &str,
+        followed: Followed,
     ) -> rusqlite::Result<i64> {
-        self.insert_outbox(account, built, sent_copy, draft, Some(answers), None)
+        self.insert_outbox(account, built, sent_copy, draft, Some(followed), None)
     }
 
     /// Puts in the outbox a message sent from the draft of another client, named `source`
-    /// ([`Store::source_sending`]), as [`Store::enqueue`] or, with `answers`,
-    /// [`Store::enqueue_reply`] does.
+    /// ([`Store::source_sending`]), as [`Store::enqueue`] or, with `followed`,
+    /// [`Store::enqueue_followup`] does.
     pub fn enqueue_kept(
         &self,
         account: i64,
         built: &Built,
         sent_copy: bool,
         draft: Option<&str>,
-        answers: Option<&str>,
+        followed: Option<Followed>,
         source: &str,
     ) -> rusqlite::Result<i64> {
-        self.insert_outbox(account, built, sent_copy, draft, answers, Some(source))
+        self.insert_outbox(account, built, sent_copy, draft, followed, Some(source))
     }
 
     fn insert_outbox(
@@ -101,13 +113,18 @@ impl Store {
         built: &Built,
         sent_copy: bool,
         draft: Option<&str>,
-        answers: Option<&str>,
+        followed: Option<Followed>,
         source: Option<&str>,
     ) -> rusqlite::Result<i64> {
+        let (answers, forwards) = match followed {
+            Some(Followed::Answered(id)) => (Some(id), None),
+            Some(Followed::Forwarded(id)) => (None, Some(id)),
+            None => (None, None),
+        };
         self.connection.query_row(
             "INSERT INTO outbox (account, sender, recipients, message_id, raw, bcc_header,
-                                 sent_copy, queued_at, draft, answers, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch(), ?8, ?9, ?10)
+                                 sent_copy, queued_at, draft, answers, forwards, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch(), ?8, ?9, ?10, ?11)
              RETURNING id",
             params![
                 account,
@@ -119,6 +136,7 @@ impl Store {
                 sent_copy,
                 draft,
                 answers,
+                forwards,
                 source
             ],
             |r| r.get(0),
@@ -287,35 +305,38 @@ impl Store {
     }
 
     /// The server took the message: it leaves the outbox, or waits for its copy in Sent when
-    /// `copy`. The draft it was sent from, if any, is to be removed, and the message it answers,
-    /// if any, is to be marked `\Answered`, in the same transaction. Whether an action was
-    /// recorded for the latter: the original may be gone, or being moved, by now, and then
-    /// there is nothing to mark.
-    pub fn sent(&mut self, id: i64, copy: bool) -> rusqlite::Result<bool> {
+    /// `copy`. The draft it was sent from, if any, is to be removed, and the message it answers
+    /// or forwards, if any, is to be marked `\Answered` or `$Forwarded`, in the same
+    /// transaction. The accounts that have an action to apply for it (the original's, which is
+    /// not always the sender's), none when it was not recorded: the original may be gone, or
+    /// being moved, by now, and then there is nothing to mark.
+    pub fn sent(&mut self, id: i64, copy: bool) -> rusqlite::Result<Vec<String>> {
         // Immediate, so that a busy copy is waited for: a deferred transaction that reads first
         // fails at once when it comes to write while another writer holds the copy.
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(i64, Option<String>, Option<String>)> = transaction
+        type Row = (i64, Option<String>, Option<String>, Option<String>);
+        let row: Option<Row> = transaction
             .query_row(
-                "SELECT account, draft, answers FROM outbox WHERE id = ?1",
+                "SELECT account, draft, answers, forwards FROM outbox WHERE id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let mut answered = false;
-        if let Some((account, draft, answers)) = row {
+        let mut marked = Vec::new();
+        if let Some((account, draft, answers, forwards)) = row {
             if let Some(draft) = draft {
                 super::drafts::remove_draft(&transaction, account, &draft)?;
             }
-            if let Some(answers) = answers {
-                answered = super::queue::queue_in(
-                    &transaction,
-                    &[answers],
-                    &Wanted::Mark(Kind::Answered),
-                )?
-                .is_ok();
+            let followed = answers
+                .map(|id| (id, Kind::Answered))
+                .or_else(|| forwards.map(|id| (id, Kind::Forwarded)));
+            if let Some((original, kind)) = followed
+                && let Ok(queued) =
+                    super::queue::queue_in(&transaction, &[original], &Wanted::Mark(kind))?
+            {
+                marked = queued.accounts;
             }
         }
         if copy {
@@ -324,7 +345,7 @@ impl Store {
             transaction.execute("DELETE FROM outbox WHERE id = ?1", [id])?;
         }
         transaction.commit()?;
-        Ok(answered)
+        Ok(marked)
     }
 
     fn set(&self, id: i64, state: &str, why: Option<&str>) -> rusqlite::Result<()> {
@@ -361,7 +382,7 @@ impl Store {
     pub fn sent_copies(&self, account: i64) -> rusqlite::Result<Vec<SentCopy>> {
         self.connection
             .prepare(
-                "SELECT id, message_id, bcc_header, raw, copy_attempts
+                "SELECT id, message_id, bcc_header, raw, copy_attempts, copy_next_at
                    FROM outbox WHERE account = ?1 AND state = 'sent' ORDER BY id",
             )?
             .query_map([account], |r| {
@@ -372,6 +393,7 @@ impl Store {
                     message_id: r.get(1)?,
                     raw,
                     attempts: r.get(4)?,
+                    next_at: r.get(5)?,
                 })
             })?
             .collect()
@@ -379,23 +401,23 @@ impl Store {
 
     /// A copy about to be appended; returns how many times appending it was started, this one
     /// included. Counted before the `APPEND`, so that a daemon killed during it leaves the next
-    /// one to look in Sent first.
-    pub fn copy_trying(&self, id: i64) -> rusqlite::Result<u32> {
+    /// one to look in Sent first. The next counted try is not before `next_at`.
+    pub fn copy_trying(&self, id: i64, next_at: i64) -> rusqlite::Result<u32> {
         self.connection.query_row(
-            "UPDATE outbox SET copy_attempts = copy_attempts + 1 WHERE id = ?1
-             RETURNING copy_attempts",
-            [id],
+            "UPDATE outbox SET copy_attempts = copy_attempts + 1, copy_next_at = ?2
+              WHERE id = ?1 RETURNING copy_attempts",
+            params![id, next_at],
             |r| r.get(0),
         )
     }
 
     /// Looking for a copy in Sent failed; returns how many times it did so far, this one
-    /// included.
-    pub fn copy_search_failed(&self, id: i64) -> rusqlite::Result<u32> {
+    /// included. The next counted try is not before `next_at`.
+    pub fn copy_search_failed(&self, id: i64, next_at: i64) -> rusqlite::Result<u32> {
         self.connection.query_row(
-            "UPDATE outbox SET copy_search_failures = copy_search_failures + 1 WHERE id = ?1
-             RETURNING copy_search_failures",
-            [id],
+            "UPDATE outbox SET copy_search_failures = copy_search_failures + 1, copy_next_at = ?2
+              WHERE id = ?1 RETURNING copy_search_failures",
+            params![id, next_at],
             |r| r.get(0),
         )
     }
@@ -628,7 +650,7 @@ mod tests {
             copies[0].raw,
             b"Bcc: <hidden@example.net>\r\nSubject: 1\r\n\r\nHello\r\n"
         );
-        assert_eq!(store.copy_trying(one).unwrap(), 1);
+        assert_eq!(store.copy_trying(one, 0).unwrap(), 1);
         assert_eq!(store.sent_copies(account).unwrap()[0].attempts, 1);
         store.copy_done(one).unwrap();
         assert!(states(&store).is_empty());
@@ -670,17 +692,45 @@ mod tests {
         let (_dir, mut store, account) = open();
         let (inbox, original) = with_a_message(&mut store, account);
         let reply = store
-            .enqueue_reply(account, &built(1), false, None, &original)
+            .enqueue_followup(
+                account,
+                &built(1),
+                false,
+                None,
+                Followed::Answered(&original),
+            )
             .unwrap();
 
         // Waiting to be sent, it marks nothing.
         assert!(actions(&store).is_empty());
         assert_eq!(store.flags(inbox).unwrap()[&1], "\\Seen");
 
-        assert!(store.sent(reply, false).unwrap());
+        assert_eq!(store.sent(reply, false).unwrap(), ["alice"]);
         assert_eq!(actions(&store), ["answered"]);
         assert_eq!(store.flags(inbox).unwrap()[&1], "\\Answered \\Seen");
         assert!(states(&store).is_empty());
+    }
+
+    #[test]
+    fn a_forward_marks_the_original_forwarded_only_once_it_is_sent() {
+        let (_dir, mut store, account) = open();
+        let (inbox, original) = with_a_message(&mut store, account);
+        let forward = store
+            .enqueue_followup(
+                account,
+                &built(1),
+                false,
+                None,
+                Followed::Forwarded(&original),
+            )
+            .unwrap();
+
+        assert!(actions(&store).is_empty());
+        assert_eq!(store.flags(inbox).unwrap()[&1], "\\Seen");
+
+        assert_eq!(store.sent(forward, false).unwrap(), ["alice"]);
+        assert_eq!(actions(&store), ["forwarded"]);
+        assert_eq!(store.flags(inbox).unwrap()[&1], "$Forwarded \\Seen");
     }
 
     #[test]
@@ -688,7 +738,7 @@ mod tests {
         let (_dir, mut store, account) = open();
         with_a_message(&mut store, account);
         let one = store.enqueue(account, &built(1), false, None).unwrap();
-        assert!(!store.sent(one, false).unwrap());
+        assert!(store.sent(one, false).unwrap().is_empty());
         assert!(actions(&store).is_empty());
     }
 
@@ -697,11 +747,17 @@ mod tests {
         let (_dir, mut store, account) = open();
         let (inbox, original) = with_a_message(&mut store, account);
         let reply = store
-            .enqueue_reply(account, &built(1), true, None, &original)
+            .enqueue_followup(
+                account,
+                &built(1),
+                true,
+                None,
+                Followed::Answered(&original),
+            )
             .unwrap();
         store.rebuild(inbox, 11).unwrap();
 
-        assert!(!store.sent(reply, true).unwrap());
+        assert!(store.sent(reply, true).unwrap().is_empty());
         assert!(actions(&store).is_empty());
         assert_eq!(states(&store), [(reply, "sent".to_owned())]);
     }

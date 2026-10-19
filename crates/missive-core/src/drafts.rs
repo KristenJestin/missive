@@ -18,13 +18,18 @@
 //!
 //! 1. `SELECT` the Drafts folder, and `UID SEARCH HEADER Message-ID "<id>" HEADER
 //!    X-Missive-Draft "1"`: the versions it already holds, one from an `APPEND` whose answer was
-//!    lost included.
-//! 2. `APPEND <drafts> (\Draft \Seen)` of the new version. Its UID comes from `APPENDUID`
-//!    (UIDPLUS), else from the same search, made again. A version tried before is first looked
-//!    for among those found (`UID FETCH <uids> (UID BODY.PEEK[])`): one identical byte for byte
-//!    landed from an `APPEND` whose answer was lost, and is taken as the new version instead of
-//!    a second copy. So cut answers, however many in a row, never add more than one copy of a
-//!    version, with or without UIDPLUS.
+//!    lost included. A Message-ID that is not ASCII cannot be written as a quoted string, and a
+//!    server answers `BAD` to it: it is not searched for, and only the versions the copy holds
+//!    are known.
+//! 2. `APPEND <drafts> (\Draft \Seen)` of the new version, given a timeout that grows with its
+//!    size (a large draft on a slow link would otherwise time out at every pass). Its UID comes
+//!    from `APPENDUID` (UIDPLUS), else from the same search, made again. A version tried before
+//!    is first looked for among those found (`UID FETCH <uids> (UID BODY.PEEK[])`): one
+//!    identical byte for byte landed from an `APPEND` whose answer was lost, and is taken as the
+//!    new version instead of a second copy. So cut answers, however many in a row, never add
+//!    more than one copy of a version, with or without UIDPLUS.
+//!    When the version cannot be written to the copy (its UID is unknown, or the copy numbers
+//!    the folder otherwise than the server), the folder is synced at once.
 //! 3. Only then, the older versions are removed: `UID STORE <uids> +FLAGS.SILENT (\Deleted)` and
 //!    `UID EXPUNGE <uids>`, which removes those UIDs and no other message marked deleted; an
 //!    expunge refused takes the flag back. Without UIDPLUS there is no `UID EXPUNGE`: the older
@@ -164,7 +169,9 @@ async fn each(
                 new,
                 left,
             }) => {
-                if draft.raw.is_some() && new.is_none() {
+                // The version is not in the copy when its UID is unknown, or when the copy
+                // numbers the folder otherwise than the server (`draft_written` writes nothing).
+                if draft.raw.is_some() && (new.is_none() || in_copy != Some(uidvalidity)) {
                     written.resync = Some(folder);
                 }
                 Outcome {
@@ -247,8 +254,12 @@ async fn one(
     let Some(uidvalidity) = server.select(name).await? else {
         return Ok(Step::No("select"));
     };
-    // With its angle brackets: `3@` does not match `13@`.
-    let search = sync::quote(&format!("<{}>", draft.message_id))
+    // With its angle brackets: `3@` does not match `13@`. A quoted string holds ASCII only, and a
+    // server answers `BAD` to more, at every pass: such a Message-ID (another client's) is not
+    // looked for, and the versions the copy holds stand for what the server holds.
+    let search = Some(&draft.message_id)
+        .filter(|id| id.is_ascii())
+        .and_then(|id| sync::quote(&format!("<{id}>")))
         .map(|id| format!("HEADER Message-ID {id} HEADER {OWN_DRAFT} \"1\""));
     let mut old = BTreeSet::new();
     if let Some(search) = &search {
@@ -256,9 +267,9 @@ async fn one(
             return Ok(Step::No("search"));
         };
         old.extend(found);
-        if in_copy == Some(uidvalidity) {
-            old.extend(store.draft_uids(folder, &draft.message_id)?);
-        }
+    }
+    if in_copy == Some(uidvalidity) {
+        old.extend(store.draft_uids(folder, &draft.message_id)?);
     }
 
     // A version tried before may be there already, from an `APPEND` whose answer was lost: it is
@@ -300,7 +311,7 @@ async fn one(
             },
         )
     } else {
-        match actions::remove(server, &sync::uid_set(&old)).await? {
+        match actions::remove(server, &old).await? {
             Done::Ok(_) => (old, Left::default()),
             // A removal only is tried again; a new version is in, and the older ones are found
             // again by the next save.

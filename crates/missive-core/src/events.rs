@@ -95,7 +95,8 @@ pub struct NewMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionEvent {
     pub account: String,
-    /// `read`, `unread`, `flagged`, `unflagged`, `move`, `delete` or `delete-permanently`.
+    /// `read`, `unread`, `flagged`, `unflagged`, `answered`, `forwarded`, `move`, `delete` or
+    /// `delete-permanently`.
     pub action: String,
     /// `applied`, `retried` or `refused`.
     pub outcome: String,
