@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use clap::{ArgGroup, Args};
 use missive_core::account::AccountStore;
+use missive_core::actions::ORIGINAL_GONE;
 use missive_core::compose::{Attachment, Draft, Mailbox};
 use missive_core::copy::MessageId;
 use missive_core::protocol::{Answer, Attached, Command, SaveDraft, Send};
@@ -189,6 +190,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         subject,
         body: text,
         html: None,
+        inline: Vec::new(),
         attachments,
         in_reply_to: a.in_reply_to,
         references: a.references,
@@ -267,10 +269,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         );
     }
     if answer.html_dropped {
-        eprintln!(
-            "The draft had an HTML part, which is dropped: the text you gave replaces it, or an \
-             attachment it draws from was taken off."
-        );
+        eprintln!("The draft had an HTML part, which is dropped: the text you gave replaces it.");
     }
     if args.send {
         let Some(outbox) = answer.outbox else {
@@ -339,7 +338,7 @@ pub(crate) fn answered(answer: Answer) -> Result<Answer, ActError> {
         )
     });
     Err(match answer.error.as_deref() {
-        Some("no-such-message") => ActError::NotFound(message),
+        Some("no-such-message" | ORIGINAL_GONE) => ActError::NotFound(message),
         _ => ActError::Failed(message),
     })
 }

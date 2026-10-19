@@ -10,6 +10,7 @@ or removed without a new protocol version.
 |---|---|
 | `$XDG_RUNTIME_DIR/missive/daemon.sock` | the socket |
 | `$XDG_RUNTIME_DIR/missive/daemon.pid` | the running daemon's pid; empty once it stopped cleanly |
+| `$XDG_RUNTIME_DIR/missive/compose-<hash>.lock` | one per draft opened in a compose window, named by a hash of the account and the draft's `Message-ID`: the window holds it locked (`flock`) while it is open, empty, left in place when it closes; a second window on the same draft finds it locked and is not opened. Only the windows and `missive compose` read it |
 
 There is one daemon per user. It holds `daemon.pid` locked for as long as it runs, so a second
 daemon refuses to start (`a daemon is already running (pid …)`), and a daemon that was killed
@@ -62,6 +63,7 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `unknown-request` | the daemon knows no such request |
 | `no-such-account` | the account named is not in the configuration |
 | `no-such-message` | an identifier names no message in the local copy (`message` says which, and why), or a `resend` or `discard` names no message of the outbox |
+| `original-gone` | a `send` or a `draft` whose `answers` or `forwards` is an identifier of a message the local copy no longer holds (moved, deleted, or its folder renumbered since the reply was started): nothing is saved or sent. A client can drop the link and ask again; `message` names the identifier. An `answers` or `forwards` that is no identifier at all stays `no-such-message` |
 | `no-such-folder` | the folder a `move` names is not one of the account's |
 | `no-trash` | a `delete` without `permanently`, in an account that has no trash |
 | `in-trash` | a `delete` without `permanently` of a message already in the trash |
@@ -150,7 +152,7 @@ reached:
 | `attachments` | array, empty when absent | each a file's `name` (no folder) and its content, `data`, in base64 |
 | `in_reply_to` | string, absent for none | the `Message-ID`, without angle brackets, of the message this one answers, written as its `In-Reply-To` header |
 | `references` | array of strings, empty when absent | the thread's `Message-ID`s without angle brackets, written as the `References` header |
-| `answers` | string, absent for none | the identifier of the message this one is a reply to: once the server took the reply (never before), that message is marked answered (`\Answered`), through the queue of actions, and the `action` event `answered` tells it. It must name a message of the local copy now (of any account: a reply may be written from another one), else the request is answered `no-such-message`; a message gone since is not an error |
+| `answers` | string, absent for none | the identifier of the message this one is a reply to: once the server took the reply (never before), that message is marked answered (`\Answered`), through the queue of actions, and the `action` event `answered` tells it. It must name a message of the local copy now (of any account: a reply may be written from another one), else the request is answered `original-gone` (`no-such-message` when it is no identifier); a message gone since the request was accepted is not an error |
 | `forwards` | string, absent for none | the identifier of the message this one forwards: once the server took the forward (never before), that message is marked forwarded (`$Forwarded`), through the queue of actions, and the `action` event `forwarded` tells it; a server whose folder keeps no keywords is not asked, and nothing is said. Checked as `answers` is; a message gone since is not an error |
 
 The daemon builds the message (see `missive compose` in `docs/cli.md`), writes it to the outbox
@@ -205,7 +207,7 @@ Saves a draft: a new one, or a new version of the draft `draft` names. With `sen
 | `in_reply_to` | string, absent to keep the draft's own | the `Message-ID`, without angle brackets, of the message the draft answers |
 | `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered unless `answers` names it, or the draft already holds that link |
 | `send` | boolean, `false` when absent | send the draft, as it is once changed (at least one recipient then); it is removed from the Drafts folder once the server took the message |
-| `answers` | string, optional | the identifier of the message the draft is a reply to, as for `send`, checked as there. The draft keeps it (an `X-Missive-Answers` header of the draft, which the message sent never carries), so that a draft picked up later and sent still marks the original: asked again without it, the draft's own is used. With `send`, marked answered once the server took the reply. A draft of another client has none |
+| `answers` | string, optional | the identifier of the message the draft is a reply to, as for `send`, checked as there. The draft keeps it (an `X-Missive-Answers` header of the draft, which the message sent never carries), so that a draft picked up later and sent still marks the original: asked again without it, the draft's own is used. With `send`, marked answered once the server took the reply. The header is believed only for a draft Missive wrote itself (the daemon records the `Message-ID` of every draft it saves, with the link): a draft of another client has none, whatever its headers say, and is still edited and sent, without marking any message |
 | `forwards` | string, optional | the same for the message the draft forwards (`X-Missive-Forwards`); marked forwarded once the server took the forward. A request names `answers` or `forwards`, not both (`bad-request`); naming one replaces what the draft kept |
 
 The daemon saves the draft in the local copy (and, with `send`, puts the message in the outbox),
@@ -224,11 +226,12 @@ message still waits in the outbox is answered `busy`: a client that lost the ans
 and asks again sends nothing twice. A `draft` with `send` naming a draft whose message was already
 sent is answered `already-sent`, once the changes that request gives are saved as a new draft, under
 a new `Message-ID`, never as a version of the sent one: the answer then also has `message_id`, the
-new draft's identifier (the `message` says so). Without changes, nothing is saved and there is no
+new draft's identifier (the `message` says so). That new draft keeps no link to the message the sent one answered or forwarded (no `answers` or `forwards`), which was marked with it. Without changes, nothing is saved and there is no
 `message_id`.
 
-When `body` replaced the text of a draft that had an HTML alternative, or `attachments` took one off that the HTML draws from, and the HTML is dropped with it, the
-answer also has `"html_dropped": true` (absent otherwise).
+When `body` replaced the text of a draft that had an HTML alternative, and the HTML is dropped
+with it, the answer also has `"html_dropped": true` (absent otherwise). `attachments` never drops
+it: the parts the HTML draws from (`cid:`) are not among the attachments, and stay with it.
 
 A `draft` naming a draft another client wrote (one without Missive's `X-Missive-Draft` header)
 does not replace it: the daemon makes a new draft from it, under a new `message_id`, and the

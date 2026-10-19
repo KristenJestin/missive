@@ -790,6 +790,13 @@ command returns at once). The output is the same; a window that cannot start is 
 error, and the draft stays saved. Without a display, nothing is opened; **`--no-window`** opens
 nothing even with one, for a script that only wants the draft saved.
 
+A draft has **one compose window**, whichever process opened it: a window holds a lock on the draft
+(see `docs/protocol.md`) for as long as it is open, and the lock goes with the process, so a window
+that crashed does not keep its draft shut. `compose --draft` on a draft that is open in a window
+does not open a second one: it saves the draft, and says on standard error that the draft is
+already open (it does not bring the first window forward). The reader's `E` says the same in its
+notice, and `missive-window compose --draft …` run by hand exits with status 1.
+
 #### Replying and forwarding
 
 `--reply`, `--reply-all` and `--forward` take a message's identifier (as `search` and `list`
@@ -825,8 +832,12 @@ the text above the quote.
   another account sends the reply. A reply or a forward saved as a draft keeps the link to its
   original (an `X-Missive-Answers` or `X-Missive-Forwards` header of the draft, which the message
   sent never carries): picked up later and sent, from the command line or the window, it marks the
-  original all the same. The message answered must be in the local copy when the reply is saved
-  or sent (a message identifier that names none is refused, `no-such-message`).
+  original all the same. Only the links of drafts Missive saved itself are believed (the copy records
+  them): a draft of another client that carries these headers is edited and sent as any other, and
+  marks nothing. The message answered must be in the local copy when the reply is saved
+  or sent: an identifier of a message that is gone is refused with the error `original-gone` (exit
+  status 3; the window drops the link and asks again), and one that is no identifier at all with
+  `no-such-message`.
 - A message that is odd is answered all the same, and one line on the error output says what was
   changed (counts and kinds, never what the message says): line breaks in its subject (an
   encoded subject can decode to some) become spaces, and the identifiers (`Message-ID`,
@@ -867,7 +878,8 @@ version in the Drafts folder, never makes the same message go twice. The changes
 request that `--send` refuses this way are saved first, as a **new draft** with a new identifier,
 never as a version of the sent one (a later resend of an `uncertain` message would remove it with
 the sent draft): the error says `already sent; your changes are saved as a new draft <id>`, and
-nothing typed is lost with the refusal. A request that changes nothing saves nothing.
+nothing typed is lost with the refusal. That new draft keeps no link to the message the sent one
+answered or forwarded (sending it marks no original again). A request that changes nothing saves nothing.
 
 Missive only ever replaces or removes a draft it wrote itself: its drafts carry an
 `X-Missive-Draft: 1` header (the message sent from one does not). A draft **another client
@@ -878,12 +890,12 @@ picked up of a draft is its recipients, subject, text, attachments and the threa
 (`In-Reply-To` and `References`), and its HTML alternative, kept as it was, byte for byte (a draft
 with only HTML gets its text made from it, beside the HTML; with several HTML parts, the first is
 kept): a draft picked up and written again, or sent, still carries its HTML. Its other headers
-(`Reply-To`…) are not kept, nor is an image the HTML draws from a part of the message (it stays an
-attachment). The HTML says what the text says: when `--body` or `--body-file` gives **another
-text**, the HTML part is dropped, so that the draft never says two things; it is dropped too when
-`--no-attach` or `--attach` takes an attachment off while the HTML draws an image from a part of
-the message (`cid:`), which would leave a broken image. One line on standard
-error says so; the same text (line ends aside) keeps it.
+(`Reply-To`…) are not kept. A part of the message that the HTML draws from (`cid:`: a logo, say) is
+not an attachment: it stays with the HTML, whatever is attached or taken off (`--no-attach`,
+`--attach`), and is written again as a `multipart/related` part. The HTML says what the text says:
+when `--body` or `--body-file` gives **another text**, the HTML part is dropped (and the parts it
+drew from with it), so that the draft never says two things. One line on standard error says so;
+the same text (line ends aside) keeps it.
 
 The draft is saved in the local copy first, and the command returns at once, whether the server
 can be reached or not: `list --folder drafts` shows it at once. The daemon then writes it to the

@@ -252,6 +252,10 @@ fn succeeded(output: &Output) {
 }
 
 /// Waits until `condition` holds, for at most `seconds`.
+fn block<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
+}
+
 async fn eventually(seconds: u64, what: &str, mut condition: impl FnMut() -> bool) {
     let started = Instant::now();
     while !condition() {
@@ -1119,9 +1123,12 @@ async fn an_identifier_that_names_no_message_is_refused_and_nothing_is_saved_or_
     let unknown = id.replace("/1", "/99");
     assert_ne!(unknown, id);
 
-    for (field, value) in [
-        ("answers", unknown.as_str()),
-        ("forwards", "not an identifier"),
+    // A well-formed identifier of a message that is gone has its own code; one that is no
+    // identifier at all stays `no-such-message`.
+    for (field, value, code) in [
+        ("answers", unknown.as_str(), "original-gone"),
+        ("forwards", unknown.as_str(), "original-gone"),
+        ("forwards", "not an identifier", "no-such-message"),
     ] {
         for send in [false, true] {
             let mut request = serde_json::json!({
@@ -1131,7 +1138,7 @@ async fn an_identifier_that_names_no_message_is_refused_and_nothing_is_saved_or_
             request[field] = value.into();
             let refused = ask(&env, request).await;
             assert_eq!(refused["ok"], false, "{field} {send}: {refused}");
-            assert_eq!(refused["error"], "no-such-message", "{refused}");
+            assert_eq!(refused["error"], code, "{refused}");
             assert!(
                 refused["message"].as_str().unwrap().contains(value),
                 "{refused}"
@@ -1145,7 +1152,7 @@ async fn an_identifier_that_names_no_message_is_refused_and_nothing_is_saved_or_
             }),
         )
         .await;
-        assert_eq!(refused["error"], "no-such-message", "{field}: {refused}");
+        assert_eq!(refused["error"], code, "{field}: {refused}");
     }
     // Both at once: a message answers or forwards another, not both.
     let both = ask(
@@ -1182,4 +1189,100 @@ async fn an_identifier_of_another_account_is_taken_as_it_is_a_cross_account_repl
         flags(&alice).contains(&"\\Answered".to_owned())
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_of_another_client_forging_the_follow_up_headers_marks_nothing_when_sent() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+
+    // Anyone who can write to the Drafts folder can add this header: it says it is Missive's own
+    // and names a message of the copy, but Missive never saved it.
+    for (name, field) in [
+        ("X-Missive-Answers", "answers"),
+        ("X-Missive-Forwards", "forwards"),
+    ] {
+        let message_id = format!("forged-{field}@example.net");
+        server.deliver(
+            "Drafts",
+            Message::new(format!(
+                "X-Missive-Draft: 1\r\n{name}: {id}\r\nFrom: {USER}\r\nTo: ina@example.net\r\n\
+                 Subject: Forged\r\nMessage-ID: <{message_id}>\r\n\r\nHello\r\n"
+            ))
+            .flag("\\Draft"),
+        );
+    }
+    succeeded(&env.run(&["sync"]).await);
+
+    for (count, field) in [(1, "forged-answers"), (2, "forged-forwards")] {
+        let sent = ask(
+            &env,
+            serde_json::json!({
+                "protocol": 1, "request": "draft", "account": "alice",
+                "draft": format!("{field}@example.net"), "send": true,
+            }),
+        )
+        .await;
+        assert_eq!(sent["ok"], true, "{sent}");
+        took(&server, count).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(flags(&server).is_empty(), "{:?}", flags(&server));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_new_draft_made_after_already_sent_keeps_no_link_to_the_original() {
+    let server = mailbox().start().await;
+    server.smtp_cut_after_data();
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    let draft = saved_draft(&env, &server, &["--reply", &id, "--body", "First"]).await;
+
+    // Sent, but the connection is cut after the end of data: the outbox cannot tell whether the
+    // server took it, so the draft is as good as sent.
+    let sent = ask(
+        &env,
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "alice", "draft": draft, "send": true,
+        }),
+    )
+    .await;
+    assert_eq!(sent["ok"], true, "{sent}");
+    eventually(30, "the message uncertain", || {
+        let output = block(env.run(&["status", "--json"]));
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        status["accounts"][0]["outbox"][0]["state"] == "uncertain"
+    })
+    .await;
+    server.heal();
+
+    // More text for a draft that is sent: it is kept as a new draft, not as one more version of
+    // the message that went, and it answers nothing: the original is marked once already.
+    let again = ask(
+        &env,
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "alice", "draft": draft,
+            "body": "Afterthought", "send": true,
+        }),
+    )
+    .await;
+    assert_eq!(again["error"], "already-sent", "{again}");
+    let new = again["message_id"].as_str().unwrap().to_owned();
+    eventually(30, "the new draft on the server", || {
+        server.uids("Drafts").iter().any(|uid| {
+            server
+                .raw("Drafts", *uid)
+                .and_then(|raw| header_of(&raw, "Message-ID"))
+                .is_some_and(|found| found.contains(&new))
+        })
+    })
+    .await;
+    for uid in server.uids("Drafts") {
+        let raw = server.raw("Drafts", uid).unwrap();
+        if header_of(&raw, "Message-ID").is_some_and(|found| found.contains(&new)) {
+            assert_eq!(header_of(&raw, "X-Missive-Answers"), None);
+            assert_eq!(header_of(&raw, "X-Missive-Forwards"), None);
+        }
+    }
 }

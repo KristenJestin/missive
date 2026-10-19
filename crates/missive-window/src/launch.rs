@@ -51,12 +51,27 @@ pub fn compose(sources: &Sources, account: String, draft: String) -> Compose {
         .map(|listing| listing.accounts.into_iter().map(|(id, _)| id).collect())
         .unwrap_or_else(|_| vec![account.clone()]);
     let raw = match Copy::open(&sources.copy) {
-        Ok(Some(copy)) => copy.draft(&account, &draft).map_err(|e| e.to_string()),
+        Ok(Some(copy)) => copy
+            .draft(&account, &draft)
+            .and_then(|raw| {
+                raw.map(|raw| {
+                    copy.followup(&account, &raw)
+                        .map(|followup| (raw, followup))
+                })
+                .transpose()
+            })
+            .map_err(|e| e.to_string()),
         Ok(None) => Ok(None),
         Err(e) => Err(e.to_string()),
     };
     let found = match raw {
-        Ok(Some(raw)) => Compose::draft(accounts.clone(), account.clone(), draft.clone(), &raw),
+        Ok(Some((raw, followup))) => Compose::draft(
+            accounts.clone(),
+            account.clone(),
+            draft.clone(),
+            &raw,
+            followup,
+        ),
         Ok(None) => Err("it is not in the local copy".to_owned()),
         Err(e) => Err(e),
     };

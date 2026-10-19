@@ -12,6 +12,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use missive_core::actions::ORIGINAL_GONE;
 use missive_core::compose::{self, Attachment, Draft, Followup, Mailbox};
 use missive_core::protocol::{Answer, Attached, Command, SaveDraft};
 use missive_core::reply::{self, Answering, Mode, Original};
@@ -197,12 +198,14 @@ impl Compose {
     }
 
     /// A draft picked up again: `id` names it as the daemon's `draft` request takes it, `raw` is
-    /// its latest version.
+    /// its latest version, and `followup` the message it answers or forwards, as the copy
+    /// believes it (`Copy::followup`: a draft of another client names none).
     pub fn draft(
         accounts: Vec<String>,
         account: String,
         id: String,
         raw: &[u8],
+        followup: Followup,
     ) -> Result<Compose, String> {
         let draft = Draft::read(raw)?;
         let mut compose = Compose::new(accounts, account);
@@ -215,7 +218,6 @@ impl Compose {
         compose.attachments = draft.attachments;
         compose.in_reply_to = draft.in_reply_to.into_iter().next();
         compose.references = draft.references;
-        let followup = Followup::read(raw);
         compose.answers = followup.answers;
         compose.forwards = followup.forwards;
         compose.message_id = compose::draft_message_id(raw);
@@ -273,6 +275,13 @@ impl Compose {
             return;
         };
         let Some((_, own)) = basis.addresses.iter().find(|(id, _)| *id == self.account) else {
+            // The account list could not be read, or leaves this account out: say so, since the
+            // recipients may now include the address the message is sent from.
+            self.notice = Some(format!(
+                "The recipients were not worked out again for {}: its address is not known \
+                 (the account list could not be read). Check that it is not among them.",
+                self.account
+            ));
             return;
         };
         if self.to != basis.to || self.cc != basis.cc {
@@ -462,8 +471,8 @@ impl Compose {
                 }
                 if answer.html_dropped {
                     self.notice = Some(
-                        "The draft's HTML version is dropped (the text changed, or an attachment \
-                         it draws from was taken off): the message goes as plain text."
+                        "The draft's HTML version is dropped (the text changed): the message goes \
+                         as plain text."
                             .to_owned(),
                     );
                 }
@@ -499,6 +508,10 @@ impl Compose {
             Ok(answer) if asked.send && answer.error.as_deref() == Some("already-sent") => {
                 if let Some(id) = answer.message_id {
                     self.message_id = Some(id.clone());
+                    // The new draft is a message of its own: the original is marked with the
+                    // one that went.
+                    self.answers = None;
+                    self.forwards = None;
                     self.notice = Some(format!(
                         "Already sent: your changes are saved as a new draft, {id}. Send again to \
                          send them as a new message."
@@ -558,15 +571,9 @@ impl Compose {
     }
 
     /// Whether the daemon refused the request because the message it answers or forwards is not
-    /// in the copy: the identifier is in what it says.
+    /// in the copy.
     fn link_lost(&self, answer: &Answer) -> bool {
-        answer.error.as_deref() == Some("no-such-message")
-            && answer.message.as_deref().is_some_and(|message| {
-                self.answers
-                    .iter()
-                    .chain(&self.forwards)
-                    .any(|id| message.contains(id.as_str()))
-            })
+        answer.error.as_deref() == Some(ORIGINAL_GONE)
     }
 
     /// Whether something changed since the last save, and is worth a draft: a new message left
