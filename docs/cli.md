@@ -865,7 +865,9 @@ with only HTML gets its text made from it, beside the HTML; with several HTML pa
 kept): a draft picked up and written again, or sent, still carries its HTML. Its other headers
 (`Reply-To`…) are not kept, nor is an image the HTML draws from a part of the message (it stays an
 attachment). The HTML says what the text says: when `--body` or `--body-file` gives **another
-text**, the HTML part is dropped, so that the draft never says two things, and one line on standard
+text**, the HTML part is dropped, so that the draft never says two things; it is dropped too when
+`--no-attach` or `--attach` takes an attachment off while the HTML draws an image from a part of
+the message (`cid:`), which would leave a broken image. One line on standard
 error says so; the same text (line ends aside) keeps it.
 
 The draft is saved in the local copy first, and the command returns at once, whether the server

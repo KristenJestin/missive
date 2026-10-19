@@ -462,8 +462,8 @@ impl Compose {
                 }
                 if answer.html_dropped {
                     self.notice = Some(
-                        "The text changed, so the draft's HTML version is dropped: the message \
-                         goes as plain text."
+                        "The draft's HTML version is dropped (the text changed, or an attachment \
+                         it draws from was taken off): the message goes as plain text."
                             .to_owned(),
                     );
                 }

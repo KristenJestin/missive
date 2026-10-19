@@ -1898,7 +1898,7 @@ async fn a_new_text_drops_the_html_part_and_says_so() {
 
     succeeded(&output);
     assert!(
-        stderr(&output).contains("HTML part is dropped"),
+        stderr(&output).contains("HTML part, which is dropped"),
         "{}",
         stderr(&output)
     );
@@ -2022,4 +2022,59 @@ async fn an_edit_to_a_draft_whose_send_is_uncertain_survives_its_resend_as_a_new
             .count(),
         1
     );
+}
+
+/// A draft of another client whose HTML draws its logo from a part of the message.
+fn foreign_html_with_a_logo() -> String {
+    format!(
+        "From: Alice Example <{USER}>\r\nTo: {NAME} <{RECIPIENT}>\r\n\
+         Subject: With a logo\r\nMessage-ID: <logo@example.com>\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/related; boundary=\"r1\"\r\n\r\n\
+         --r1\r\nContent-Type: multipart/alternative; boundary=\"a1\"\r\n\r\n\
+         --a1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{BODY}\r\n\
+         --a1\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+         <p>{BODY}</p><img src=\"cid:logo@example.org\">\r\n\
+         --a1--\r\n\
+         --r1\r\nContent-Type: image/png; name=\"logo.png\"\r\n\
+         Content-Disposition: inline; filename=\"logo.png\"\r\n\
+         Content-ID: <logo@example.org>\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+         iVBORw0KGgo=\r\n\
+         --r1--\r\n"
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn taking_the_attachments_off_a_draft_whose_html_draws_from_one_drops_the_html_too() {
+    let server = with_drafts(
+        Folder::new("Drafts")
+            .special_use(SpecialUse::Drafts)
+            .message(Message::new(foreign_html_with_a_logo()).flag("\\Draft")),
+    )
+    .start()
+    .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.drafts().await[0]["id"].as_str().unwrap().to_owned();
+    // Picked up as it is, the logo and the HTML that draws it stay together.
+    env.save(&["--draft", &id, "--subject", "Kept"]).await;
+    let kept = newest_draft(&server, 2).await;
+    assert!(html_of(&kept).unwrap().contains("cid:logo@example.org"));
+    assert_eq!(
+        MessageParser::default()
+            .parse(&kept)
+            .unwrap()
+            .attachment_count(),
+        1
+    );
+
+    let output = env.run(&["compose", "--draft", &id, "--no-attach"]).await;
+
+    succeeded(&output);
+    assert!(stderr(&output).contains("HTML part"), "{}", stderr(&output));
+    eventually(30, "the new version", || server_drafts(&server).len() == 3).await;
+    let raw = newest_draft(&server, 3).await;
+    let parsed = MessageParser::default().parse(&raw).unwrap();
+    assert_eq!(html_of(&raw), None, "no image left to draw");
+    assert_eq!(parsed.attachment_count(), 0);
+    assert!(!String::from_utf8_lossy(&raw).contains("cid:"));
+    assert!(parsed.body_text(0).unwrap().contains(BODY));
 }

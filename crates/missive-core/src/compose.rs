@@ -218,6 +218,19 @@ impl Draft {
 }
 
 impl Draft {
+    /// Gives the draft these attachments. Its HTML alternative may draw an image from one of
+    /// them (`cid:`): taking an attachment off would leave a broken image, so the HTML part is
+    /// dropped when one goes and the HTML refers to the message's own parts. Whether it was.
+    pub fn set_attachments(&mut self, attachments: Vec<Attachment>) -> bool {
+        let removed = self
+            .attachments
+            .iter()
+            .any(|old| !attachments.contains(old));
+        self.attachments = attachments;
+        let draws = |html: &str| html.to_ascii_lowercase().contains("cid:");
+        removed && self.html.as_deref().is_some_and(draws) && self.html.take().is_some()
+    }
+
     /// Gives the draft this text. Its HTML alternative stays when the text is the one it has
     /// (line ends aside: a window or a pipe does not write them as the message holds them), and
     /// is dropped when the text differs, since it would say something else than the text. Whether
@@ -815,6 +828,53 @@ mod tests {
         assert_eq!(draft.body, "Something else");
         // Nothing to drop: not said.
         assert!(!draft.set_body("Again something else".to_owned()));
+    }
+
+    #[test]
+    fn taking_off_an_attachment_the_html_may_draw_from_drops_the_html_part() {
+        let logo = Attachment {
+            name: "logo.png".to_owned(),
+            data: b"png".to_vec(),
+        };
+        let notes = Attachment {
+            name: "notes.txt".to_owned(),
+            data: b"notes".to_vec(),
+        };
+        let drawing = "<p>Hi <img src=\"cid:logo@example.org\"></p>";
+        let draft = |html: &str| Draft {
+            body: "Hi".to_owned(),
+            html: Some(html.to_owned()),
+            attachments: vec![logo.clone(), notes.clone()],
+            ..Draft::default()
+        };
+
+        // Everything off: the image the HTML draws is gone, and so is the HTML.
+        let mut all_off = draft(drawing);
+        assert!(all_off.set_attachments(Vec::new()));
+        assert_eq!((all_off.html, all_off.attachments), (None, Vec::new()));
+        // Any attachment off may be the one it draws from.
+        let mut one_off = draft(drawing);
+        assert!(one_off.set_attachments(vec![logo.clone()]));
+        assert_eq!(one_off.html, None);
+        // Nothing taken off (the same ones, one more, another order): the HTML stays.
+        let mut kept = draft(drawing);
+        assert!(!kept.set_attachments(vec![notes.clone(), logo.clone()]));
+        let extra = Attachment {
+            name: "more.txt".to_owned(),
+            data: Vec::new(),
+        };
+        assert!(!kept.set_attachments(vec![logo.clone(), notes.clone(), extra]));
+        assert!(kept.html.is_some());
+        // An HTML that draws from no part has nothing to lose.
+        let mut plain = draft("<p>Hi <img src=\"https://images.example.org/a.png\"></p>");
+        assert!(!plain.set_attachments(Vec::new()));
+        assert!(plain.html.is_some());
+        // A text draft has no HTML to drop.
+        let mut text = Draft {
+            attachments: vec![logo],
+            ..Draft::default()
+        };
+        assert!(!text.set_attachments(Vec::new()));
     }
 
     #[test]

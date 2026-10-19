@@ -848,13 +848,14 @@ impl Daemon {
                 html_dropped = draft.set_body(body);
             }
             if let Some(attachments) = request.attachments {
-                draft.attachments = attachments
+                let attachments = attachments
                     .into_iter()
                     .map(|a| Attachment {
                         name: a.name,
                         data: a.data,
                     })
                     .collect();
+                html_dropped |= draft.set_attachments(attachments);
             }
             if let Some(id) = request.in_reply_to {
                 draft.in_reply_to = vec![id];

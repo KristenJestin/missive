@@ -268,8 +268,8 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
     }
     if answer.html_dropped {
         eprintln!(
-            "The draft had an HTML part: the text you gave replaces it, so the HTML part is \
-             dropped."
+            "The draft had an HTML part, which is dropped: the text you gave replaces it, or an \
+             attachment it draws from was taken off."
         );
     }
     if args.send {
