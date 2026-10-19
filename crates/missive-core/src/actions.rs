@@ -450,7 +450,8 @@ fn refuse(
 fn refused(reason: &'static str, why: String, copied: bool) -> Result {
     let message = if copied {
         format!(
-            "{why}; the server had copied the messages to the target first, so they are in both              folders now: nothing was removed, delete or move one of the two"
+            "{why}; the server had copied the messages to the target first, so they are in both \
+             folders now: nothing was removed, delete or move one of the two"
         )
     } else {
         why
@@ -840,6 +841,20 @@ async fn uid_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_move_that_copied_says_the_messages_are_in_both_folders() {
+        let Result::Refused { message, .. } =
+            refused("refused", "the server said no".to_owned(), true)
+        else {
+            panic!("a refusal")
+        };
+        assert_eq!(
+            message,
+            "the server said no; the server had copied the messages to the target first, so \
+             they are in both folders now: nothing was removed, delete or move one of the two"
+        );
+    }
 
     #[test]
     fn a_flag_is_added_or_removed_and_the_flags_stay_sorted_once_each() {
