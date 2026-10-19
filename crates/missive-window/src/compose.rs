@@ -501,6 +501,10 @@ impl Compose {
             Ok(answer) if asked.send && answer.error.as_deref() == Some("already-sent") => {
                 if let Some(id) = answer.message_id {
                     self.message_id = Some(id.clone());
+                    // The new draft is a message of its own: the original is marked with the
+                    // one that went.
+                    self.answers = None;
+                    self.forwards = None;
                     self.notice = Some(format!(
                         "Already sent: your changes are saved as a new draft, {id}. Send again to \
                          send them as a new message."

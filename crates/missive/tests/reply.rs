@@ -252,6 +252,10 @@ fn succeeded(output: &Output) {
 }
 
 /// Waits until `condition` holds, for at most `seconds`.
+fn block<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
+}
+
 async fn eventually(seconds: u64, what: &str, mut condition: impl FnMut() -> bool) {
     let started = Instant::now();
     while !condition() {
@@ -1225,4 +1229,60 @@ async fn a_draft_of_another_client_forging_the_follow_up_headers_marks_nothing_w
     }
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(flags(&server).is_empty(), "{:?}", flags(&server));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_new_draft_made_after_already_sent_keeps_no_link_to_the_original() {
+    let server = mailbox().start().await;
+    server.smtp_cut_after_data();
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    let draft = saved_draft(&env, &server, &["--reply", &id, "--body", "First"]).await;
+
+    // Sent, but the connection is cut after the end of data: the outbox cannot tell whether the
+    // server took it, so the draft is as good as sent.
+    let sent = ask(
+        &env,
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "alice", "draft": draft, "send": true,
+        }),
+    )
+    .await;
+    assert_eq!(sent["ok"], true, "{sent}");
+    eventually(30, "the message uncertain", || {
+        let output = block(env.run(&["status", "--json"]));
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        status["accounts"][0]["outbox"][0]["state"] == "uncertain"
+    })
+    .await;
+    server.heal();
+
+    // More text for a draft that is sent: it is kept as a new draft, not as one more version of
+    // the message that went, and it answers nothing: the original is marked once already.
+    let again = ask(
+        &env,
+        serde_json::json!({
+            "protocol": 1, "request": "draft", "account": "alice", "draft": draft,
+            "body": "Afterthought", "send": true,
+        }),
+    )
+    .await;
+    assert_eq!(again["error"], "already-sent", "{again}");
+    let new = again["message_id"].as_str().unwrap().to_owned();
+    eventually(30, "the new draft on the server", || {
+        server.uids("Drafts").iter().any(|uid| {
+            server
+                .raw("Drafts", *uid)
+                .and_then(|raw| header_of(&raw, "Message-ID"))
+                .is_some_and(|found| found.contains(&new))
+        })
+    })
+    .await;
+    for uid in server.uids("Drafts") {
+        let raw = server.raw("Drafts", uid).unwrap();
+        if header_of(&raw, "Message-ID").is_some_and(|found| found.contains(&new)) {
+            assert_eq!(header_of(&raw, "X-Missive-Answers"), None);
+            assert_eq!(header_of(&raw, "X-Missive-Forwards"), None);
+        }
+    }
 }

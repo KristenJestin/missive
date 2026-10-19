@@ -871,7 +871,8 @@ version in the Drafts folder, never makes the same message go twice. The changes
 request that `--send` refuses this way are saved first, as a **new draft** with a new identifier,
 never as a version of the sent one (a later resend of an `uncertain` message would remove it with
 the sent draft): the error says `already sent; your changes are saved as a new draft <id>`, and
-nothing typed is lost with the refusal. A request that changes nothing saves nothing.
+nothing typed is lost with the refusal. That new draft keeps no link to the message the sent one
+answered or forwarded (sending it marks no original again). A request that changes nothing saves nothing.
 
 Missive only ever replaces or removes a draft it wrote itself: its drafts carry an
 `X-Missive-Draft: 1` header (the message sent from one does not). A draft **another client

@@ -225,7 +225,7 @@ message still waits in the outbox is answered `busy`: a client that lost the ans
 and asks again sends nothing twice. A `draft` with `send` naming a draft whose message was already
 sent is answered `already-sent`, once the changes that request gives are saved as a new draft, under
 a new `Message-ID`, never as a version of the sent one: the answer then also has `message_id`, the
-new draft's identifier (the `message` says so). Without changes, nothing is saved and there is no
+new draft's identifier (the `message` says so). That new draft keeps no link to the message the sent one answered or forwarded (no `answers` or `forwards`), which was marked with it. Without changes, nothing is saved and there is no
 `message_id`.
 
 When `body` replaced the text of a draft that had an HTML alternative, or `attachments` took one off that the HTML draws from, and the HTML is dropped with it, the

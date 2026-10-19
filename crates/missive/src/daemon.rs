@@ -826,12 +826,12 @@ impl Daemon {
         // What the request names replaces what the draft kept; a request that names nothing
         // leaves the draft's link as it is, so that a draft picked up later still marks the
         // message it answers.
-        let followup = if asked == Followup::default() {
+        let asked = if asked == Followup::default() {
             stored_followup.clone()
         } else {
             asked
         };
-        let changed = followup != stored_followup
+        let changed = asked != stored_followup
             || request.to.is_some()
             || request.cc.is_some()
             || request.bcc.is_some()
@@ -841,6 +841,13 @@ impl Daemon {
             || request.in_reply_to.is_some();
         let mailboxes = |list: &[String]| -> Result<Vec<Mailbox>, String> {
             list.iter().map(|text| Mailbox::parse(text)).collect()
+        };
+        // The changes of a draft already sent are kept as a new draft: a message of its own,
+        // which answers nothing (the original was marked, or will be, with the one that went).
+        let followup = if sent_already {
+            Followup::default()
+        } else {
+            asked
         };
         let mut html_dropped = false;
         let fields = (|| {

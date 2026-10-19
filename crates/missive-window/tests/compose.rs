@@ -753,6 +753,8 @@ fn a_draft_already_sent_says_where_its_changes_were_saved() {
     compose.send();
     let send = draft(compose.take_request().unwrap());
     assert_eq!(send.draft.as_deref(), Some("n@example.org"));
+    // A message of its own: it answers nothing, so sending it marks the original no more.
+    assert_eq!((send.answers, send.forwards), (None, None));
 }
 
 #[test]
