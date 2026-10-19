@@ -66,16 +66,18 @@ impl Store {
         self.insert_outbox(account, built, sent_copy, draft, None)
     }
 
-    /// Puts a reply in the account's outbox. Once the server took it, the message it answers
-    /// (`answers`, its identifier) is marked `\Answered`, through the queue of actions.
+    /// Puts a reply in the account's outbox, sent from a draft or not, as [`Store::enqueue`].
+    /// Once the server took it, the message it answers (`answers`, its identifier) is marked
+    /// `\Answered`, through the queue of actions.
     pub fn enqueue_reply(
         &self,
         account: i64,
         built: &Built,
         sent_copy: bool,
+        draft: Option<&str>,
         answers: &str,
     ) -> rusqlite::Result<i64> {
-        self.insert_outbox(account, built, sent_copy, None, Some(answers))
+        self.insert_outbox(account, built, sent_copy, draft, Some(answers))
     }
 
     fn insert_outbox(
@@ -630,7 +632,7 @@ mod tests {
         let (_dir, mut store, account) = open();
         let (inbox, original) = with_a_message(&mut store, account);
         let reply = store
-            .enqueue_reply(account, &built(1), false, &original)
+            .enqueue_reply(account, &built(1), false, None, &original)
             .unwrap();
 
         // Waiting to be sent, it marks nothing.
@@ -657,7 +659,7 @@ mod tests {
         let (_dir, mut store, account) = open();
         let (inbox, original) = with_a_message(&mut store, account);
         let reply = store
-            .enqueue_reply(account, &built(1), true, &original)
+            .enqueue_reply(account, &built(1), true, None, &original)
             .unwrap();
         store.rebuild(inbox, 11).unwrap();
 

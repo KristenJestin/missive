@@ -831,7 +831,12 @@ impl Daemon {
         // The draft removed once the message is sent: Missive's own only.
         let draft = (save || (request.draft.is_some() && kept.is_none()))
             .then_some(built.message_id.as_str());
-        let outbox = match store.enqueue(key, &built, !account.server_saves_sent, draft) {
+        let sent_copy = !account.server_saves_sent;
+        let queued = match &request.answers {
+            Some(answers) => store.enqueue_reply(key, &built, sent_copy, draft, answers),
+            None => store.enqueue(key, &built, sent_copy, draft),
+        };
+        let outbox = match queued {
             Ok(outbox) => outbox,
             Err(e) => return failed(e.to_string()),
         };
@@ -920,7 +925,7 @@ impl Daemon {
             Ok((
                 key,
                 match &send.answers {
-                    Some(answers) => store.enqueue_reply(key, &built, sent_copy, answers)?,
+                    Some(answers) => store.enqueue_reply(key, &built, sent_copy, None, answers)?,
                     None => store.enqueue(key, &built, sent_copy, None)?,
                 },
             ))

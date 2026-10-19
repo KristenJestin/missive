@@ -576,3 +576,51 @@ async fn one_way_of_answering_at_a_time_and_none_with_a_draft() {
         );
     }
 }
+
+/// Asks the daemon on its socket, as the window does, and reads its answer.
+async fn ask(env: &Env, request: serde_json::Value) -> serde_json::Value {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let stream = UnixStream::connect(env.socket()).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut line = request.to_string();
+    line.push('\n');
+    write.write_all(line.as_bytes()).await.unwrap();
+    let mut answer = String::new();
+    BufReader::new(read).read_line(&mut answer).await.unwrap();
+    serde_json::from_str(&answer).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_draft_sent_twice_is_sent_once_marks_the_original_and_leaves_drafts() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    let output = env
+        .run(&["compose", "--reply", &id, "--body", "Noon.", "--json"])
+        .await;
+    succeeded(&output);
+    let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let draft = saved["id"].as_str().unwrap();
+
+    let send = serde_json::json!({
+        "protocol": 1, "request": "draft", "account": "alice", "draft": draft,
+        "body": "Noon works.", "send": true, "answers": id,
+    });
+    let first = ask(&env, send.clone()).await;
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["message_id"], draft);
+    // The window's answer lost, and Send pressed again: the message is already on its way.
+    let second = ask(&env, send).await;
+    assert_eq!(second["ok"], false, "{second}");
+
+    took(&server, 1).await;
+    let sent = server.smtp_messages();
+    let parsed = MessageParser::default().parse(&sent[0].data).unwrap();
+    assert_eq!(parsed.subject(), Some("Re: Lunch?"));
+    assert!(parsed.body_text(0).unwrap().starts_with("Noon works."));
+    eventually(30, "the original marked answered", || {
+        flags(&server).contains(&"\\Answered".to_owned())
+    })
+    .await;
+    eventually(30, "the draft removed", || server.uids("Drafts").is_empty()).await;
+}
