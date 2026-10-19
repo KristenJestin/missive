@@ -689,6 +689,9 @@ async fn a_move_on_a_server_with_only_uidplus_copies_then_expunges_only_that_uid
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_without_move_or_uidplus_refuses_the_move_and_nothing_changes() {
     let (server, env, _daemon) = started(mailbox().without_move().without_uidplus()).await;
+    // As a copy that does not know the server's capabilities yet: the action is queued, and the
+    // worker refuses it.
+    env.forget_capabilities();
     let before = env.messages();
     let from = server.imap_log().len();
 
@@ -1763,7 +1766,7 @@ const QUEUED: i32 = 4;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_tells_an_action_the_server_refused_apart() {
-    let (_server, env, _daemon) = started(mailbox().without_move().without_uidplus()).await;
+    let (_server, env, _daemon) = started(mailbox().bad("UID MOVE")).await;
     let three = env.id("INBOX", 3);
 
     let output = env
@@ -1773,7 +1776,7 @@ async fn wait_tells_an_action_the_server_refused_apart() {
     let answer = json(&output);
     assert_eq!(answer["outcome"], "refused");
     assert_eq!(answer["actions"][0]["outcome"], "refused");
-    assert_eq!(answer["actions"][0]["reason"], "unsupported");
+    assert_eq!(answer["actions"][0]["reason"], "refused");
     assert!(answer["actions"][0]["message"].is_string(), "{answer}");
 
     let output = env
@@ -1855,4 +1858,62 @@ async fn wait_with_no_daemon_running_does_not_believe_the_state_the_last_one_lef
     succeeded(&output);
     assert_eq!(json(&output)["outcome"], "applied");
     assert_eq!(server.flags("INBOX", 3), flags(&["\\Seen"]));
+}
+
+impl Env {
+    /// Makes the copy forget the server's capabilities, as a copy written before it recorded them.
+    fn forget_capabilities(&self) {
+        Connection::open(self.copy_path())
+            .unwrap()
+            .execute("UPDATE account SET can_move = NULL, can_uidplus = NULL", [])
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_the_server_cannot_do_is_refused_when_asked_once_its_capabilities_are_known() {
+    let (server, env, _daemon) = started(mailbox().without_move().without_uidplus()).await;
+    let before = env.messages();
+    let from = server.imap_log().len();
+
+    for args in [
+        vec!["move", "--to", "archive"],
+        vec!["delete"],
+        vec!["delete", "--permanently"],
+    ] {
+        let folder = if args.contains(&"--permanently") {
+            "Trash"
+        } else {
+            "INBOX"
+        };
+        let id = env.id(folder, 1);
+        let mut args = args.clone();
+        args.push(&id);
+        let output = env.act(&args).await;
+        failed(&output);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(stderr(&output).contains("UIDPLUS"), "{}", stderr(&output));
+        assert_eq!(env.queue(), 0, "{args:?}");
+    }
+    assert_eq!(env.messages(), before);
+    assert!(
+        writes(&server, from).is_empty(),
+        "{:?}",
+        writes(&server, from)
+    );
+    // A mark needs neither.
+    succeeded(&env.act(&["mark", &env.id("INBOX", 3), "--read"]).await);
+
+    // With MOVE but without UIDPLUS, a move is accepted and a permanent delete refused.
+    let (_server, env, _daemon) = started(mailbox().without_uidplus()).await;
+    let output = env
+        .act(&["delete", "--permanently", "--json", &env.id("Trash", 1)])
+        .await;
+    failed(&output);
+    assert!(stderr(&output).contains("UIDPLUS"), "{}", stderr(&output));
+    succeeded(
+        &env.act(&["move", &env.id("INBOX", 3), "--to", "archive"])
+            .await,
+    );
+    eventually(10, "the queue empty", || env.queue() == 0).await;
 }

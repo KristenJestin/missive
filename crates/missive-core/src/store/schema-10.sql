@@ -20,3 +20,9 @@ CREATE INDEX half_move_account ON half_move (account);
 -- any client) can match the `action` event to the request that recorded it.
 CREATE TABLE action_sequence (last INTEGER NOT NULL) STRICT;
 INSERT INTO action_sequence (last) SELECT coalesce(max(id), 0) FROM action;
+
+-- What the account's IMAP server can do, recorded at each connection, so that an action it cannot
+-- apply is refused when it is asked: whether it has MOVE (RFC 6851) and UIDPLUS (RFC 4315).
+-- NULL until the first connection.
+ALTER TABLE account ADD COLUMN can_move INTEGER;
+ALTER TABLE account ADD COLUMN can_uidplus INTEGER;

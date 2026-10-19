@@ -657,7 +657,10 @@ role is looked for first, then a name. A message already in that folder is left 
 
 The server must have `MOVE`, or else `UIDPLUS` (the move is then a copy, followed by the removal
 of exactly those messages). A server with neither refuses the move: removing a message there
-would also remove every message another client marked deleted in the same folder.
+would also remove every message another client marked deleted in the same folder. The daemon
+records what the server can do at each connection: once it knows, such a move is refused when it
+is asked, and nothing is recorded; before the account's first connection, it is recorded and
+refused when it is tried.
 
 ### `missive delete <message id>… [--permanently] [--wait [--timeout <seconds>]] [--json]`
 
@@ -715,7 +718,7 @@ A request is checked whole before anything is recorded: when one identifier name
 the action cannot apply to one of them, nothing is recorded and the command fails, saying why on
 standard error. The exit status is 3 when an identifier names no message (as for `show`), 1 for
 every other refusal: a folder that does not exist, `--permanently` outside the trash, a message
-whose move waits, an account that is not configured.
+whose move waits, an account that is not configured, an action the server cannot apply.
 
 ## Sending
 

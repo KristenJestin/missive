@@ -5,7 +5,7 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{NewMessage, Store};
-use crate::actions::{Kind, Queued, Refused, Wanted, with_flag};
+use crate::actions::{Kind, Queued, Refused, Wanted, unsupported, with_flag};
 use crate::copy::{MessageId, NotFound};
 use crate::sync::CopyUid;
 
@@ -211,6 +211,19 @@ pub(super) fn queue_in(
                 (Kind::DeletePermanently, None)
             }
         };
+        let capabilities: (Option<bool>, Option<bool>) = transaction.query_row(
+            "SELECT can_move, can_uidplus FROM account WHERE key = ?1",
+            [group.account],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if let (Some(moves), Some(uidplus)) = capabilities
+            && let Some(why) = unsupported(kind, moves, uidplus)
+        {
+            return Ok(Err(Refused::new(
+                "unsupported",
+                format!("{}: {why}", group.first),
+            )));
+        }
         actions.push((&*group, kind, target));
     }
 

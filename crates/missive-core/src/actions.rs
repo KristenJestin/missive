@@ -140,7 +140,8 @@ pub enum Wanted {
 /// Why a request was refused before anything was recorded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused {
-    /// `no-such-message`, `no-such-folder`, `no-trash`, `in-trash`, `not-in-trash` or `busy`.
+    /// `no-such-message`, `no-such-folder`, `no-trash`, `in-trash`, `not-in-trash`, `busy` or
+    /// `unsupported`.
     pub error: &'static str,
     /// For people.
     pub message: String,
@@ -164,6 +165,25 @@ pub struct Queued {
     pub accounts: Vec<String>,
     /// The numbers of the actions recorded, one per folder, as their `action` events give them.
     pub actions: Vec<i64>,
+}
+
+/// Why a server with or without MOVE and UIDPLUS cannot apply an action of this kind safely, if
+/// it cannot: when the copy knows the server's capabilities, the request is refused at once
+/// (`unsupported`), else the action is refused when it is tried.
+pub fn unsupported(kind: Kind, moves: bool, uidplus: bool) -> Option<&'static str> {
+    if kind == Kind::DeletePermanently && !uidplus {
+        return Some(
+            "the server has no UID EXPUNGE (UIDPLUS): deleting for good would also remove the \
+             messages other clients marked deleted",
+        );
+    }
+    if kind.moves() && !moves && !uidplus {
+        return Some(
+            "the server has neither MOVE nor UIDPLUS: moving would also remove the messages \
+             other clients marked deleted",
+        );
+    }
+    None
 }
 
 /// A message's flags, as the copy keeps them, with `flag` added or removed.
@@ -470,19 +490,8 @@ async fn one(
         return Ok(RENUMBERED);
     }
     // Refused before anything is sent.
-    if action.kind == Kind::DeletePermanently && !capabilities.uidplus {
-        return Ok(Step::Refused(
-            "unsupported",
-            "the server has no UID EXPUNGE (UIDPLUS): deleting for good would also remove the \
-             messages other clients marked deleted",
-        ));
-    }
-    if action.kind.moves() && !capabilities.moves && !capabilities.uidplus {
-        return Ok(Step::Refused(
-            "unsupported",
-            "the server has neither MOVE nor UIDPLUS: moving would also remove the messages \
-             other clients marked deleted",
-        ));
+    if let Some(why) = unsupported(action.kind, capabilities.moves, capabilities.uidplus) {
+        return Ok(Step::Refused("unsupported", why));
     }
     match server.select(&action.folder.name).await? {
         None => return Ok(Step::No("select")),

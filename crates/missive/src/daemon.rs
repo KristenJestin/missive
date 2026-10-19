@@ -1368,6 +1368,9 @@ impl Worker {
             };
         }
         let capabilities = check!(sync::prepare(&mut session).await);
+        if let Err(e) = self.store.set_capabilities(self.key, capabilities) {
+            log!("account {}: cannot record its capabilities ({e})", self.key);
+        }
         self.idle_refused = false;
         log!(
             "account {}: connected ({}, {})",
