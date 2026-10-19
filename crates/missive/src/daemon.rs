@@ -1255,7 +1255,14 @@ impl Worker {
         loop {
             self.take_requests();
             if password.is_none() {
-                match self.password().await {
+                // A keyring that asks for a passphrase holds the read until someone types it:
+                // a stop does not wait for it.
+                let mut stop = self.stop.clone();
+                let read = tokio::select! {
+                    read = self.password() => read,
+                    _ = stopped(&mut stop) => return,
+                };
+                match read {
                     Some(found) => password = Some(found),
                     None => {
                         self.settle("no-login");

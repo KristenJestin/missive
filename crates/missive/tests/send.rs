@@ -1801,3 +1801,29 @@ async fn a_stop_does_not_wait_for_a_keyring_read_during_the_wait_after_a_refused
         "a worker was cut off"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_does_not_wait_for_the_keyring_read_at_the_top_of_the_imap_worker() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    // The keyring waits for a passphrase nobody types from the start: the IMAP worker's first
+    // read never ends.
+    env.keyring.stall_secret_reads();
+    let mut daemon = env.daemon().await;
+    // Time for the worker to be in the read (the stalled keyring counts none).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let stopping = Instant::now();
+    daemon.stop(15).await;
+
+    assert!(
+        stopping.elapsed() < Duration::from_secs(3),
+        "the stop waited {:?}",
+        stopping.elapsed()
+    );
+    assert!(
+        !env.logs().contains("did not stop in time"),
+        "a worker was cut off"
+    );
+}
