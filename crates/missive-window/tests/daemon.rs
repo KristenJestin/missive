@@ -12,13 +12,14 @@ use std::process::{Child, Command as Process, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use common::{ID, Mail, PASSWORD, sorted_mailbox};
+use common::{ID, Mail, PASSWORD, plan, sorted_mailbox};
 use missive_core::account::Password;
 use missive_core::events::Event;
-use missive_core::fake::FakeKeyring;
+use missive_core::fake::{FakeKeyring, FakeServer, Folder, SpecialUse};
 use missive_core::keyring::Keyring;
 use missive_window::ask;
-use missive_window::model::{Model, Reader};
+use missive_window::compose::{Compose, Field};
+use missive_window::model::{Model, Reader, Start};
 use missive_window::view::Asker;
 
 /// The `missive` binary beside this test's folder of the build.
@@ -249,4 +250,95 @@ async fn offline_an_action_from_the_window_is_queued_and_shown_at_once() {
         3,
         "the server has not moved"
     );
+}
+
+/// Hands every request the compose window has to the asker, and the answers back.
+fn ask_compose(compose: &mut Compose, asker: &Asker) {
+    tokio::task::block_in_place(|| {
+        while let Some(command) = compose.take_request() {
+            let answer = asker(command);
+            compose.answered(answer);
+        }
+    })
+}
+
+async fn eventually(what: &str, daemon: &Daemon, mut condition: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !condition() {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{what} did not happen; the log:\n{}",
+            daemon.log()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_written_in_the_window_arrives_with_its_attachment_and_its_draft_is_gone() {
+    let mail = Mail::new(
+        FakeServer::builder()
+            .user(common::USER, PASSWORD)
+            .folder(Folder::new("INBOX").message(plan(3, "", "The Zanzibar archive.")))
+            .folder(Folder::new("Sent").special_use(SpecialUse::Sent))
+            .folder(Folder::new("Drafts").special_use(SpecialUse::Drafts)),
+    )
+    .await;
+    let keyring = keyring().await;
+    let daemon = Daemon::start(&mail, &keyring).await;
+    let asker = daemon.asker();
+    let mut model = mail.model();
+    open(&mut model, "Plan 3");
+    let mut compose = model.compose(Start::Reply).unwrap();
+    let file = mail.home.path().join("minutes.txt");
+    std::fs::write(&file, "Minutes of the meeting").unwrap();
+
+    // Typed, attached, and saved once the typing stopped.
+    compose.attach(vec![file]);
+    let body = format!("Noon works.{}", compose.body);
+    compose.edit(Field::Body, body);
+    let timer = compose.take_save_timer().unwrap();
+    compose.save_timer_elapsed(timer);
+    ask_compose(&mut compose, &asker);
+    assert!(compose.notice.is_none(), "{:?}", compose.notice);
+    eventually("the draft on the server", &daemon, || {
+        mail.server.uids("Drafts").len() == 1
+    })
+    .await;
+
+    // Sent, Send pressed twice.
+    compose.send();
+    compose.send();
+    ask_compose(&mut compose, &asker);
+    assert!(compose.done(), "{:?}", compose.notice);
+    eventually("the message sent", &daemon, || {
+        !mail.server.smtp_messages().is_empty()
+    })
+    .await;
+    eventually("the draft gone", &daemon, || {
+        mail.server.uids("Drafts").is_empty()
+    })
+    .await;
+    eventually("the original answered", &daemon, || {
+        mail.server_flags(1).iter().any(|f| f == "\\Answered")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let sent = mail.server.smtp_messages();
+    assert_eq!(sent.len(), 1, "sent once");
+    assert_eq!(sent[0].to, ["carol.sender@example.com"]);
+    let parsed = mail_parser::MessageParser::default()
+        .parse(&sent[0].data)
+        .unwrap();
+    assert_eq!(parsed.subject(), Some("Re: Plan 3"));
+    assert!(
+        parsed
+            .body_text(0)
+            .unwrap()
+            .starts_with("Noon works.\r\n\r\nOn 2026-10-17 09:03 +0200, Carol Sender wrote:")
+    );
+    let attachment = parsed.attachment(0).expect("the attachment");
+    assert_eq!(attachment.contents(), b"Minutes of the meeting");
+    use mail_parser::MimeHeaders;
+    assert_eq!(attachment.attachment_name(), Some("minutes.txt"));
 }
