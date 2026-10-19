@@ -399,6 +399,16 @@ impl Store {
             .collect()
     }
 
+    /// The earliest time a copy of the account waiting for Sent may be tried again, in
+    /// milliseconds since the epoch; `None` when no copy waits.
+    pub fn next_copy_at(&self, account: i64) -> rusqlite::Result<Option<i64>> {
+        self.connection.query_row(
+            "SELECT min(copy_next_at) FROM outbox WHERE account = ?1 AND state = 'sent'",
+            [account],
+            |r| r.get(0),
+        )
+    }
+
     /// A copy about to be appended; returns how many times appending it was started, this one
     /// included. Counted before the `APPEND`, so that a daemon killed during it leaves the next
     /// one to look in Sent first. The next counted try is not before `next_at`.
