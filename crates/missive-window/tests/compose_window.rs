@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{ID, Mail, mailbox};
-use gpui_kit::{AnyWindowHandle, Modifiers, TestAppContext, VisualContext, VisualTestContext};
+use gpui_kit::{
+    AnyWindowHandle, ExternalPaths, FileDropEvent, Modifiers, TestAppContext, VisualContext,
+    VisualTestContext,
+};
 use missive_core::protocol::{Answer, Command, PROTOCOL, SaveDraft};
 use missive_window::compose::{Compose, Field, SAVE_AFTER, State};
 use missive_window::compose_view::{Chooser, ComposeWindow};
@@ -272,4 +275,49 @@ fn the_reader_keys_open_a_compose_window(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(subjects(cx).len(), 2);
     assert!(subjects(cx).contains(&"Fwd: Plan 3".to_owned()));
+}
+
+#[gpui_kit::test]
+fn files_dropped_on_the_window_are_attached_and_the_unreadable_ones_are_named(
+    cx: &mut TestAppContext,
+) {
+    let folder = tempfile::tempdir().unwrap();
+    let notes = folder.path().join("notes.txt");
+    std::fs::write(&notes, "Notes").unwrap();
+    let report = folder.path().join("report é.pdf");
+    std::fs::write(&report, "%PDF-1.7").unwrap();
+    let missing = folder.path().join("gone.txt");
+    let (asker, _) = asker();
+    let cx = window(cx, new_message(), asker, no_chooser());
+    let at = cx.debug_bounds("attach").unwrap().center();
+
+    // What a compositor sends when files are dragged over the window and let go.
+    let paths = ExternalPaths([notes, report, missing].into_iter().collect());
+    cx.simulate_event(FileDropEvent::Entered {
+        position: at,
+        paths,
+    });
+    cx.simulate_event(FileDropEvent::Pending { position: at });
+    cx.simulate_event(FileDropEvent::Submit { position: at });
+    cx.executor().run_until_parked();
+    cx.run_until_parked();
+
+    let (names, notice, saves) = cx.update(|window, cx| {
+        let root = window.root::<ComposeWindow>().flatten().unwrap();
+        let root = root.read(cx);
+        (
+            root.model
+                .attachments
+                .iter()
+                .map(|a| a.name.clone())
+                .collect::<Vec<_>>(),
+            root.model.notice.clone().unwrap_or_default(),
+            root.model.needs_save(),
+        )
+    });
+    assert_eq!(names, ["notes.txt", "report é.pdf"]);
+    assert!(notice.contains("gone.txt"), "{notice}");
+    assert!(saves, "the draft is saved with them once the typing stops");
+    // They are shown, each with its Remove button.
+    assert!(cx.debug_bounds("remove-1").is_some());
 }
