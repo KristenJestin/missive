@@ -41,6 +41,16 @@ pub struct Action {
     pub attempts: u32,
 }
 
+/// What the copy kept of a message that a copy of it on the server has too: `UID COPY` keeps the
+/// raw message, so its size, and the INTERNALDATE (RFC 3501, 6.4.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// Without its angle brackets.
+    pub message_id: Option<String>,
+    pub size: i64,
+    pub internal_date: Option<i64>,
+}
+
 /// The messages of one folder a request names.
 struct Group {
     account: i64,
@@ -324,17 +334,27 @@ impl Store {
         Ok(())
     }
 
-    /// The `Message-ID` of each of a folder's `uids`, in their order (`None` without one).
-    pub fn message_ids(&self, folder: i64, uids: &[u32]) -> rusqlite::Result<Vec<Option<String>>> {
-        let mut statement = self
-            .connection
-            .prepare_cached("SELECT message_id FROM message WHERE folder = ?1 AND uid = ?2")?;
+    /// What tells each of a folder's `uids` from another message, in their order (`None` for a
+    /// UID the copy does not have).
+    pub fn fingerprints(
+        &self,
+        folder: i64,
+        uids: &[u32],
+    ) -> rusqlite::Result<Vec<Option<Fingerprint>>> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT message_id, size, internal_date FROM message WHERE folder = ?1 AND uid = ?2",
+        )?;
         uids.iter()
             .map(|uid| {
                 statement
-                    .query_row(params![folder, uid], |r| r.get(0))
+                    .query_row(params![folder, uid], |r| {
+                        Ok(Fingerprint {
+                            message_id: r.get(0)?,
+                            size: r.get(1)?,
+                            internal_date: r.get(2)?,
+                        })
+                    })
                     .optional()
-                    .map(Option::flatten)
             })
             .collect()
     }

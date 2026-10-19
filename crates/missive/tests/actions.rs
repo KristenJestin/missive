@@ -1553,3 +1553,55 @@ async fn after_an_action_the_sync_goes_back_to_examine_before_any_fetch() {
     assert!(!after.iter().any(|c| c.starts_with("SELECT")), "{log:?}");
     assert!(after.iter().any(|c| c == "EXAMINE \"INBOX\""), "{log:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_whose_answer_never_came_is_not_trusted_to_another_message_with_its_message_id() {
+    // Another message with the same Message-ID arrives in the target meanwhile: the same message
+    // received again later (another INTERNALDATE), or another message (another size).
+    let impostors = [
+        message(3).internal_date("02-Jan-2026 10:00:00 +0000"),
+        Message::new(
+            "Message-ID: <3@example.com>\r\n\
+             \r\n\
+             Not the same message at all.\r\n",
+        ),
+    ];
+    for impostor in impostors {
+        let (server, env, _daemon) = started_with(
+            mailbox().without_move().stall("UID COPY"),
+            &["--action-timeout", "1"],
+        )
+        .await;
+        let original = server.raw("INBOX", 3).unwrap();
+        succeeded(
+            &env.act(&["move", &env.id("INBOX", 3), "--to", "archive"])
+                .await,
+        );
+        // The server never ran it, and never answered.
+        eventually(10, "the COPY", || tries(&server, "UID COPY") == 1).await;
+        server.deliver("Archive", impostor);
+        server.heal();
+
+        eventually(30, "the queue empty", || env.queue() == 0).await;
+        succeeded(&sync_soon(&env).await);
+
+        // Looked for, found, but not trusted: copied again before the source lost it.
+        assert_eq!(
+            tries(&server, "UID SEARCH UID"),
+            1,
+            "{:?}",
+            server.imap_log()
+        );
+        assert_eq!(tries(&server, "UID COPY"), 2, "{:?}", server.imap_log());
+        removed_after_the_last_copy(&server);
+        assert_eq!(server.uids("Archive"), [1, 2]);
+        assert_eq!(
+            server.raw("Archive", 2).unwrap(),
+            original,
+            "the second message of the archive is the real copy"
+        );
+        assert_eq!(server.uids("INBOX"), [1, 2, 4]);
+        assert_eq!(env.uids("Archive"), [1, 2]);
+        assert_eq!(env.uids("INBOX"), [1, 2, 4]);
+    }
+}

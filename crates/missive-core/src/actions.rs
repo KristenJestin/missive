@@ -36,17 +36,19 @@
 //!
 //! A `UID COPY` whose answer was never read (the connection was cut) may or may not have
 //! copied: before copying again, the target's UIDNEXT tells whether anything arrived there since,
-//! and if so, each message is looked for there by its `Message-ID`. A message without one is
+//! and if so, each message is looked for there by its `Message-ID`, and a message found counts as
+//! its copy only with the size and the INTERNALDATE the copy kept from the source (`UID COPY`
+//! keeps both). A message without a Message-ID or an INTERNALDATE, or whose copy is not found, is
 //! copied again: a copy twice is better than a message lost.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use async_imap::imap_proto::{MailboxDatum, Response, StatusAttribute};
+use async_imap::imap_proto::{AttributeValue, MailboxDatum, Response, StatusAttribute};
 
 use crate::connect::{ConnectError, ImapSession};
 use crate::copy::message_id;
-use crate::store::{Action, Store};
+use crate::store::{Action, Fingerprint, Store};
 use crate::sync::{self, Capabilities, CopyUid, Done, SyncError};
 
 /// How many times an action fails (a `NO`, a cut connection, a timeout…) before it is refused.
@@ -661,20 +663,18 @@ async fn recover_copy(
     let Some(uidvalidity) = server.examine_uidvalidity(&target.name).await? else {
         return Ok(Recovered::Unknown);
     };
-    let message_ids = store.message_ids(action.folder.id, &action.uids)?;
+    let fingerprints = store.fingerprints(action.folder.id, &action.uids)?;
     let mut found = CopyUid {
         uidvalidity,
         pairs: Vec::new(),
     };
     let mut missing = Vec::new();
-    for (uid, message_id) in action.uids.iter().zip(message_ids) {
-        // The copy keeps a Message-ID without its angle brackets; with them, `3@` does not
-        // match `13@`.
-        let new = match message_id.and_then(|id| sync::quote(&format!("<{id}>"))) {
-            Some(quoted) => server
-                .search(&format!("UID {before}:* HEADER Message-ID {quoted}"))
-                .await?
-                .and_then(|uids| uids.into_iter().find(|new| *new >= before)),
+    for (uid, fingerprint) in action.uids.iter().zip(fingerprints) {
+        let new = match fingerprint {
+            Some(fingerprint) => {
+                let taken: Vec<u32> = found.pairs.iter().map(|(_, new)| *new).collect();
+                find_copy(server, before, &fingerprint, &taken).await?
+            }
             None => None,
         };
         match new {
@@ -702,6 +702,79 @@ async fn recover_copy(
         // Copied, but where is not told: the target's sync brings them.
         _ => Ok(Recovered::Copied(None)),
     }
+}
+
+/// The UID of a copy of the message in the target, which is examined, from `before` on: a message
+/// with its `Message-ID`, its size and its INTERNALDATE, which `UID COPY` keeps. The same
+/// Message-ID alone is not enough: the same message received again, or another message that
+/// reuses it, may have arrived there meanwhile, and trusting it would remove the original
+/// without a copy. `taken` are the UIDs already found for other messages of the action.
+async fn find_copy(
+    server: &mut Server<'_>,
+    before: u32,
+    fingerprint: &Fingerprint,
+    taken: &[u32],
+) -> std::result::Result<Option<u32>, SyncError> {
+    // The copy keeps a Message-ID without its angle brackets; with them, `3@` does not match
+    // `13@`.
+    let Some(quoted) = fingerprint
+        .message_id
+        .as_ref()
+        .and_then(|id| sync::quote(&format!("<{id}>")))
+    else {
+        return Ok(None);
+    };
+    // Without its INTERNALDATE, nothing can tell a copy from another message.
+    let Some(internal_date) = fingerprint.internal_date else {
+        return Ok(None);
+    };
+    let Some(candidates) = server
+        .search(&format!("UID {before}:* HEADER Message-ID {quoted}"))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let candidates: Vec<u32> = candidates
+        .into_iter()
+        .filter(|new| *new >= before && !taken.contains(new))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut same = Vec::new();
+    let done = server
+        .run_done(
+            &format!(
+                "UID FETCH {} (UID RFC822.SIZE INTERNALDATE)",
+                sync::uid_set(&candidates)
+            ),
+            |response| {
+                if let Response::Fetch(_, attributes) = response
+                    && let Some(uid) = sync::uid(attributes)
+                    && candidates.contains(&uid)
+                {
+                    let mut size = None;
+                    let mut date = None;
+                    for attribute in attributes.iter() {
+                        match attribute {
+                            AttributeValue::Rfc822Size(value) => size = Some(i64::from(*value)),
+                            AttributeValue::InternalDate(value) => {
+                                date = sync::parse_internal_date(value);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if size == Some(fingerprint.size) && date == Some(internal_date) {
+                        same.push(uid);
+                    }
+                }
+            },
+        )
+        .await?;
+    if !matches!(done, Done::Ok(_)) {
+        return Ok(None);
+    }
+    Ok(same.into_iter().min())
 }
 
 /// The UIDNEXT of a folder, from `STATUS`. `None` when the server refused it.
