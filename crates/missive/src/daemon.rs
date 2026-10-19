@@ -1705,6 +1705,13 @@ impl Worker {
             .iter()
             .any(|outcome| matches!(outcome.result, actions::Result::Retried { .. }));
         self.queue_failed = result.is_err();
+        if applied.taken_back > 0 {
+            log!(
+                "account {}: took back the \\Deleted flag a refused action left on {} messages",
+                self.key,
+                applied.taken_back
+            );
+        }
         for outcome in &applied.outcomes {
             self.tell_outcome(outcome);
         }
