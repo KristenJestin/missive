@@ -134,6 +134,7 @@ fn each_key_sends_its_request(cx: &mut TestAppContext) {
     let (_runtime, mail) = mail();
     let model = mail.model();
     let plan1 = id_of(&model, "Plan 1");
+    let plan2 = id_of(&model, "Plan 2");
     let plan3 = id_of(&model, "Plan 3");
     let (asker, asked) = asker(None);
     let cx = window(cx, model, asker);
@@ -142,10 +143,15 @@ fn each_key_sends_its_request(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.simulate_keystrokes("up up enter a");
     cx.run_until_parked();
-    assert_eq!(shown(cx).0, None, "an archived message leaves the reader");
-    cx.simulate_keystrokes("enter m down down enter");
+    assert_eq!(
+        shown(cx).0.as_deref(),
+        Some("Plan 2"),
+        "an archived message gives the reader to the next one"
+    );
+    cx.simulate_keystrokes("m down down enter");
     cx.run_until_parked();
-    cx.simulate_keystrokes("enter delete");
+    assert_eq!(shown(cx).0.as_deref(), Some("Plan 1"));
+    cx.simulate_keystrokes("delete");
     cx.run_until_parked();
     assert_eq!(
         *asked.lock().unwrap(),
@@ -153,9 +159,9 @@ fn each_key_sends_its_request(cx: &mut TestAppContext) {
             mark(&plan1, "unread"),
             mark(&plan1, "flagged"),
             moved(&plan3, "archive"),
-            moved(&plan3, "Projects"),
+            moved(&plan2, "Projects"),
             Command::Delete {
-                messages: vec![plan3.clone()],
+                messages: vec![plan1.clone()],
                 permanently: false
             },
         ]
@@ -167,6 +173,7 @@ fn the_reader_header_buttons_send_the_same_requests(cx: &mut TestAppContext) {
     let (_runtime, mail) = mail();
     let model = mail.model();
     let plan1 = id_of(&model, "Plan 1");
+    let plan2 = id_of(&model, "Plan 2");
     let plan3 = id_of(&model, "Plan 3");
     let (asker, asked) = asker(None);
     let cx = window(cx, model, asker);
@@ -176,10 +183,8 @@ fn the_reader_header_buttons_send_the_same_requests(cx: &mut TestAppContext) {
     click(cx, "flag");
     cx.simulate_keystrokes("up up enter");
     click(cx, "archive");
-    cx.simulate_keystrokes("enter");
     click(cx, "move-to");
     click(cx, "pick-2");
-    cx.simulate_keystrokes("enter");
     click(cx, "delete");
     assert_eq!(
         *asked.lock().unwrap(),
@@ -187,9 +192,9 @@ fn the_reader_header_buttons_send_the_same_requests(cx: &mut TestAppContext) {
             mark(&plan1, "unread"),
             mark(&plan1, "flagged"),
             moved(&plan3, "archive"),
-            moved(&plan3, "Projects"),
+            moved(&plan2, "Projects"),
             Command::Delete {
-                messages: vec![plan3.clone()],
+                messages: vec![plan1.clone()],
                 permanently: false
             },
         ]
@@ -248,4 +253,78 @@ fn a_refused_request_shows_a_notice_in_the_window(cx: &mut TestAppContext) {
     let notice = shown(cx).1.expect("a notice");
     assert!(notice.contains("busy"), "{notice}");
     assert!(cx.debug_bounds("notice").is_some());
+}
+
+#[gpui_kit::test]
+fn a_daemon_that_does_not_answer_shows_a_notice_and_later_actions_still_go(
+    cx: &mut TestAppContext,
+) {
+    let (_runtime, mail) = mail();
+    let model = mail.model();
+    let plan3 = id_of(&model, "Plan 3");
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let recorded = asked.clone();
+    // What the client gives when the daemon accepts and stays silent (`client::ANSWER_TIMEOUT`).
+    let asker: Asker = Arc::new(move |command: Command| {
+        recorded.lock().unwrap().push(command);
+        Err("the daemon did not answer within 10 seconds".to_owned())
+    });
+    let cx = window(cx, model, asker);
+
+    cx.simulate_keystrokes("s");
+    cx.run_until_parked();
+    let notice = shown(cx).1.expect("a notice");
+    assert!(notice.contains("did not answer"), "{notice}");
+    assert!(cx.debug_bounds("notice").is_some());
+    cx.simulate_keystrokes("s");
+    cx.run_until_parked();
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [mark(&plan3, "flagged"), mark(&plan3, "flagged")],
+        "the window is not stuck on the first request"
+    );
+}
+
+#[gpui_kit::test]
+fn with_no_message_open_the_picker_shows_for_the_cursor(cx: &mut TestAppContext) {
+    let (_runtime, mail) = mail();
+    let model = mail.model();
+    let plan3 = id_of(&model, "Plan 3");
+    let (asker, asked) = asker(None);
+    let cx = window(cx, model, asker);
+
+    cx.simulate_keystrokes("m");
+    assert!(cx.debug_bounds("pick-0").is_some(), "the picker shows");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(*asked.lock().unwrap(), [moved(&plan3, "archive")]);
+    assert_eq!(shown(cx).0, None, "no message was opened");
+}
+
+#[gpui_kit::test]
+fn with_no_message_open_the_question_shows_for_the_cursor_in_the_trash(cx: &mut TestAppContext) {
+    let (_runtime, mail) = mail();
+    let mut model = mail.model();
+    let trash = model.accounts[0]
+        .folders
+        .iter()
+        .find(|f| f.folder.role.as_deref() == Some("trash"))
+        .unwrap()
+        .folder
+        .id;
+    model.select_folder(common::ID, trash);
+    let plan6 = id_of(&model, "Plan 6");
+    let (asker, asked) = asker(None);
+    let cx = window(cx, model, asker);
+
+    cx.simulate_keystrokes("delete");
+    assert!(cx.debug_bounds("confirm-delete").is_some(), "it asks");
+    click(cx, "confirm-delete");
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [Command::Delete {
+            messages: vec![plan6],
+            permanently: true
+        }]
+    );
 }

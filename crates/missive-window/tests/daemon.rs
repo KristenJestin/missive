@@ -241,7 +241,10 @@ async fn offline_an_action_from_the_window_is_queued_and_shown_at_once() {
     );
     assert!(model.notice.is_none(), "{:?}", model.notice);
     assert_eq!(subjects(&model), ["Plan 2", "Plan 1"]);
-    assert_eq!(model.reader, Reader::Empty);
+    assert!(
+        matches!(&model.reader, Reader::Open(opened) if opened.subject.as_deref() == Some("Plan 2")),
+        "the next message is open"
+    );
     select(&mut model, "archive");
     assert_eq!(subjects(&model), ["Plan 3"]);
     assert!(!model.messages[0].hit.unread, "read, while queued");

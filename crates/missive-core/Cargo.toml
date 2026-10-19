@@ -41,4 +41,4 @@ zbus.workspace = true
 missive-core = { path = ".", features = ["fake"] }
 tempfile.workspace = true
 zbus.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }
