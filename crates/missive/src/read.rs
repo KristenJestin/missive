@@ -9,8 +9,8 @@ use clap::{Args, ValueEnum};
 use missive_core::account::{AccountStore, Listing};
 use missive_core::body::{self, Attachment};
 use missive_core::copy::{
-    Copy, FolderRef, Hit, List, NotFound, Outgoing, Person, Search, Stored, WaitingDraft,
-    local_time,
+    Copy, FolderRef, HalfMoved, Hit, List, NotFound, Outgoing, Person, Search, Stored,
+    WaitingDraft, local_time,
 };
 use missive_core::protocol::pid_path;
 use missive_core::store::{SkippedFolder, Store};
@@ -194,6 +194,9 @@ struct AccountStatus {
     /// The drafts kept in the local copy until the server holds them: to write, to remove (sent),
     /// or kept there for good when the account has no Drafts folder.
     drafts: Vec<WaitingDraft>,
+    /// The messages a move refused after their copy left in two folders, until the user removes
+    /// one of the two.
+    half_moved: Vec<HalfMoved>,
     #[serde(skip)]
     in_copy: bool,
 }
@@ -208,18 +211,19 @@ pub fn status(json: bool) -> Result<()> {
     };
     let mut accounts = Vec::new();
     for id in configured {
-        let (outbox, drafts) = match &copy {
+        let (outbox, drafts, half_moved) = match &copy {
             Some(copy) => (
                 copy.outbox(&id).map_err(|e| e.to_string())?,
                 copy.drafts(&id).map_err(|e| e.to_string())?,
+                copy.half_moved(&id).map_err(|e| e.to_string())?,
             ),
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
-        accounts.push((id, outbox, drafts));
+        accounts.push((id, outbox, drafts, half_moved));
     }
     let accounts: Vec<AccountStatus> = accounts
         .into_iter()
-        .map(|(id, outbox, drafts)| {
+        .map(|(id, outbox, drafts, half_moved)| {
             let Some(row) = rows.iter().find(|row| row.id == id) else {
                 return AccountStatus {
                     id,
@@ -230,6 +234,7 @@ pub fn status(json: bool) -> Result<()> {
                     skipped: Vec::new(),
                     outbox,
                     drafts,
+                    half_moved,
                     in_copy: false,
                 };
             };
@@ -245,6 +250,7 @@ pub fn status(json: bool) -> Result<()> {
                 skipped: row.skipped.clone(),
                 outbox,
                 drafts,
+                half_moved,
                 in_copy: true,
             }
         })
@@ -345,6 +351,13 @@ pub fn status(json: bool) -> Result<()> {
                     );
                 }
             }
+        }
+        for half in &account.half_moved {
+            println!(
+                "\thalf moved: {} is in both {} and {}, since the server refused to remove it \
+                 after copying it; delete or move one of the two",
+                half.message, half.folder, half.target
+            );
         }
     }
     Ok(())

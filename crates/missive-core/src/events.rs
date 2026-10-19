@@ -101,6 +101,9 @@ pub struct ActionEvent {
     pub outcome: String,
     /// The identifiers of the messages, as they were when the action was asked.
     pub messages: Vec<String>,
+    /// The action's number, as the answer to its request gave it: no other action has it.
+    #[serde(default)]
+    pub id: i64,
     /// For `retried` and `refused`: why, for programs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -110,6 +113,10 @@ pub struct ActionEvent {
     /// For `refused`: why, for people.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// For a refused move only, `true` when the server had copied the messages to the target
+    /// first: they are in both folders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied: Option<bool>,
 }
 
 /// What became of a draft at the server (`docs/events.md`).
@@ -370,26 +377,30 @@ mod tests {
             action: "read".to_owned(),
             outcome: "applied".to_owned(),
             messages: vec!["alice/4/17/99".to_owned()],
+            id: 7,
             reason: None,
             attempts: None,
             message: None,
+            copied: None,
         });
         assert_eq!(
             applied.line(),
-            r#"{"protocol":1,"event":"action","account":"alice","action":"read","outcome":"applied","messages":["alice/4/17/99"]}"#
+            r#"{"protocol":1,"event":"action","account":"alice","action":"read","outcome":"applied","messages":["alice/4/17/99"],"id":7}"#
         );
         let retried = Event::Action(ActionEvent {
             account: "alice".to_owned(),
             action: "move".to_owned(),
             outcome: "retried".to_owned(),
             messages: vec!["alice/4/17/99".to_owned()],
+            id: 8,
             reason: Some("refused".to_owned()),
             attempts: Some(2),
             message: None,
+            copied: None,
         });
         assert_eq!(
             retried.line(),
-            r#"{"protocol":1,"event":"action","account":"alice","action":"move","outcome":"retried","messages":["alice/4/17/99"],"reason":"refused","attempts":2}"#
+            r#"{"protocol":1,"event":"action","account":"alice","action":"move","outcome":"retried","messages":["alice/4/17/99"],"id":8,"reason":"refused","attempts":2}"#
         );
     }
 

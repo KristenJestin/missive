@@ -1005,6 +1005,7 @@ impl Daemon {
             answer: Some(name.to_owned()),
             ok: true,
             messages: Some(queued.messages),
+            actions: Some(queued.actions),
             ..Answer::default()
         }
     }
@@ -1367,6 +1368,9 @@ impl Worker {
             };
         }
         let capabilities = check!(sync::prepare(&mut session).await);
+        if let Err(e) = self.store.set_capabilities(self.key, capabilities) {
+            log!("account {}: cannot record its capabilities ({e})", self.key);
+        }
         self.idle_refused = false;
         log!(
             "account {}: connected ({}, {})",
@@ -1639,14 +1643,22 @@ impl Worker {
 
     /// Logs what became of an action, and tells the watchers.
     fn tell_outcome(&mut self, outcome: &Outcome) {
-        let (name, reason, attempts, message) = match &outcome.result {
-            actions::Result::Applied => ("applied", None, None, None),
+        let (name, reason, attempts, message, copied) = match &outcome.result {
+            actions::Result::Applied => ("applied", None, None, None, None),
             actions::Result::Retried { attempts, reason } => {
-                ("retried", Some(*reason), Some(*attempts), None)
+                ("retried", Some(*reason), Some(*attempts), None, None)
             }
-            actions::Result::Refused { reason, message } => {
-                ("refused", Some(*reason), None, Some(message.clone()))
-            }
+            actions::Result::Refused {
+                reason,
+                message,
+                copied,
+            } => (
+                "refused",
+                Some(*reason),
+                None,
+                Some(message.clone()),
+                copied.then_some(true),
+            ),
         };
         log!(
             "account {}: action {} ({}, {} messages) {name}{}",
@@ -1665,9 +1677,11 @@ impl Worker {
             action: outcome.kind.name().to_owned(),
             outcome: name.to_owned(),
             messages: outcome.messages.clone(),
+            id: outcome.action,
             reason: reason.map(str::to_owned),
             attempts,
             message,
+            copied,
         }));
     }
 

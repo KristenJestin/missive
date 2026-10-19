@@ -34,19 +34,25 @@
 //! A removal whose `UID EXPUNGE` was refused takes its `\Deleted` back, so that no other
 //! client's `EXPUNGE` removes the message later.
 //!
+//! A move refused once its `UID COPY` was made leaves the messages in both folders. Nothing is
+//! removed to fix it: the copy shows both, the outcome says so, and the messages are recorded as
+//! half moved ([`crate::copy::Copy::half_moved`]) until the user removes one of the two.
+//!
 //! A `UID COPY` whose answer was never read (the connection was cut) may or may not have
 //! copied: before copying again, the target's UIDNEXT tells whether anything arrived there since,
-//! and if so, each message is looked for there by its `Message-ID`. A message without one is
+//! and if so, each message is looked for there by its `Message-ID`, and a message found counts as
+//! its copy only with the size and the INTERNALDATE the copy kept from the source (`UID COPY`
+//! keeps both). A message without a Message-ID or an INTERNALDATE, or whose copy is not found, is
 //! copied again: a copy twice is better than a message lost.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use async_imap::imap_proto::{MailboxDatum, Response, StatusAttribute};
+use async_imap::imap_proto::{AttributeValue, MailboxDatum, Response, StatusAttribute};
 
 use crate::connect::{ConnectError, ImapSession};
 use crate::copy::message_id;
-use crate::store::{Action, Store};
+use crate::store::{Action, Fingerprint, Store};
 use crate::sync::{self, Capabilities, CopyUid, Done, SyncError};
 
 /// How many times an action fails (a `NO`, a cut connection, a timeout…) before it is refused.
@@ -134,7 +140,8 @@ pub enum Wanted {
 /// Why a request was refused before anything was recorded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused {
-    /// `no-such-message`, `no-such-folder`, `no-trash`, `in-trash`, `not-in-trash` or `busy`.
+    /// `no-such-message`, `no-such-folder`, `no-trash`, `in-trash`, `not-in-trash`, `busy` or
+    /// `unsupported`.
     pub error: &'static str,
     /// For people.
     pub message: String,
@@ -156,6 +163,27 @@ pub struct Queued {
     pub messages: Vec<String>,
     /// The accounts the actions are for, by identifier: their workers have work.
     pub accounts: Vec<String>,
+    /// The numbers of the actions recorded, one per folder, as their `action` events give them.
+    pub actions: Vec<i64>,
+}
+
+/// Why a server with or without MOVE and UIDPLUS cannot apply an action of this kind safely, if
+/// it cannot: when the copy knows the server's capabilities, the request is refused at once
+/// (`unsupported`), else the action is refused when it is tried.
+pub fn unsupported(kind: Kind, moves: bool, uidplus: bool) -> Option<&'static str> {
+    if kind == Kind::DeletePermanently && !uidplus {
+        return Some(
+            "the server has no UID EXPUNGE (UIDPLUS): deleting for good would also remove the \
+             messages other clients marked deleted",
+        );
+    }
+    if kind.moves() && !moves && !uidplus {
+        return Some(
+            "the server has neither MOVE nor UIDPLUS: moving would also remove the messages \
+             other clients marked deleted",
+        );
+    }
+    None
 }
 
 /// A message's flags, as the copy keeps them, with `flag` added or removed.
@@ -184,10 +212,12 @@ pub enum Result {
     },
     /// It was dropped and its change taken back from the copy. `reason` is `renumbered`,
     /// `no-such-folder`, `unsupported`, `refused` or `connection` (it failed that way
-    /// [`MAX_ATTEMPTS`] times).
+    /// [`MAX_ATTEMPTS`] times). `copied`: a move the server refused once it had copied the
+    /// messages, which are in both folders now; nothing is removed to fix it but by the user.
     Refused {
         reason: &'static str,
         message: String,
+        copied: bool,
     },
 }
 
@@ -355,14 +385,15 @@ async fn round(
                         reason: "connection",
                     }));
                 } else {
-                    refuse(store, &action, applied)?;
-                    applied.outcomes.push(outcome(Result::Refused {
-                        reason: "connection",
-                        message: format!(
+                    let copied = refuse(store, &action, applied)?;
+                    applied.outcomes.push(outcome(refused(
+                        "connection",
+                        format!(
                             "it failed {attempts} times: the connection was lost, the server's \
                              answer could not be used, or none came in time"
                         ),
-                    }));
+                        copied,
+                    )));
                 }
                 return Err(error);
             }
@@ -383,33 +414,53 @@ async fn round(
                     // The actions after it wait, so that they are applied in order.
                     return Ok(());
                 }
-                refuse(store, &action, applied)?;
-                Result::Refused {
-                    reason: "refused",
-                    message: format!("the server refused it {attempts} times ({why})"),
-                }
+                let copied = refuse(store, &action, applied)?;
+                refused(
+                    "refused",
+                    format!("the server refused it {attempts} times ({why})"),
+                    copied,
+                )
             }
             Step::Refused(reason, message) => {
-                refuse(store, &action, applied)?;
-                Result::Refused {
-                    reason,
-                    message: message.to_owned(),
-                }
+                let copied = refuse(store, &action, applied)?;
+                refused(reason, message.to_owned(), copied)
             }
         };
         applied.outcomes.push(outcome(result));
     }
 }
 
-/// Drops an action and takes its change back from the copy; the folder is synced again.
+/// Drops an action and takes its change back from the copy; the folder is synced again, and the
+/// target too when the move had copied the messages there. Returns whether it had.
 fn refuse(
     store: &mut Store,
     action: &Action,
     applied: &mut Applied,
-) -> std::result::Result<(), SyncError> {
-    store.refused(action)?;
+) -> std::result::Result<bool, SyncError> {
+    let copied = store.refused(action)?;
     applied.resync.insert(action.folder.id);
-    Ok(())
+    if copied && let Some(target) = &action.target {
+        applied.resync.insert(target.id);
+    }
+    Ok(copied)
+}
+
+/// What a refused action says, for people: `why`, and for a move that had copied the messages,
+/// where they are now.
+fn refused(reason: &'static str, why: String, copied: bool) -> Result {
+    let message = if copied {
+        format!(
+            "{why}; the server had copied the messages to the target first, so they are in both \
+             folders now: nothing was removed, delete or move one of the two"
+        )
+    } else {
+        why
+    };
+    Result::Refused {
+        reason,
+        message,
+        copied,
+    }
 }
 
 /// What one try of an action came to.
@@ -440,19 +491,8 @@ async fn one(
         return Ok(RENUMBERED);
     }
     // Refused before anything is sent.
-    if action.kind == Kind::DeletePermanently && !capabilities.uidplus {
-        return Ok(Step::Refused(
-            "unsupported",
-            "the server has no UID EXPUNGE (UIDPLUS): deleting for good would also remove the \
-             messages other clients marked deleted",
-        ));
-    }
-    if action.kind.moves() && !capabilities.moves && !capabilities.uidplus {
-        return Ok(Step::Refused(
-            "unsupported",
-            "the server has neither MOVE nor UIDPLUS: moving would also remove the messages \
-             other clients marked deleted",
-        ));
+    if let Some(why) = unsupported(action.kind, capabilities.moves, capabilities.uidplus) {
+        return Ok(Step::Refused("unsupported", why));
     }
     match server.select(&action.folder.name).await? {
         None => return Ok(Step::No("select")),
@@ -661,20 +701,18 @@ async fn recover_copy(
     let Some(uidvalidity) = server.examine_uidvalidity(&target.name).await? else {
         return Ok(Recovered::Unknown);
     };
-    let message_ids = store.message_ids(action.folder.id, &action.uids)?;
+    let fingerprints = store.fingerprints(action.folder.id, &action.uids)?;
     let mut found = CopyUid {
         uidvalidity,
         pairs: Vec::new(),
     };
     let mut missing = Vec::new();
-    for (uid, message_id) in action.uids.iter().zip(message_ids) {
-        // The copy keeps a Message-ID without its angle brackets; with them, `3@` does not
-        // match `13@`.
-        let new = match message_id.and_then(|id| sync::quote(&format!("<{id}>"))) {
-            Some(quoted) => server
-                .search(&format!("UID {before}:* HEADER Message-ID {quoted}"))
-                .await?
-                .and_then(|uids| uids.into_iter().find(|new| *new >= before)),
+    for (uid, fingerprint) in action.uids.iter().zip(fingerprints) {
+        let new = match fingerprint {
+            Some(fingerprint) => {
+                let taken: Vec<u32> = found.pairs.iter().map(|(_, new)| *new).collect();
+                find_copy(server, before, &fingerprint, &taken).await?
+            }
             None => None,
         };
         match new {
@@ -704,6 +742,79 @@ async fn recover_copy(
     }
 }
 
+/// The UID of a copy of the message in the target, which is examined, from `before` on: a message
+/// with its `Message-ID`, its size and its INTERNALDATE, which `UID COPY` keeps. The same
+/// Message-ID alone is not enough: the same message received again, or another message that
+/// reuses it, may have arrived there meanwhile, and trusting it would remove the original
+/// without a copy. `taken` are the UIDs already found for other messages of the action.
+async fn find_copy(
+    server: &mut Server<'_>,
+    before: u32,
+    fingerprint: &Fingerprint,
+    taken: &[u32],
+) -> std::result::Result<Option<u32>, SyncError> {
+    // The copy keeps a Message-ID without its angle brackets; with them, `3@` does not match
+    // `13@`.
+    let Some(quoted) = fingerprint
+        .message_id
+        .as_ref()
+        .and_then(|id| sync::quote(&format!("<{id}>")))
+    else {
+        return Ok(None);
+    };
+    // Without its INTERNALDATE, nothing can tell a copy from another message.
+    let Some(internal_date) = fingerprint.internal_date else {
+        return Ok(None);
+    };
+    let Some(candidates) = server
+        .search(&format!("UID {before}:* HEADER Message-ID {quoted}"))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let candidates: Vec<u32> = candidates
+        .into_iter()
+        .filter(|new| *new >= before && !taken.contains(new))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut same = Vec::new();
+    let done = server
+        .run_done(
+            &format!(
+                "UID FETCH {} (UID RFC822.SIZE INTERNALDATE)",
+                sync::uid_set(&candidates)
+            ),
+            |response| {
+                if let Response::Fetch(_, attributes) = response
+                    && let Some(uid) = sync::uid(attributes)
+                    && candidates.contains(&uid)
+                {
+                    let mut size = None;
+                    let mut date = None;
+                    for attribute in attributes.iter() {
+                        match attribute {
+                            AttributeValue::Rfc822Size(value) => size = Some(i64::from(*value)),
+                            AttributeValue::InternalDate(value) => {
+                                date = sync::parse_internal_date(value);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if size == Some(fingerprint.size) && date == Some(internal_date) {
+                        same.push(uid);
+                    }
+                }
+            },
+        )
+        .await?;
+    if !matches!(done, Done::Ok(_)) {
+        return Ok(None);
+    }
+    Ok(same.into_iter().min())
+}
+
 /// The UIDNEXT of a folder, from `STATUS`. `None` when the server refused it.
 async fn uid_next(
     server: &mut Server<'_>,
@@ -730,6 +841,20 @@ async fn uid_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_move_that_copied_says_the_messages_are_in_both_folders() {
+        let Result::Refused { message, .. } =
+            refused("refused", "the server said no".to_owned(), true)
+        else {
+            panic!("a refusal")
+        };
+        assert_eq!(
+            message,
+            "the server said no; the server had copied the messages to the target first, so \
+             they are in both folders now: nothing was removed, delete or move one of the two"
+        );
+    }
 
     #[test]
     fn a_flag_is_added_or_removed_and_the_flags_stay_sorted_once_each() {
