@@ -1248,3 +1248,99 @@ async fn mailto_refuses_a_link_that_would_inject_a_header_and_saves_nothing() {
     assert!(env.drafts().await.is_empty());
     drafts_on_server(&server, &[]).await;
 }
+
+/// Whether the fake window wrote its five arguments.
+fn written(args: &Path) -> bool {
+    std::fs::read_to_string(args)
+        .is_ok_and(|text| text.lines().count() == 5 && text.ends_with('\n'))
+}
+
+/// A copy of `missive` alone in a folder, so that no real `missive-window` sits beside it, and a
+/// fake `missive-window` in another folder, for the `PATH`, that writes its arguments to `args`,
+/// one per line, with the shell's builtins alone (the `PATH` holds nothing else).
+fn fake_window(env: &Env) -> (PathBuf, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.path("bin");
+    let path = env.path("path");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&path).unwrap();
+    let missive = bin.join("missive");
+    std::fs::copy(env!("CARGO_BIN_EXE_missive"), &missive).unwrap();
+    let args = env.path("args");
+    let window = path.join("missive-window");
+    std::fs::write(
+        &window,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", args.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&window, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (missive, path, args)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_a_display_mailto_and_compose_open_the_window_on_the_draft_saved_first() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let (missive, path, args) = fake_window(&env);
+
+    let run = |command: &[&str]| {
+        let mut real = Command::new(&missive);
+        real.args(command)
+            .env_clear()
+            .env("HOME", env.home.path())
+            .env("XDG_CONFIG_HOME", env.path("config"))
+            .env("XDG_DATA_HOME", env.path("data"))
+            .env("XDG_STATE_HOME", env.path("state"))
+            .env("XDG_RUNTIME_DIR", env.path("runtime"))
+            .env("DBUS_SESSION_BUS_ADDRESS", env.keyring.address())
+            .env("PATH", &path)
+            .env("WAYLAND_DISPLAY", "wayland-fake")
+            .stdin(Stdio::null());
+        real
+    };
+    let output = run(&["mailto", "--json", "mailto:zoe@example.com?subject=Linked"])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = saved["id"].as_str().unwrap().to_owned();
+    eventually(10, "the window started", || written(&args)).await;
+    assert_eq!(
+        std::fs::read_to_string(&args).unwrap(),
+        format!("compose\n--account\nalice\n--draft\n{id}\n")
+    );
+    // The draft the window is started on is in the copy already.
+    let listed = env.drafts().await;
+    assert!(listed.iter().any(|d| d["id"] == id.as_str()), "{listed:?}");
+
+    std::fs::remove_file(&args).unwrap();
+    let output = run(&["compose", "--json", "--to", RECIPIENT])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    eventually(10, "the window started", || written(&args)).await;
+    assert!(
+        std::fs::read_to_string(&args)
+            .unwrap()
+            .ends_with(&format!("--draft\n{}\n", saved["id"].as_str().unwrap()))
+    );
+
+    // Sending opens nothing; without a display, nothing opens either.
+    std::fs::remove_file(&args).unwrap();
+    let output = run(&["compose", "--json", "--to", RECIPIENT, "--send"])
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    let output = run(&["mailto", "mailto:zoe@example.com"])
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .await
+        .unwrap();
+    succeeded(&output);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!args.exists(), "no window without a display");
+}

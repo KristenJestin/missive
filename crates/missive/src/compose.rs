@@ -211,7 +211,7 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
     // Picking a draft up again, only what was given changes; a new draft is all that is given.
     let given = |list: Vec<String>| (args.draft.is_none() || !list.is_empty()).then_some(list);
     let answer = act::ask(Command::Draft(SaveDraft {
-        account,
+        account: account.clone(),
         draft: args.draft.clone(),
         to: given(to),
         cc: given(cc),
@@ -246,6 +246,8 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         };
         return queued(outbox, message_id, args.json);
     }
+    // Saved first: the window shows the draft, and nothing is lost if it cannot start.
+    crate::window::compose(&account, &message_id);
     if args.json {
         println!("{}", serde_json::to_string(&Saved { id: message_id })?);
     } else {

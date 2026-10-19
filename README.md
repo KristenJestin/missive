@@ -10,7 +10,7 @@ Work in progress: see the issues. Agents read `AGENTS.md`.
 
 No build needed: a release is an archive of the Releases page of this repository,
 `missive-<tag>-x86_64-linux.tar.gz` with its `.sha256`, holding `missive` (the command line and
-the daemon), `missive-window` (the reading window), `install.sh` and two desktop entries. It is
+the daemon), `missive-window` (the reading and compose windows), `install.sh` and two desktop entries. It is
 built on Ubuntu 24.04 for Linux x86_64 and needs glibc 2.39 or newer. The window also needs the
 fonts and keyboard libraries of a desktop (on Ubuntu 24.04: `libfontconfig1 libfreetype6 libxcb1
 libxkbcommon0 libxkbcommon-x11-0`); the command line does not, and `install.sh` never starts the

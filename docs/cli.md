@@ -708,6 +708,12 @@ one line says the draft is saved, with its identifier. With `--json`, one object
 {"id": "4b2e…@example.org"}
 ```
 
+When a display is there (`WAYLAND_DISPLAY` or `DISPLAY` is set), the draft, once saved, is also
+opened in the **compose window**: `missive-window compose --account <id> --draft <draft id>`,
+the `missive-window` beside `missive`, else the one on the `PATH`, started on its own (the
+command returns at once). The output is the same; a window that cannot start is said on standard
+error, and the draft stays saved. Without a display, nothing is opened.
+
 #### Replying and forwarding
 
 `--reply`, `--reply-all` and `--forward` take a message's identifier (as `search` and `list`
@@ -850,8 +856,9 @@ one a killed daemon left) first looks for the message in Sent by its `Message-ID
 ### `missive mailto <uri> [--account <id>] [--json]`
 
 Composes from a `mailto:` link (RFC 6068), as the system's handler for them: the desktop entry
-`missive-mailto.desktop` runs `missive mailto %u`. Until the compose window exists, the link is
-saved as a **draft** (see `missive compose`), and nothing is opened. For people, one line gives
+`missive-mailto.desktop` runs `missive mailto %u`. The link is saved as a **draft** (see
+`missive compose`) and, when a display is there, the draft is then opened in the compose window,
+as `compose` does; without a display, nothing is opened. For people, one line gives
 the draft's identifier and says where to find it (`missive list --folder drafts`); with `--json`,
 one object, as `compose` prints:
 
