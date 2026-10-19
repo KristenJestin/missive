@@ -1434,3 +1434,28 @@ async fn status_says_that_a_message_stays_claimed_for_good() {
     assert!(text.contains("message 1 claimed: stuck"), "{text}");
     assert!(!text.contains("message 2 claimed"), "{text}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_without_a_claim_time_is_not_called_stuck() {
+    let (_server, _relay, env) = smtp_down().await;
+    let mut daemon = env.daemon().await;
+    env.ready().await;
+    succeeded(&env.compose(&["--body", "old claim"]).await);
+    daemon.kill().await;
+    // What a daemon older than the claim time leaves: claimed, with the time its message was
+    // queued for (0: at once), which says nothing of when the claim was made.
+    let copy = Connection::open(env.copy_path()).unwrap();
+    copy.execute(
+        "UPDATE outbox SET state = 'claimed', next_attempt_at = 0 WHERE id = 1",
+        [],
+    )
+    .unwrap();
+
+    let status = env.status().await;
+    let outbox = &status["accounts"][0]["outbox"];
+    assert_eq!(outbox[0]["state"], "claimed", "{status}");
+    assert_eq!(outbox[0]["stuck"], false, "{status}");
+    let output = env.run(&["status"]).await;
+    succeeded(&output);
+    assert!(!stdout(&output).contains("stuck"), "{}", stdout(&output));
+}

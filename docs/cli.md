@@ -228,7 +228,7 @@ the daemon runs.
 | `accounts[].outbox[].queued_at` | number | when it was written, in seconds since the epoch |
 | `accounts[].outbox[].attempts` | number | the tries that failed before the end of its data (tried again later) |
 | `accounts[].outbox[].last_error` | string or `null` | the last error, for people |
-| `accounts[].outbox[].stuck` | boolean | the message has been `claimed` for more than an hour: the daemon's worker could not write the outbox to put it back in the queue (five tries), and it stays so until the daemon starts again, which queues it again. `false` for any other state, and for a claim that is being tried |
+| `accounts[].outbox[].stuck` | boolean | the message has been `claimed` for more than an hour: the daemon's worker could not write the outbox to put it back in the queue (five tries), and it stays so until the daemon starts again, which queues it again. `false` for any other state, for a claim that is being tried, and for a claim without a time (made by a daemon older than the claim time) |
 | `accounts[].drafts` | array | the drafts the copy keeps until the server holds them, oldest first (see [Drafts](#drafts)) |
 | `accounts[].drafts[].id` | string | the draft's identifier (its `Message-ID`, without angle brackets), as `compose --json` printed it |
 | `accounts[].drafts[].state` | string | `waiting` (to write to the Drafts folder), `removing` (its message was sent: to remove from the Drafts folder) or `no-drafts-folder` (the account has no Drafts folder: the draft stays in the copy) |

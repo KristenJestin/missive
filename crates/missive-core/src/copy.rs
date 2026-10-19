@@ -525,7 +525,9 @@ impl Copy {
             let claimed_at: Option<i64> = r.get(6)?;
             Ok(Outgoing {
                 id: r.get(0)?,
-                stuck: state == "claimed" && claimed_at.is_some_and(|at| at < limit),
+                // 0 is no claim time: a daemon older than the claim time left the one its message
+                // was queued with, which says nothing of when it was claimed.
+                stuck: state == "claimed" && claimed_at.is_some_and(|at| 0 < at && at < limit),
                 state,
                 message_id: r.get(2)?,
                 queued_at: r.get(3)?,
