@@ -215,16 +215,25 @@ pub(super) fn queue_in(
     }
 
     for (group, kind, target) in actions {
+        let id: i64 = transaction.query_row(
+            "UPDATE action_sequence
+                SET last = max(last, (SELECT coalesce(max(id), 0) FROM action)) + 1
+             RETURNING last",
+            [],
+            |r| r.get(0),
+        )?;
+        queued.actions.push(id);
         transaction.execute(
-            "INSERT INTO action (account, folder, uidvalidity, uids, kind, target)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO action (id, account, folder, uidvalidity, uids, kind, target)
+                 VALUES (?7, ?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 group.account,
                 group.folder,
                 group.uidvalidity,
                 serde_json::to_string(&group.uids).expect("numbers serialize"),
                 kind.name(),
-                target
+                target,
+                id
             ],
         )?;
         for uid in &group.uids {

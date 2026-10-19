@@ -107,8 +107,14 @@ the copy, in one transaction, and answered: nothing waits for the server, which 
 unreachable. The answer gives the identifiers recorded, each once, in the order of the request:
 
 ```json
-{"protocol": 1, "answer": "mark", "ok": true, "messages": ["alice/1/1745112/4"]}
+{"protocol": 1, "answer": "mark", "ok": true, "messages": ["alice/1/1745112/4"], "actions": [12]}
 ```
+
+`actions` gives the numbers of the actions recorded, one per folder of the messages: the `id` of
+their `action` events. A number names one action for ever, never another one later. To follow a
+request until the server applied it (as `missive mark --wait` does), a client subscribes, then
+sends the request on the same connection: the events that come before the answer are kept and
+matched once the answer gives the numbers.
 
 A request that cannot apply to one of its messages records nothing, and is answered with one of
 the errors above. The daemon then applies the queue on the server, in order, when the account is

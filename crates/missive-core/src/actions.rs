@@ -162,6 +162,8 @@ pub struct Queued {
     pub messages: Vec<String>,
     /// The accounts the actions are for, by identifier: their workers have work.
     pub accounts: Vec<String>,
+    /// The numbers of the actions recorded, one per folder, as their `action` events give them.
+    pub actions: Vec<i64>,
 }
 
 /// A message's flags, as the copy keeps them, with `flag` added or removed.

@@ -152,7 +152,7 @@ the daemon tried it on the server.
 
 ```json
 {"protocol": 1, "event": "action", "account": "alice", "action": "read",
- "outcome": "applied", "messages": ["alice/1/1745112/4"]}
+ "outcome": "applied", "messages": ["alice/1/1745112/4"], "id": 12}
 ```
 
 | Field | Type | |
@@ -161,6 +161,7 @@ the daemon tried it on the server.
 | `action` | string | `read`, `unread`, `flagged`, `unflagged`, `answered` (set once a reply is sent), `move`, `delete` (a move to the trash) or `delete-permanently` |
 | `outcome` | string | `applied`, `retried` or `refused` |
 | `messages` | array of strings | the identifiers of the messages, as they were when the action was asked |
+| `id` | number | the action's number, as the answer to its request gave it (`actions`, `docs/protocol.md`): no other action ever has it |
 | `reason` | string | with `retried` and `refused` only: why, for programs (below) |
 | `attempts` | number | with `retried` only: how many times it failed so far |
 | `message` | string | with `refused` only: why, for people |

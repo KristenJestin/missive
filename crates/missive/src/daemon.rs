@@ -1005,6 +1005,7 @@ impl Daemon {
             answer: Some(name.to_owned()),
             ok: true,
             messages: Some(queued.messages),
+            actions: Some(queued.actions),
             ..Answer::default()
         }
     }
@@ -1673,6 +1674,7 @@ impl Worker {
             action: outcome.kind.name().to_owned(),
             outcome: name.to_owned(),
             messages: outcome.messages.clone(),
+            id: outcome.action,
             reason: reason.map(str::to_owned),
             attempts,
             message,

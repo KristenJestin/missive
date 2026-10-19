@@ -628,7 +628,7 @@ several. They ask the daemon (starting one when none answers, as `sync` does), w
 1. records the action in the local copy, in a queue, together with its effect: the message reads
    as seen, shows in its new folder, or is gone, in `list`, `search`, `show` and `unread` at once;
 2. answers: the command returns as soon as the action is recorded, whether the server can be
-   reached or not;
+   reached or not (with `--wait`, once the server applied or refused it: see below);
 3. applies it on the server when the account is connected, in the order the actions were asked,
    and reconciles the copy with what the server answered. Offline, the queue waits for the
    connection; a daemon stopped or killed in between applies it when it starts again.
@@ -645,11 +645,11 @@ still names the folder the server has it in; once moved, it has a new identifier
 that folder), as it would if another client had moved it. A message whose move waits takes no
 other action until the server moved it (`busy`).
 
-### `missive mark <message id>… --read | --unread | --flagged | --unflagged [--json]`
+### `missive mark <message id>… --read | --unread | --flagged | --unflagged [--wait [--timeout <seconds>]] [--json]`
 
 Adds or removes the `\Seen` or the `\Flagged` flag.
 
-### `missive move <message id>… --to <role or folder name> [--json]`
+### `missive move <message id>… --to <role or folder name> [--wait [--timeout <seconds>]] [--json]`
 
 Moves the messages to another folder of their account: a role (`inbox`, `sent`, `drafts`,
 `trash`, `junk`, `archive`) or a folder's name as the server gives it (`unread` shows them). A
@@ -659,7 +659,7 @@ The server must have `MOVE`, or else `UIDPLUS` (the move is then a copy, followe
 of exactly those messages). A server with neither refuses the move: removing a message there
 would also remove every message another client marked deleted in the same folder.
 
-### `missive delete <message id>… [--permanently] [--json]`
+### `missive delete <message id>… [--permanently] [--wait [--timeout <seconds>]] [--json]`
 
 Without `--permanently`, moves the messages to their account's trash (the folder with the
 `trash` role). A message already in the trash is refused, and so is a message of an account that
@@ -679,6 +679,37 @@ connected.`. With `--json`, one object:
 ```
 
 `messages` holds the identifiers the action was recorded for, each once, in the order given.
+
+#### `--wait`
+
+With `--wait`, the command answers once the server applied or refused the actions, rather than
+once they are recorded. The wait is bounded: it ends when an account of the request is offline
+(`no-login`, `auth-refused`, `certificate-refused` or `unreachable`: its queue waits for the
+connection, so waiting would only end at the timeout), when the daemon stops, or after
+`--timeout` seconds (60 by default). An action left in the queue then is not lost: the daemon
+applies it as it would without `--wait`.
+
+For people, the line ends with what became of them: `1 message marked read; applied on the
+server.`, `…; refused by the server: <why>.` or `…; still queued: the account is unreachable.`
+With `--json`, the object has two fields more:
+
+```json
+{"messages": ["alice/1/1745112/4"], "outcome": "applied",
+ "actions": [{"id": 12, "outcome": "applied"}]}
+```
+
+| Field | Type | |
+|---|---|---|
+| `outcome` | string | `applied` (every action), `refused` (one at least was refused) or `queued` (one at least is still in the queue, none refused) |
+| `actions` | array | one per action recorded (one per folder of the messages), in the order of the answer |
+| `actions[].id` | number | the action's number, as the `action` events give it (`docs/events.md`) |
+| `actions[].outcome` | string | `applied`, `refused` or `queued` |
+| `actions[].reason` | string | with `refused`: the `reason` of the `action` event; with `queued`: the state of the account that is offline (`unreachable`…), `timeout` or `gone` (the daemon stopped) |
+| `actions[].message` | string | with `refused`: why, for people |
+| `actions[].copied` | `true` | with a refused move that left the messages in two folders (`docs/events.md`) |
+
+The exit status tells them apart: 0 when every action was applied, 5 when one was refused, 4 when
+one is still queued (and none refused). The line or the object is printed in every case.
 
 A request is checked whole before anything is recorded: when one identifier names no message, or
 the action cannot apply to one of them, nothing is recorded and the command fails, saying why on

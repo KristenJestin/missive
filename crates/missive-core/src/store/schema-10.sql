@@ -14,3 +14,9 @@ CREATE TABLE half_move (
     target_uid INTEGER
 ) STRICT;
 CREATE INDEX half_move_account ON half_move (account);
+
+-- The last number given to an action. A row's `id` alone could be given again once the last
+-- action left the queue; with this, a number names one action for ever, so that `--wait` (and
+-- any client) can match the `action` event to the request that recorded it.
+CREATE TABLE action_sequence (last INTEGER NOT NULL) STRICT;
+INSERT INTO action_sequence (last) SELECT coalesce(max(id), 0) FROM action;
