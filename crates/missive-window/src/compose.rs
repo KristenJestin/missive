@@ -275,6 +275,13 @@ impl Compose {
             return;
         };
         let Some((_, own)) = basis.addresses.iter().find(|(id, _)| *id == self.account) else {
+            // The account list could not be read, or leaves this account out: say so, since the
+            // recipients may now include the address the message is sent from.
+            self.notice = Some(format!(
+                "The recipients were not worked out again for {}: its address is not known \
+                 (the account list could not be read). Check that it is not among them.",
+                self.account
+            ));
             return;
         };
         if self.to != basis.to || self.cc != basis.cc {

@@ -794,6 +794,14 @@ const ORIGINAL: &[u8] = b"From: Zoe <zoe@example.com>\r\n\
     Date: Sat, 17 Oct 2026 07:30:00 +0200\r\n\r\nAre you free?\r\n";
 
 fn reply_all_from(account: &str) -> Compose {
+    reply_all_knowing(account, |known| known)
+}
+
+/// A reply all from `account`, given the addresses of the accounts as `known` changes them.
+fn reply_all_knowing(
+    account: &str,
+    known: impl FnOnce(Vec<(String, String)>) -> Vec<(String, String)>,
+) -> Compose {
     let accounts = vec!["alice".to_owned(), "bob".to_owned()];
     let own = if account == "alice" {
         "alice@example.org"
@@ -811,10 +819,10 @@ fn reply_all_from(account: &str) -> Compose {
     Compose::answering(accounts, account.to_owned(), answering).with_recipients_of(
         ORIGINAL,
         missive_core::reply::Mode::ReplyAll,
-        vec![
+        known(vec![
             ("alice".to_owned(), "alice@example.org".to_owned()),
             ("bob".to_owned(), "bob@example.net".to_owned()),
-        ],
+        ]),
     )
 }
 
@@ -844,6 +852,23 @@ fn switching_the_sending_account_of_a_reply_all_recomputes_the_recipients() {
             "\"Zoe\" <zoe@example.com>".to_owned(),
             "\"Alice\" <alice@example.org>".to_owned()
         ])
+    );
+}
+
+#[test]
+fn an_account_list_that_cannot_be_read_is_said_when_the_sending_account_changes() {
+    // The window could not read the accounts' addresses: it cannot tell which one to leave out.
+    let mut compose = reply_all_knowing("alice", |_| Vec::new());
+    let before = (compose.to.clone(), compose.cc.clone());
+
+    compose.pick_account("bob");
+
+    assert_eq!(compose.account, "bob");
+    assert_eq!((compose.to.clone(), compose.cc.clone()), before);
+    let notice = compose.notice.clone().unwrap();
+    assert!(
+        notice.contains("bob") && notice.contains("not worked out again"),
+        "{notice}"
     );
 }
 
