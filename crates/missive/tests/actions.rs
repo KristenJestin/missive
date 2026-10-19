@@ -1911,6 +1911,55 @@ async fn wait_with_no_daemon_running_does_not_believe_the_state_the_last_one_lef
     assert_eq!(server.flags("INBOX", 3), flags(&["\\Seen"]));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_with_a_daemon_older_than_the_command_says_it_cannot_tell() {
+    let env = Env::new().await;
+    std::fs::create_dir_all(env.socket().parent().unwrap()).unwrap();
+    // A daemon from before `--wait`: its answer to `mark` has no `actions`.
+    let listener = tokio::net::UnixListener::bind(env.socket()).unwrap();
+    let old_daemon = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap();
+            write
+                .write_all(b"{\"protocol\":1,\"answer\":\"subscribe\",\"ok\":true}\n")
+                .await
+                .unwrap();
+            lines.next_line().await.unwrap();
+            write
+                .write_all(
+                    b"{\"protocol\":1,\"answer\":\"mark\",\"ok\":true,\
+                      \"messages\":[\"alice/1/100/3\"]}\n",
+                )
+                .await
+                .unwrap();
+            // The daemon stays connected: the command must not wait for its timeout.
+            let _ = lines.next_line().await;
+        }
+    });
+
+    let started = Instant::now();
+    let output = env
+        .act(&["mark", "alice/1/100/3", "--read", "--wait", "--json"])
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let answer = json(&output);
+    assert_eq!(answer["outcome"], "queued", "{answer}");
+    assert_eq!(answer["messages"], serde_json::json!(["alice/1/100/3"]));
+
+    let output = env
+        .act(&["mark", "alice/1/100/3", "--read", "--wait"])
+        .await;
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("older") && text.contains("--wait"), "{text}");
+    assert!(!text.contains("applied"), "{text}");
+    old_daemon.abort();
+}
+
 impl Env {
     /// Makes the copy forget the server's capabilities, as a copy written before it recorded them.
     fn forget_capabilities(&self) {

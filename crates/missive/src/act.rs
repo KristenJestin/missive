@@ -214,8 +214,12 @@ async fn run(
         });
     }
     let messages = answer.messages.unwrap_or_default();
+    // `ok` without `actions`: a daemon from before `--wait`, which cannot tell what became of them.
+    let unknown = waited.is_some() && answer.actions.is_none();
     let outcome = waited.as_ref().map(|waited| {
-        if waited.iter().any(|w| w.outcome == "refused") {
+        if unknown {
+            "queued"
+        } else if waited.iter().any(|w| w.outcome == "refused") {
             "refused"
         } else if waited.iter().any(|w| w.outcome == "queued") {
             "queued"
@@ -228,12 +232,16 @@ async fn run(
         let recorded = Recorded {
             messages,
             outcome,
-            actions: waited.clone(),
+            actions: waited.clone().filter(|_| !unknown),
         };
         println!("{}", serde_json::to_string(&recorded)?);
     } else {
         let noun = if count == 1 { "message" } else { "messages" };
         match &waited {
+            Some(_) if unknown => println!(
+                "{count} {noun} {done}; still queued: the running daemon is older than this \
+                 command and does not support --wait."
+            ),
             None => println!(
                 "{count} {noun} {done}; the server is told as soon as the account is connected."
             ),
@@ -314,7 +322,9 @@ async fn ask_and_wait(
     let stopped = loop {
         if let Some(answer) = &answer {
             let ids = answer.actions.as_deref().unwrap_or_default();
-            if !answer.ok || ids.iter().all(|id| ended.contains_key(id)) {
+            // Without `actions` (a daemon older than this command), nothing can be followed.
+            if !answer.ok || answer.actions.is_none() || ids.iter().all(|id| ended.contains_key(id))
+            {
                 break None;
             }
             if let Some(state) = accounts
