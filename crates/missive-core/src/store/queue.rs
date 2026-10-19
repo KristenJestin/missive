@@ -918,8 +918,21 @@ impl Store {
     ///
     /// A `\Deleted` left whose message no longer has it, or no longer is there, has nothing left
     /// to take back: another client cleared it or removed the message.
+    ///
+    /// While a permanent delete waits on `folder`, nothing settles there: the copy lacks its
+    /// messages without the server having removed them, and if the server then refuses the delete
+    /// for good, they are back with whatever they had.
     pub fn settle(&mut self, folder: i64) -> rusqlite::Result<()> {
         let transaction = self.connection.transaction()?;
+        let deleting: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM action
+                             WHERE folder = ?1 AND kind = 'delete-permanently')",
+            [folder],
+            |r| r.get(0),
+        )?;
+        if deleting {
+            return Ok(());
+        }
         let uidvalidity: Option<u32> = transaction.query_row(
             "SELECT uidvalidity FROM folder WHERE id = ?1",
             [folder],

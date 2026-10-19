@@ -2937,3 +2937,46 @@ async fn a_deleted_flag_left_is_kept_when_the_folder_answers_empty() {
     eventually(10, "the inbox emptied", || env.uids("INBOX").is_empty()).await;
     assert_eq!(env.deleted_left_rows(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_left_is_kept_while_a_permanent_delete_of_its_message_waits() {
+    let server = FakeServer::builder()
+        .user(USER, PASSWORD)
+        .folder(Folder::new("INBOX").message(message(1)).message(message(2)))
+        .refuse("UID EXPUNGE")
+        .refuse("UID STORE 1 -FLAGS")
+        .start()
+        .await;
+    let env = Env::new().await;
+    env.add_account("alice", &server, USER, Some(PASSWORD))
+        .await;
+    let _daemon = env.daemon(&["--check-interval", "3600"]).await;
+    let mut events = Events::subscribe(&env).await;
+    succeeded(&sync_soon(&env).await);
+
+    // The first delete is refused for good and leaves its flag on the server.
+    let one = env.id("INBOX", 1);
+    succeeded(&env.act(&["delete", "--permanently", &one]).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(server.flags("INBOX", 1), flags(&["\\Deleted"]));
+    assert_eq!(env.deleted_left_rows(), 1);
+
+    // A second one waits for its next try, and a sync runs meanwhile: the message is not in the
+    // copy then, but only because it is being deleted.
+    succeeded(&env.act(&["delete", "--permanently", &one]).await);
+    assert_eq!(events.action().await["outcome"], "retried");
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(env.deleted_left_rows(), 1);
+
+    // Refused for good again: the flag is still there, and still said.
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(server.flags("INBOX", 1), flags(&["\\Deleted"]));
+    succeeded(&sync_soon(&env).await);
+    eventually(10, "the message back in the copy", || {
+        env.uids("INBOX") == [1, 2]
+    })
+    .await;
+    assert_eq!(env.deleted_left_rows(), 1);
+}
