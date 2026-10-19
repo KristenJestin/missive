@@ -277,6 +277,84 @@ fn the_reader_keys_open_a_compose_window(cx: &mut TestAppContext) {
     assert!(subjects(cx).contains(&"Fwd: Plan 3".to_owned()));
 }
 
+/// The compose windows open, by subject.
+fn compose_windows(cx: &mut VisualTestContext) -> Vec<String> {
+    cx.update(|_, cx| {
+        cx.windows()
+            .into_iter()
+            .filter_map(|w| w.downcast::<ComposeWindow>())
+            .map(|w| w.read(cx).unwrap().model.subject.clone())
+            .collect()
+    })
+}
+
+#[gpui_kit::test]
+fn a_draft_is_opened_in_one_window_however_many_times_it_is_asked_for(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let drafts = missive_core::fake::Folder::new("Drafts")
+        .special_use(missive_core::fake::SpecialUse::Drafts)
+        .message(missive_core::fake::Message::new(
+            "X-Missive-Draft: 1\r\nFrom: alice@example.org\r\nTo: zoe@example.com\r\n\
+             Subject: One draft\r\nMessage-ID: <one@example.org>\r\n\r\nHello\r\n",
+        ))
+        .message(missive_core::fake::Message::new(
+            "X-Missive-Draft: 1\r\nFrom: alice@example.org\r\nTo: zoe@example.com\r\n\
+             Subject: Another draft\r\nMessage-ID: <two@example.org>\r\n\r\nHello\r\n",
+        ));
+    let mail = runtime.block_on(Mail::new(mailbox().folder(drafts)));
+    let (asker, _) = asker();
+    cx.update(|cx| {
+        gpui_kit::base::init(cx);
+        view::bind_keys(cx);
+    });
+    let opener: Opener = Arc::new(|_| {});
+    let mut model = mail.model();
+    let folder = model.accounts[0]
+        .folders
+        .iter()
+        .find(|f| f.folder.role.as_deref() == Some("drafts"))
+        .unwrap()
+        .folder
+        .id;
+    model.select_folder(ID, folder);
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| MailWindow::new(model, opener, asker, window, cx));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("e");
+    cx.run_until_parked();
+    assert_eq!(compose_windows(cx).len(), 1);
+    // The same draft again, with the first window still open: it is not opened twice.
+    cx.simulate_keystrokes("e");
+    cx.run_until_parked();
+    assert_eq!(compose_windows(cx).len(), 1);
+
+    // Another draft has a window of its own.
+    cx.simulate_keystrokes("down e");
+    cx.run_until_parked();
+    let subjects = compose_windows(cx);
+    assert_eq!(subjects.len(), 2, "{subjects:?}");
+    assert_ne!(subjects[0], subjects[1]);
+
+    // Once the window is closed, the draft opens again.
+    let first = cx.update(|_, cx| {
+        cx.windows()
+            .into_iter()
+            .find_map(|w| w.downcast::<ComposeWindow>())
+            .unwrap()
+    });
+    cx.update(|_, cx| {
+        first
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap()
+    });
+    cx.run_until_parked();
+    assert_eq!(compose_windows(cx).len(), 1);
+    cx.simulate_keystrokes("up e");
+    cx.run_until_parked();
+    assert_eq!(compose_windows(cx).len(), 2);
+}
+
 #[gpui_kit::test]
 fn files_dropped_on_the_window_are_attached_and_the_unreadable_ones_are_named(
     cx: &mut TestAppContext,

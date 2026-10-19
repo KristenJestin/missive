@@ -13,13 +13,13 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     App, ClickEvent, Context, ElementId, FocusHandle, FontWeight, KeyBinding, MouseButton, Rgba,
     ScrollStrategy, SharedString, SharedUri, StyleRefinement, UniformListScrollHandle, Window,
-    WindowAppearance, actions, div, px, rems, rgb, uniform_list,
+    WindowAppearance, WindowHandle, actions, div, px, rems, rgb, uniform_list,
 };
 use missive_core::copy::{Person, local_time};
 use missive_core::opener::followable;
 use missive_core::protocol::{Answer, Command};
 
-use crate::compose_view::{self, Chooser};
+use crate::compose_view::{self, Chooser, ComposeWindow};
 use crate::images::MessageImages;
 use crate::model::{Body, Daemon, Model, Opened, Reader, Start};
 
@@ -100,6 +100,10 @@ pub struct MailWindow {
     font: Option<SharedString>,
     /// The file chooser of the compose windows this window opens.
     chooser: Chooser,
+    /// The compose windows it opened, still open or not yet noticed closed: a draft that has one
+    /// is brought forward rather than opened a second time, where each window's save would
+    /// replace the other's.
+    composing: Vec<WindowHandle<ComposeWindow>>,
 }
 
 impl MailWindow {
@@ -130,6 +134,7 @@ impl MailWindow {
             asker,
             asking: false,
             chooser: Arc::new(|| Err("the file chooser is not available".to_owned())),
+            composing: Vec::new(),
         }
     }
 
@@ -142,12 +147,36 @@ impl MailWindow {
     /// Opens a compose window for `start`, when the model has something to start from.
     pub fn compose(&mut self, start: Start, cx: &mut Context<Self>) {
         if let Some(compose) = self.model.compose(start)
-            && let Err(e) =
-                compose_view::open(compose, self.asker.clone(), self.chooser.clone(), cx)
+            && !self.bring_forward(compose.draft_key(), cx)
         {
-            self.model.notice = Some(format!("The compose window cannot open: {e}."));
+            match compose_view::open(compose, self.asker.clone(), self.chooser.clone(), cx) {
+                Ok(window) => self.composing.push(window),
+                Err(e) => {
+                    self.model.notice = Some(format!("The compose window cannot open: {e}."));
+                }
+            }
         }
         self.changed(cx);
+    }
+
+    /// Brings forward the compose window already open on the draft `key` (its `Message-ID`),
+    /// if there is one. The windows found closed are forgotten.
+    fn bring_forward(&mut self, key: Option<&str>, cx: &mut Context<Self>) -> bool {
+        let mut found = false;
+        self.composing.retain(|window| {
+            let Ok(same) =
+                window.read_with(cx, |open, _| key.is_some() && open.model.draft_key() == key)
+            else {
+                return false;
+            };
+            if same && !found {
+                found = window
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok();
+            }
+            true
+        });
+        found
     }
 
     /// After the model changed: the open message is reduced off this thread, its read timer
