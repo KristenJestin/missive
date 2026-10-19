@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{ID, Mail, mailbox};
-use gpui_kit::{AnyWindowHandle, Modifiers, TestAppContext, VisualContext, VisualTestContext};
+use gpui_kit::{
+    AnyWindowHandle, ExternalPaths, FileDropEvent, Modifiers, TestAppContext, VisualContext,
+    VisualTestContext,
+};
 use missive_core::protocol::{Answer, Command, PROTOCOL, SaveDraft};
 use missive_window::compose::{Compose, Field, SAVE_AFTER, State};
 use missive_window::compose_view::{Chooser, ComposeWindow};
@@ -272,4 +275,127 @@ fn the_reader_keys_open_a_compose_window(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(subjects(cx).len(), 2);
     assert!(subjects(cx).contains(&"Fwd: Plan 3".to_owned()));
+}
+
+/// The compose windows open, by subject.
+fn compose_windows(cx: &mut VisualTestContext) -> Vec<String> {
+    cx.update(|_, cx| {
+        cx.windows()
+            .into_iter()
+            .filter_map(|w| w.downcast::<ComposeWindow>())
+            .map(|w| w.read(cx).unwrap().model.subject.clone())
+            .collect()
+    })
+}
+
+#[gpui_kit::test]
+fn a_draft_is_opened_in_one_window_however_many_times_it_is_asked_for(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let drafts = missive_core::fake::Folder::new("Drafts")
+        .special_use(missive_core::fake::SpecialUse::Drafts)
+        .message(missive_core::fake::Message::new(
+            "X-Missive-Draft: 1\r\nFrom: alice@example.org\r\nTo: zoe@example.com\r\n\
+             Subject: One draft\r\nMessage-ID: <one@example.org>\r\n\r\nHello\r\n",
+        ))
+        .message(missive_core::fake::Message::new(
+            "X-Missive-Draft: 1\r\nFrom: alice@example.org\r\nTo: zoe@example.com\r\n\
+             Subject: Another draft\r\nMessage-ID: <two@example.org>\r\n\r\nHello\r\n",
+        ));
+    let mail = runtime.block_on(Mail::new(mailbox().folder(drafts)));
+    let (asker, _) = asker();
+    cx.update(|cx| {
+        gpui_kit::base::init(cx);
+        view::bind_keys(cx);
+    });
+    let opener: Opener = Arc::new(|_| {});
+    let mut model = mail.model();
+    let folder = model.accounts[0]
+        .folders
+        .iter()
+        .find(|f| f.folder.role.as_deref() == Some("drafts"))
+        .unwrap()
+        .folder
+        .id;
+    model.select_folder(ID, folder);
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| MailWindow::new(model, opener, asker, window, cx));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("e");
+    cx.run_until_parked();
+    assert_eq!(compose_windows(cx).len(), 1);
+    // The same draft again, with the first window still open: it is not opened twice.
+    cx.simulate_keystrokes("e");
+    cx.run_until_parked();
+    assert_eq!(compose_windows(cx).len(), 1);
+
+    // Another draft has a window of its own.
+    cx.simulate_keystrokes("down e");
+    cx.run_until_parked();
+    let subjects = compose_windows(cx);
+    assert_eq!(subjects.len(), 2, "{subjects:?}");
+    assert_ne!(subjects[0], subjects[1]);
+
+    // Once the window is closed, the draft opens again.
+    let first = cx.update(|_, cx| {
+        cx.windows()
+            .into_iter()
+            .find_map(|w| w.downcast::<ComposeWindow>())
+            .unwrap()
+    });
+    cx.update(|_, cx| {
+        first
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap()
+    });
+    cx.run_until_parked();
+    assert_eq!(compose_windows(cx).len(), 1);
+    cx.simulate_keystrokes("up e");
+    cx.run_until_parked();
+    assert_eq!(compose_windows(cx).len(), 2);
+}
+
+#[gpui_kit::test]
+fn files_dropped_on_the_window_are_attached_and_the_unreadable_ones_are_named(
+    cx: &mut TestAppContext,
+) {
+    let folder = tempfile::tempdir().unwrap();
+    let notes = folder.path().join("notes.txt");
+    std::fs::write(&notes, "Notes").unwrap();
+    let report = folder.path().join("report é.pdf");
+    std::fs::write(&report, "%PDF-1.7").unwrap();
+    let missing = folder.path().join("gone.txt");
+    let (asker, _) = asker();
+    let cx = window(cx, new_message(), asker, no_chooser());
+    let at = cx.debug_bounds("attach").unwrap().center();
+
+    // What a compositor sends when files are dragged over the window and let go.
+    let paths = ExternalPaths([notes, report, missing].into_iter().collect());
+    cx.simulate_event(FileDropEvent::Entered {
+        position: at,
+        paths,
+    });
+    cx.simulate_event(FileDropEvent::Pending { position: at });
+    cx.simulate_event(FileDropEvent::Submit { position: at });
+    cx.executor().run_until_parked();
+    cx.run_until_parked();
+
+    let (names, notice, saves) = cx.update(|window, cx| {
+        let root = window.root::<ComposeWindow>().flatten().unwrap();
+        let root = root.read(cx);
+        (
+            root.model
+                .attachments
+                .iter()
+                .map(|a| a.name.clone())
+                .collect::<Vec<_>>(),
+            root.model.notice.clone().unwrap_or_default(),
+            root.model.needs_save(),
+        )
+    });
+    assert_eq!(names, ["notes.txt", "report é.pdf"]);
+    assert!(notice.contains("gone.txt"), "{notice}");
+    assert!(saves, "the draft is saved with them once the typing stops");
+    // They are shown, each with its Remove button.
+    assert!(cx.debug_bounds("remove-1").is_some());
 }

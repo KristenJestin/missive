@@ -9,7 +9,9 @@
 //! a blind copy. A server that saves sent mail itself keeps what it was sent, without them.
 //!
 //! A draft Missive writes carries [`OWN_DRAFT`] (`X-Missive-Draft: 1`), and only such a draft is
-//! ever replaced or removed by Missive; the message sent from it does not carry it.
+//! ever replaced or removed by Missive; the message sent from it does not carry it. The same
+//! goes for the link to the message a draft answers or forwards ([`Followup`]): a header of the
+//! draft alone, so that a draft picked up again later still marks the original once sent.
 
 use mail_builder::MessageBuilder;
 use mail_builder::headers::Header;
@@ -124,6 +126,65 @@ pub fn is_own_draft(raw: &[u8]) -> bool {
         .is_some_and(|parsed| parsed.header(OWN_DRAFT).is_some())
 }
 
+/// The header of a draft that names the message it answers (its identifier, as `list` prints it).
+pub const ANSWERS: &str = "X-Missive-Answers";
+
+/// The same for the message it forwards.
+pub const FORWARDS: &str = "X-Missive-Forwards";
+
+/// The message a draft is a reply to or a forward of, to mark answered or forwarded once it is
+/// sent. Kept in the draft, never in the message sent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Followup {
+    pub answers: Option<String>,
+    pub forwards: Option<String>,
+}
+
+impl Followup {
+    /// What a draft Missive wrote says it follows up. A draft of another client says nothing,
+    /// whatever its headers.
+    pub fn read(raw: &[u8]) -> Followup {
+        let Some(parsed) = MessageParser::default().parse_headers(raw) else {
+            return Followup::default();
+        };
+        if parsed.header(OWN_DRAFT).is_none() {
+            return Followup::default();
+        }
+        let text = |name: &str| {
+            parsed
+                .header(name)
+                .and_then(HeaderValue::as_text)
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty())
+        };
+        Followup {
+            answers: text(ANSWERS),
+            forwards: text(FORWARDS),
+        }
+    }
+
+    /// Whether it can be written as a header: one message, named by something that is no more
+    /// than an identifier (no line break, no space).
+    pub fn check(&self) -> Result<(), String> {
+        if self.answers.is_some() && self.forwards.is_some() {
+            return Err("a message answers or forwards another, not both".to_owned());
+        }
+        for id in self.answers.iter().chain(&self.forwards) {
+            if !is_identifier(id) {
+                return Err(format!("{id:?} is not a message identifier"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `Message-ID` of a draft, without its angle brackets: the same for every version of it.
+pub fn draft_message_id(raw: &[u8]) -> Option<String> {
+    MessageParser::default()
+        .parse_headers(raw)
+        .and_then(|parsed| parsed.message_id().map(str::to_owned))
+}
+
 impl Draft {
     /// Whether it can be sent: it has a recipient, and can be written.
     pub fn check(&self) -> Result<(), String> {
@@ -157,6 +218,19 @@ impl Draft {
 }
 
 impl Draft {
+    /// Gives the draft these attachments. Its HTML alternative may draw an image from one of
+    /// them (`cid:`): taking an attachment off would leave a broken image, so the HTML part is
+    /// dropped when one goes and the HTML refers to the message's own parts. Whether it was.
+    pub fn set_attachments(&mut self, attachments: Vec<Attachment>) -> bool {
+        let removed = self
+            .attachments
+            .iter()
+            .any(|old| !attachments.contains(old));
+        self.attachments = attachments;
+        let draws = |html: &str| html.to_ascii_lowercase().contains("cid:");
+        removed && self.html.as_deref().is_some_and(draws) && self.html.take().is_some()
+    }
+
     /// Gives the draft this text. Its HTML alternative stays when the text is the one it has
     /// (line ends aside: a window or a pipe does not write them as the message holds them), and
     /// is dropped when the text differs, since it would say something else than the text. Whether
@@ -247,10 +321,15 @@ pub struct Built {
 }
 
 impl Built {
-    /// The message as it is kept in the Drafts folder: [`OWN_DRAFT`], its Bcc header, then the
-    /// message.
-    pub fn as_draft(&self) -> Vec<u8> {
+    /// The message as it is kept in the Drafts folder: [`OWN_DRAFT`], the message it follows up
+    /// (`followup`, which has been checked), its Bcc header, then the message.
+    pub fn as_draft(&self, followup: &Followup) -> Vec<u8> {
         let mut raw = format!("{OWN_DRAFT}: 1\r\n").into_bytes();
+        for (name, id) in [(ANSWERS, &followup.answers), (FORWARDS, &followup.forwards)] {
+            if let Some(id) = id {
+                raw.extend(format!("{name}: {id}\r\n").into_bytes());
+            }
+        }
         raw.extend(self.bcc_header.iter().flatten());
         raw.extend_from_slice(&self.raw);
         raw
@@ -600,11 +679,79 @@ mod tests {
         let built = write(&account(), &draft, 0, Some("same@example.org")).unwrap();
         assert_eq!(built.message_id, "same@example.org");
 
-        assert_eq!(Draft::read(&built.as_draft()).unwrap(), draft);
-        assert!(is_own_draft(&built.as_draft()));
+        assert_eq!(
+            Draft::read(&built.as_draft(&Followup::default())).unwrap(),
+            draft
+        );
+        assert!(is_own_draft(&built.as_draft(&Followup::default())));
         // Without its Bcc header, the message sent reads back without them, and is no draft.
         assert!(Draft::read(&built.raw).unwrap().bcc.is_empty());
         assert!(!is_own_draft(&built.raw));
+    }
+
+    #[test]
+    fn a_draft_keeps_the_message_it_answers_or_forwards_and_the_message_sent_does_not() {
+        let draft = Draft {
+            to: vec![mailbox("zoe@example.com")],
+            ..Draft::default()
+        };
+        let built = write(&account(), &draft, 0, Some("same@example.org")).unwrap();
+        for (followup, header) in [
+            (
+                Followup {
+                    answers: Some("alice/1/2/3".to_owned()),
+                    forwards: None,
+                },
+                "X-Missive-Answers: alice/1/2/3",
+            ),
+            (
+                Followup {
+                    answers: None,
+                    forwards: Some("alice/1/2/4".to_owned()),
+                },
+                "X-Missive-Forwards: alice/1/2/4",
+            ),
+        ] {
+            let kept = built.as_draft(&followup);
+            assert!(String::from_utf8_lossy(&kept).contains(header), "{header}");
+            assert_eq!(Followup::read(&kept), followup);
+            assert_eq!(Draft::read(&kept).unwrap(), draft);
+        }
+        // Only the draft carries the link: the message that goes out never does.
+        let raw = String::from_utf8_lossy(&built.raw);
+        assert!(!raw.contains("X-Missive"), "{raw}");
+        assert_eq!(
+            Followup::read(&built.as_draft(&Followup::default())),
+            Followup::default()
+        );
+    }
+
+    #[test]
+    fn a_draft_of_another_client_follows_nothing_even_with_the_header() {
+        let raw = b"X-Missive-Answers: alice/1/2/3\r\nFrom: a@example.org\r\n\r\nHi\r\n";
+        assert_eq!(Followup::read(raw), Followup::default());
+    }
+
+    #[test]
+    fn a_followup_that_would_start_a_header_or_name_two_messages_is_refused() {
+        for id in ["a\r\nBcc: evil@example.net", "a b", "<a>", ""] {
+            let followup = Followup {
+                answers: Some(id.to_owned()),
+                forwards: None,
+            };
+            assert!(followup.check().is_err(), "{id:?}");
+            let followup = Followup {
+                answers: None,
+                forwards: Some(id.to_owned()),
+            };
+            assert!(followup.check().is_err(), "{id:?}");
+        }
+        let both = Followup {
+            answers: Some("alice/1/2/3".to_owned()),
+            forwards: Some("alice/1/2/4".to_owned()),
+        };
+        assert!(both.check().is_err());
+        assert!(Followup::default().check().is_ok());
     }
 
     #[test]
@@ -681,6 +828,53 @@ mod tests {
         assert_eq!(draft.body, "Something else");
         // Nothing to drop: not said.
         assert!(!draft.set_body("Again something else".to_owned()));
+    }
+
+    #[test]
+    fn taking_off_an_attachment_the_html_may_draw_from_drops_the_html_part() {
+        let logo = Attachment {
+            name: "logo.png".to_owned(),
+            data: b"png".to_vec(),
+        };
+        let notes = Attachment {
+            name: "notes.txt".to_owned(),
+            data: b"notes".to_vec(),
+        };
+        let drawing = "<p>Hi <img src=\"cid:logo@example.org\"></p>";
+        let draft = |html: &str| Draft {
+            body: "Hi".to_owned(),
+            html: Some(html.to_owned()),
+            attachments: vec![logo.clone(), notes.clone()],
+            ..Draft::default()
+        };
+
+        // Everything off: the image the HTML draws is gone, and so is the HTML.
+        let mut all_off = draft(drawing);
+        assert!(all_off.set_attachments(Vec::new()));
+        assert_eq!((all_off.html, all_off.attachments), (None, Vec::new()));
+        // Any attachment off may be the one it draws from.
+        let mut one_off = draft(drawing);
+        assert!(one_off.set_attachments(vec![logo.clone()]));
+        assert_eq!(one_off.html, None);
+        // Nothing taken off (the same ones, one more, another order): the HTML stays.
+        let mut kept = draft(drawing);
+        assert!(!kept.set_attachments(vec![notes.clone(), logo.clone()]));
+        let extra = Attachment {
+            name: "more.txt".to_owned(),
+            data: Vec::new(),
+        };
+        assert!(!kept.set_attachments(vec![logo.clone(), notes.clone(), extra]));
+        assert!(kept.html.is_some());
+        // An HTML that draws from no part has nothing to lose.
+        let mut plain = draft("<p>Hi <img src=\"https://images.example.org/a.png\"></p>");
+        assert!(!plain.set_attachments(Vec::new()));
+        assert!(plain.html.is_some());
+        // A text draft has no HTML to drop.
+        let mut text = Draft {
+            attachments: vec![logo],
+            ..Draft::default()
+        };
+        assert!(!text.set_attachments(Vec::new()));
     }
 
     #[test]

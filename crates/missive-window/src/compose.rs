@@ -12,9 +12,9 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use missive_core::compose::{Attachment, Draft, Mailbox};
+use missive_core::compose::{self, Attachment, Draft, Followup, Mailbox};
 use missive_core::protocol::{Answer, Attached, Command, SaveDraft};
-use missive_core::reply::{self, Answering};
+use missive_core::reply::{self, Answering, Mode, Original};
 
 /// How long after the last change the draft is saved.
 pub const SAVE_AFTER: Duration = Duration::from_secs(3);
@@ -58,6 +58,17 @@ struct InFlight {
     attachments: u64,
 }
 
+/// What the recipients of a reply come from.
+struct RecipientsOf {
+    original: Original,
+    mode: Mode,
+    /// Each account's address, by account.
+    addresses: Vec<(String, String)>,
+    /// The To and Cc the account chosen gave them: changed by the user since, they are theirs.
+    to: String,
+    cc: String,
+}
+
 pub struct Compose {
     /// The accounts the message can be written from.
     pub accounts: Vec<String>,
@@ -78,6 +89,12 @@ pub struct Compose {
     forwards: Option<String>,
     /// The draft's identifier, once the daemon saved it.
     pub draft: Option<String>,
+    /// The draft's `Message-ID`, which every version of it keeps: what tells that two windows
+    /// are on the same draft, whichever way each was opened.
+    message_id: Option<String>,
+    /// A reply: what its recipients are worked out from, to work them out again when the
+    /// sending account changes.
+    recipients_of: Option<RecipientsOf>,
     pub state: State,
     /// Changes made, and those the daemon saved.
     edits: u64,
@@ -89,6 +106,11 @@ pub struct Compose {
     save_wanted: bool,
     send_wanted: bool,
     in_flight: Option<InFlight>,
+    /// The change a send was asked with, when the daemon's answer to it was lost: the message
+    /// may be in the outbox as it was then.
+    unconfirmed_send: Option<u64>,
+    /// The notice tells what the last answer changed: the next answer leaves it.
+    keep_notice: bool,
     save_timer: Option<SaveTimer>,
     /// Closing waits for the draft's save; a save that failed lets the next close discard.
     closing: bool,
@@ -115,6 +137,8 @@ impl Compose {
             answers: None,
             forwards: None,
             draft: None,
+            message_id: None,
+            recipients_of: None,
             state: State::Editing,
             edits: 0,
             saved: 0,
@@ -123,6 +147,8 @@ impl Compose {
             save_wanted: false,
             send_wanted: false,
             in_flight: None,
+            unconfirmed_send: None,
+            keep_notice: false,
             save_timer: None,
             closing: false,
             close_failed: false,
@@ -149,6 +175,27 @@ impl Compose {
         compose
     }
 
+    /// Remembers what the recipients of this reply come from (the original message, as
+    /// [`Compose::answering`] was given it, and each account's address), so that choosing
+    /// another sending account works them out again.
+    pub fn with_recipients_of(
+        mut self,
+        raw: &[u8],
+        mode: Mode,
+        addresses: Vec<(String, String)>,
+    ) -> Compose {
+        if let Ok(original) = Original::read(raw) {
+            self.recipients_of = Some(RecipientsOf {
+                original,
+                mode,
+                addresses,
+                to: self.to.clone(),
+                cc: self.cc.clone(),
+            });
+        }
+        self
+    }
+
     /// A draft picked up again: `id` names it as the daemon's `draft` request takes it, `raw` is
     /// its latest version.
     pub fn draft(
@@ -168,6 +215,10 @@ impl Compose {
         compose.attachments = draft.attachments;
         compose.in_reply_to = draft.in_reply_to.into_iter().next();
         compose.references = draft.references;
+        let followup = Followup::read(raw);
+        compose.answers = followup.answers;
+        compose.forwards = followup.forwards;
+        compose.message_id = compose::draft_message_id(raw);
         compose.draft = Some(id);
         Ok(compose)
     }
@@ -209,8 +260,38 @@ impl Compose {
             && self.accounts.iter().any(|a| a == account)
         {
             self.account = account.to_owned();
+            self.recompute_recipients();
             self.changed();
         }
+    }
+
+    /// The reply's recipients as the account now chosen writes them (its own address is left
+    /// out, and the previous account's, which was, comes back), unless the user changed them:
+    /// then they are theirs, and the notice says what to look at.
+    fn recompute_recipients(&mut self) {
+        let Some(basis) = &mut self.recipients_of else {
+            return;
+        };
+        let Some((_, own)) = basis.addresses.iter().find(|(id, _)| *id == self.account) else {
+            return;
+        };
+        if self.to != basis.to || self.cc != basis.cc {
+            self.notice = Some(format!(
+                "The recipients are as you wrote them: check that {own}, the address you now \
+                 write from, is not among them."
+            ));
+            return;
+        }
+        let reply = reply::reply(&basis.original, basis.mode, own);
+        self.to = texts(&reply.to);
+        self.cc = texts(&reply.cc);
+        basis.to = self.to.clone();
+        basis.cc = self.cc.clone();
+    }
+
+    /// The draft's `Message-ID`, once known: two windows with the same one are on the same draft.
+    pub fn draft_key(&self) -> Option<&str> {
+        self.message_id.as_deref()
     }
 
     /// Attaches the files [`load`] read, and says why the others were not.
@@ -345,8 +426,8 @@ impl Compose {
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
             send,
-            answers: if send { self.answers.clone() } else { None },
-            forwards: if send { self.forwards.clone() } else { None },
+            answers: self.answers.clone(),
+            forwards: self.forwards.clone(),
         }))
     }
 
@@ -358,10 +439,12 @@ impl Compose {
         let refused = match answer {
             Ok(answer) if answer.ok => {
                 if let Some(id) = answer.message_id {
+                    self.message_id = Some(id.clone());
                     self.draft = Some(id);
                 }
                 self.saved = asked.edits;
                 self.attachments_saved = asked.attachments;
+                self.unconfirmed_send = None;
                 if asked.send {
                     self.state = State::Sent;
                 } else if self.closing && self.state == State::Editing {
@@ -372,24 +455,88 @@ impl Compose {
                         self.state = State::Closed;
                     }
                 }
-                if !self.closing && self.state != State::Sending {
+                if self.keep_notice {
+                    self.keep_notice = false;
+                } else if !self.closing && self.state != State::Sending {
                     self.notice = None;
                 }
-                return;
-            }
-            // The draft is already in the outbox: a send whose answer was lost, asked again.
-            Ok(answer) if asked.send && answer.error.as_deref() == Some("busy") => {
-                self.state = State::Sent;
-                return;
-            }
-            Ok(answer) => {
-                let error = answer.error.unwrap_or_default();
-                match answer.message {
-                    Some(message) => format!("refused ({error}): {message}"),
-                    None => format!("refused ({error})"),
+                if answer.html_dropped {
+                    self.notice = Some(
+                        "The draft's HTML version is dropped (the text changed, or an attachment \
+                         it draws from was taken off): the message goes as plain text."
+                            .to_owned(),
+                    );
                 }
+                return;
             }
-            Err(e) => format!("the daemon could not be asked ({e})"),
+            // The draft is already in the outbox: a send whose answer was lost, asked again. If
+            // the user typed since, the message queued does not have it: it is kept as a new
+            // draft.
+            Ok(answer) if asked.send && answer.error.as_deref() == Some("busy") => {
+                if self
+                    .unconfirmed_send
+                    .take()
+                    .is_some_and(|sent| sent != asked.edits)
+                {
+                    self.draft = None;
+                    self.message_id = None;
+                    self.answers = None;
+                    self.forwards = None;
+                    self.state = State::Editing;
+                    self.save_wanted = true;
+                    self.keep_notice = true;
+                    self.notice = Some(
+                        "The message was already on its way without your last changes. They are \
+                         kept in a new draft."
+                            .to_owned(),
+                    );
+                } else {
+                    self.state = State::Sent;
+                }
+                return;
+            }
+            // Sent already: the daemon saved what the request changed as a new draft.
+            Ok(answer) if asked.send && answer.error.as_deref() == Some("already-sent") => {
+                if let Some(id) = answer.message_id {
+                    self.message_id = Some(id.clone());
+                    self.notice = Some(format!(
+                        "Already sent: your changes are saved as a new draft, {id}. Send again to \
+                         send them as a new message."
+                    ));
+                    self.draft = Some(id);
+                    self.saved = asked.edits;
+                    self.attachments_saved = asked.attachments;
+                    self.state = State::Editing;
+                    self.send_wanted = false;
+                    return;
+                }
+                refused_text(answer)
+            }
+            // The message this answers is gone from the copy (moved, deleted): there is nothing
+            // to mark any more, and the text is not refused for it.
+            Ok(answer) if self.link_lost(&answer) => {
+                self.answers = None;
+                self.forwards = None;
+                if asked.send {
+                    self.send_wanted = true;
+                } else if !self.send_wanted {
+                    self.save_wanted = true;
+                }
+                self.keep_notice = true;
+                self.notice = Some(
+                    "The message this answers is no longer in the local copy: it will not be \
+                     marked."
+                        .to_owned(),
+                );
+                return;
+            }
+            Ok(answer) => refused_text(answer),
+            Err(e) => {
+                if asked.send {
+                    self.unconfirmed_send = Some(asked.edits);
+                }
+                format!("the daemon could not be asked ({e})")
+            }
         };
         let what = if self.state == State::Sending {
             "Not sent"
@@ -408,6 +555,18 @@ impl Compose {
         self.notice = Some(format!(
             "{what}, {refused}. What you wrote is kept in this window.{then}"
         ));
+    }
+
+    /// Whether the daemon refused the request because the message it answers or forwards is not
+    /// in the copy: the identifier is in what it says.
+    fn link_lost(&self, answer: &Answer) -> bool {
+        answer.error.as_deref() == Some("no-such-message")
+            && answer.message.as_deref().is_some_and(|message| {
+                self.answers
+                    .iter()
+                    .chain(&self.forwards)
+                    .any(|id| message.contains(id.as_str()))
+            })
     }
 
     /// Whether something changed since the last save, and is worth a draft: a new message left
@@ -430,6 +589,15 @@ impl Compose {
             edits: self.edits,
             after: SAVE_AFTER,
         });
+    }
+}
+
+/// What a refusal says, for people.
+fn refused_text(answer: Answer) -> String {
+    let error = answer.error.unwrap_or_default();
+    match answer.message {
+        Some(message) => format!("refused ({error}): {message}"),
+        None => format!("refused ({error})"),
     }
 }
 

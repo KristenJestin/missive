@@ -493,3 +493,343 @@ async fn the_window_started_on_a_draft_shows_it_and_one_not_in_the_copy_says_so(
     assert!(missing.notice.unwrap().contains("gone@example.org"));
     assert_eq!(missing.draft, None);
 }
+
+fn own_draft_of(header: &str) -> Vec<u8> {
+    format!(
+        "X-Missive-Draft: 1\r\n{header}\r\nTo: zoe@example.com\r\nSubject: Re: Plans\r\n\
+         Message-ID: <d@example.org>\r\n\r\nHello\r\n"
+    )
+    .into_bytes()
+}
+
+fn picked_up(raw: &[u8]) -> Compose {
+    Compose::draft(
+        vec![ID.to_owned()],
+        ID.to_owned(),
+        "alice/3/1/5".to_owned(),
+        raw,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_reply_names_the_message_it_answers_in_every_save_not_only_in_the_send() {
+    // What a reply from the reader starts with, as `answering` gives it.
+    let mut reply = Compose::answering(
+        vec![ID.to_owned()],
+        ID.to_owned(),
+        missive_core::reply::Answering {
+            answers: Some("alice/3/1/5".to_owned()),
+            ..Default::default()
+        },
+    );
+    reply.edit(Field::Body, "Noon.".to_owned());
+    let timer = reply.take_save_timer().unwrap();
+    reply.save_timer_elapsed(timer);
+    let save = draft(reply.take_request().unwrap());
+    assert!(!save.send);
+    assert_eq!(save.answers.as_deref(), Some("alice/3/1/5"));
+    assert_eq!(save.forwards, None);
+}
+
+#[test]
+fn a_draft_picked_up_again_remembers_the_message_it_answers_or_forwards() {
+    let mut answering = picked_up(&own_draft_of("X-Missive-Answers: alice/3/1/5"));
+    let save = draft(type_and_wait(&mut answering, Field::Body, "Noon.").unwrap());
+    assert_eq!(save.answers.as_deref(), Some("alice/3/1/5"));
+    assert_eq!(save.forwards, None);
+    answering.answered(saved("d@example.org"));
+    answering.send();
+    let send = draft(answering.take_request().unwrap());
+    assert!(send.send);
+    assert_eq!(send.answers.as_deref(), Some("alice/3/1/5"));
+
+    let mut forwarding = picked_up(&own_draft_of("X-Missive-Forwards: alice/3/1/6"));
+    let save = draft(type_and_wait(&mut forwarding, Field::Body, "FYI").unwrap());
+    assert_eq!(save.forwards.as_deref(), Some("alice/3/1/6"));
+    assert_eq!(save.answers, None);
+}
+
+#[test]
+fn a_draft_of_another_client_names_nothing_it_answers() {
+    let raw = b"X-Missive-Answers: alice/3/1/5\r\nTo: zoe@example.com\r\nSubject: Re: Plans\r\n\
+        Message-ID: <d@example.org>\r\n\r\nHello\r\n";
+    let mut compose = picked_up(raw);
+    let save = draft(type_and_wait(&mut compose, Field::Body, "Noon.").unwrap());
+    assert_eq!((save.answers, save.forwards), (None, None));
+}
+
+#[test]
+fn the_message_a_reply_answers_being_gone_the_link_is_dropped_and_the_text_still_goes() {
+    let mut compose = picked_up(&own_draft_of("X-Missive-Answers: alice/3/1/5"));
+    compose.edit(Field::Body, "Noon.".to_owned());
+    compose.send();
+    let first = draft(compose.take_request().unwrap());
+    assert_eq!(first.answers.as_deref(), Some("alice/3/1/5"));
+    assert!(first.send);
+
+    // Moved or deleted since: its identifier names nothing now.
+    compose.answered(Ok(Answer::error(
+        Some("draft"),
+        "no-such-message",
+        "alice/3/1/5: no such message in the local copy",
+    )));
+    assert_eq!(compose.state, State::Sending, "the send goes on");
+    let notice = compose.notice.clone().unwrap();
+    assert!(notice.contains("not be marked"), "{notice}");
+    let again = draft(compose.take_request().expect("asked again at once"));
+    assert!(again.send);
+    assert_eq!(again.answers, None);
+    assert_eq!(again.body.as_deref(), Some("Noon."));
+
+    compose.answered(saved("d@example.org"));
+    assert!(compose.done());
+}
+
+#[test]
+fn a_save_refused_for_the_message_it_answers_is_asked_again_without_the_link() {
+    let mut compose = picked_up(&own_draft_of("X-Missive-Answers: alice/3/1/5"));
+    let first = draft(type_and_wait(&mut compose, Field::Body, "Noon.").unwrap());
+    assert_eq!(first.answers.as_deref(), Some("alice/3/1/5"));
+    compose.answered(Ok(Answer::error(
+        Some("draft"),
+        "no-such-message",
+        "alice/3/1/5: no such message in the local copy",
+    )));
+    let again = draft(compose.take_request().expect("saved again at once"));
+    assert_eq!(again.answers, None);
+    compose.answered(saved("d@example.org"));
+    // The notice stays until the next change.
+    assert!(compose.notice.as_deref().unwrap().contains("not be marked"));
+    assert_eq!(compose.take_request(), None);
+}
+
+#[test]
+fn a_draft_that_names_no_message_of_its_own_stays_refused() {
+    // The error is about the draft, not about the message it answers: no link is dropped.
+    let mut compose = picked_up(&own_draft_of("X-Missive-Answers: alice/3/1/5"));
+    type_and_wait(&mut compose, Field::Body, "Noon.").unwrap();
+    compose.answered(Ok(Answer::error(
+        Some("draft"),
+        "no-such-message",
+        "d@example.org: no such draft in the local copy",
+    )));
+    assert!(compose.notice.as_deref().unwrap().contains("Not saved"));
+    assert_eq!(compose.take_request(), None);
+}
+
+#[test]
+fn edits_made_after_a_lost_send_are_kept_as_a_new_draft_when_the_daemon_says_busy() {
+    let mut compose = new_message();
+    type_and_wait(&mut compose, Field::To, "zoe@example.com").unwrap();
+    compose.answered(saved("d@example.org"));
+    compose.edit(Field::Body, "First words".to_owned());
+    compose.send();
+    draft(compose.take_request().unwrap());
+    // The answer was lost: the message may be in the outbox as it was.
+    compose.answered(Err("the connection was cut".to_owned()));
+    compose.edit(Field::Body, "First words, and more".to_owned());
+
+    compose.send();
+    let again = draft(compose.take_request().unwrap());
+    assert_eq!(again.draft.as_deref(), Some("d@example.org"));
+    compose.answered(Ok(Answer::error(
+        Some("draft"),
+        "busy",
+        "this draft is being sent",
+    )));
+
+    assert!(
+        !compose.done(),
+        "what was typed since is not in the message queued"
+    );
+    assert_eq!(compose.state, State::Editing);
+    assert_eq!(compose.body, "First words, and more");
+    let notice = compose.notice.clone().unwrap();
+    assert!(notice.contains("new draft"), "{notice}");
+    let save = draft(compose.take_request().expect("saved as a new draft"));
+    assert_eq!(save.draft, None);
+    assert!(!save.send);
+    assert_eq!(save.body.as_deref(), Some("First words, and more"));
+    assert_eq!(save.answers, None);
+    compose.answered(saved("n@example.org"));
+    assert_eq!(compose.draft.as_deref(), Some("n@example.org"));
+    assert!(
+        compose.notice.as_deref().unwrap().contains("new draft"),
+        "kept"
+    );
+}
+
+#[test]
+fn a_draft_already_sent_says_where_its_changes_were_saved() {
+    let mut compose = picked_up(&own_draft_of("X-Missive-Answers: alice/3/1/5"));
+    compose.edit(Field::Body, "Late words".to_owned());
+    compose.send();
+    draft(compose.take_request().unwrap());
+
+    let mut answer = Answer::error(
+        Some("draft"),
+        "already-sent",
+        "already sent; your changes are saved as a new draft n@example.org",
+    );
+    answer.message_id = Some("n@example.org".to_owned());
+    compose.answered(Ok(answer));
+
+    assert_eq!(compose.state, State::Editing, "nothing was sent");
+    assert_eq!(compose.draft.as_deref(), Some("n@example.org"));
+    assert!(!compose.needs_save(), "saved as that draft");
+    let notice = compose.notice.clone().unwrap();
+    assert!(notice.contains("n@example.org"), "{notice}");
+    assert_eq!(compose.take_request(), None);
+    // Sent again, it names the new draft.
+    compose.send();
+    let send = draft(compose.take_request().unwrap());
+    assert_eq!(send.draft.as_deref(), Some("n@example.org"));
+}
+
+#[test]
+fn a_draft_already_sent_with_no_change_to_save_stays_refused_with_its_text() {
+    let mut compose = picked_up(&own_draft_of("X-Missive-Answers: alice/3/1/5"));
+    compose.send();
+    draft(compose.take_request().unwrap());
+    compose.answered(Ok(Answer::error(
+        Some("draft"),
+        "already-sent",
+        "this draft was already sent",
+    )));
+    assert_eq!(compose.state, State::Editing);
+    assert_eq!(compose.draft.as_deref(), Some("alice/3/1/5"));
+    assert!(compose.notice.as_deref().unwrap().contains("already"));
+}
+
+#[test]
+fn a_text_that_drops_the_drafts_html_part_says_so_in_the_window() {
+    let mut compose = picked_up(&own_draft_of("X-Missive-Foo: 1"));
+    type_and_wait(&mut compose, Field::Body, "Another text").unwrap();
+    let mut answer = saved("d@example.org").unwrap();
+    answer.html_dropped = true;
+    compose.answered(Ok(answer));
+    let notice = compose.notice.clone().unwrap();
+    assert!(notice.contains("HTML"), "{notice}");
+
+    // The next save, which drops nothing, clears it.
+    type_and_wait(&mut compose, Field::Body, "Another text, again").unwrap();
+    compose.answered(saved("d@example.org"));
+    assert_eq!(compose.notice, None);
+}
+
+const ORIGINAL: &[u8] = b"From: Zoe <zoe@example.com>\r\n\
+    To: Alice <alice@example.org>, Bob <bob@example.net>\r\n\
+    Subject: Lunch?\r\nMessage-ID: <lunch@example.com>\r\n\
+    Date: Sat, 17 Oct 2026 07:30:00 +0200\r\n\r\nAre you free?\r\n";
+
+fn reply_all_from(account: &str) -> Compose {
+    let accounts = vec!["alice".to_owned(), "bob".to_owned()];
+    let own = if account == "alice" {
+        "alice@example.org"
+    } else {
+        "bob@example.net"
+    };
+    let answering = missive_core::reply::answering(
+        "alice/1/1/1",
+        ORIGINAL,
+        Some("Lunch?"),
+        Some(missive_core::reply::Mode::ReplyAll),
+        own,
+    )
+    .unwrap();
+    Compose::answering(accounts, account.to_owned(), answering).with_recipients_of(
+        ORIGINAL,
+        missive_core::reply::Mode::ReplyAll,
+        vec![
+            ("alice".to_owned(), "alice@example.org".to_owned()),
+            ("bob".to_owned(), "bob@example.net".to_owned()),
+        ],
+    )
+}
+
+#[test]
+fn switching_the_sending_account_of_a_reply_all_recomputes_the_recipients() {
+    let mut compose = reply_all_from("alice");
+    assert_eq!(
+        compose.to,
+        "\"Zoe\" <zoe@example.com>, \"Bob\" <bob@example.net>"
+    );
+    assert_eq!(compose.cc, "");
+
+    compose.pick_account("bob");
+
+    // Bob's own address leaves, and Alice's, which the reply left out, comes in.
+    assert_eq!(
+        compose.to,
+        "\"Zoe\" <zoe@example.com>, \"Alice\" <alice@example.org>"
+    );
+    let timer = compose.take_save_timer().unwrap();
+    compose.save_timer_elapsed(timer);
+    let save = draft(compose.take_request().unwrap());
+    assert_eq!(save.account, "bob");
+    assert_eq!(
+        save.to,
+        Some(vec![
+            "\"Zoe\" <zoe@example.com>".to_owned(),
+            "\"Alice\" <alice@example.org>".to_owned()
+        ])
+    );
+}
+
+#[test]
+fn recipients_the_user_changed_are_left_as_written_when_the_account_changes() {
+    let mut compose = reply_all_from("alice");
+    compose.edit(Field::Cc, "carl@example.net".to_owned());
+
+    compose.pick_account("bob");
+
+    assert_eq!(
+        compose.to,
+        "\"Zoe\" <zoe@example.com>, \"Bob\" <bob@example.net>"
+    );
+    assert_eq!(compose.cc, "carl@example.net");
+    let notice = compose.notice.clone().unwrap();
+    assert!(notice.contains("bob@example.net"), "{notice}");
+}
+
+#[test]
+fn a_message_that_answers_nothing_keeps_its_recipients_when_the_account_changes() {
+    let mut compose = Compose::new(
+        vec!["alice".to_owned(), "bob".to_owned()],
+        "alice".to_owned(),
+    );
+    compose.edit(Field::To, "bob@example.net".to_owned());
+    compose.pick_account("bob");
+    assert_eq!(compose.to, "bob@example.net");
+    assert_eq!(compose.notice, None);
+}
+
+#[tokio::test]
+async fn a_reply_all_from_the_reader_works_the_recipients_out_again_for_the_account_chosen() {
+    let copied = "Cc: Alice <alice@example.org>, Bob <bob@example.net>\r\n";
+    let mail = Mail::new(
+        missive_core::fake::FakeServer::builder()
+            .user(common::USER, common::PASSWORD)
+            .folder(
+                missive_core::fake::Folder::new("INBOX").message(common::plan(6, copied, "Lunch?")),
+            ),
+    )
+    .await;
+    // A second account, which reaches no server: the window only reads its address.
+    let store = missive_core::account::AccountStore::new(mail.home.path().join("config/missive"));
+    let mut bob = store.get(ID).unwrap().unwrap();
+    bob.address = "bob@example.net".to_owned();
+    bob.user = bob.address.clone();
+    store.save("bob", &bob, None).unwrap();
+    let mut model = mail.model();
+    open(&mut model, "Plan 6");
+
+    let mut compose = model.compose(Start::ReplyAll).unwrap();
+    assert!(compose.accounts.contains(&"bob".to_owned()));
+    assert_eq!(compose.cc, "\"Bob\" <bob@example.net>");
+
+    compose.pick_account("bob");
+
+    assert_eq!(compose.cc, "\"Alice\" <alice@example.org>");
+}

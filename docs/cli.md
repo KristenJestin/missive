@@ -742,7 +742,7 @@ whose move waits, an account that is not configured, an action the server cannot
 
 ## Sending
 
-### `missive compose [--account <id>] [--draft <draft id> | --reply <message id> | --reply-all <message id> | --forward <message id>] [--to <address>]… [--cc <address>]… [--bcc <address>]… [--no-to] [--no-cc] [--no-bcc] [--subject <text>] [--body-file <path> | --body <text or ->] [--attach <path>]… [--no-attach] [--send] [--json]`
+### `missive compose [--account <id>] [--draft <draft id> | --reply <message id> | --reply-all <message id> | --forward <message id>] [--to <address>]… [--cc <address>]… [--bcc <address>]… [--no-to] [--no-cc] [--no-bcc] [--subject <text>] [--body-file <path> | --body <text or ->] [--attach <path>]… [--no-attach] [--send] [--no-window] [--json]`
 
 Writes a message: saved as a draft, or with `--send` sent. An address is `name@example.org` or
 `Name <name@example.org>` (the name may be in any script; the address is ASCII). `--body -`
@@ -781,7 +781,8 @@ When a display is there (`WAYLAND_DISPLAY` or `DISPLAY` is set), the draft, once
 opened in the **compose window**: `missive-window compose --account <id> --draft <draft id>`,
 the `missive-window` beside `missive`, else the one on the `PATH`, started on its own (the
 command returns at once). The output is the same; a window that cannot start is said on standard
-error, and the draft stays saved. Without a display, nothing is opened.
+error, and the draft stays saved. Without a display, nothing is opened; **`--no-window`** opens
+nothing even with one, for a script that only wants the draft saved.
 
 #### Replying and forwarding
 
@@ -815,7 +816,11 @@ the text above the quote.
   queue of actions, as `missive mark` does. A reply that is only saved as a draft marks nothing,
   and neither does one the server refuses. A message that was moved or deleted meanwhile is not
   marked. The flag goes to the account that owns the message, which wakes at once even when
-  another account sends the reply.
+  another account sends the reply. A reply or a forward saved as a draft keeps the link to its
+  original (an `X-Missive-Answers` or `X-Missive-Forwards` header of the draft, which the message
+  sent never carries): picked up later and sent, from the command line or the window, it marks the
+  original all the same. The message answered must be in the local copy when the reply is saved
+  or sent (a message identifier that names none is refused, `no-such-message`).
 - A message that is odd is answered all the same, and one line on the error output says what was
   changed (counts and kinds, never what the message says): line breaks in its subject (an
   encoded subject can decode to some) become spaces, and the identifiers (`Message-ID`,
@@ -869,7 +874,9 @@ with only HTML gets its text made from it, beside the HTML; with several HTML pa
 kept): a draft picked up and written again, or sent, still carries its HTML. Its other headers
 (`Reply-To`…) are not kept, nor is an image the HTML draws from a part of the message (it stays an
 attachment). The HTML says what the text says: when `--body` or `--body-file` gives **another
-text**, the HTML part is dropped, so that the draft never says two things, and one line on standard
+text**, the HTML part is dropped, so that the draft never says two things; it is dropped too when
+`--no-attach` or `--attach` takes an attachment off while the HTML draws an image from a part of
+the message (`cid:`), which would leave a broken image. One line on standard
 error says so; the same text (line ends aside) keeps it.
 
 The draft is saved in the local copy first, and the command returns at once, whether the server
@@ -958,12 +965,12 @@ one a killed daemon left) first looks for the message in Sent by its `Message-ID
 tries (an append started, or a look in Sent that failed) are at least a minute apart: the syncs
 in between count none, so that a server that refuses for a minute does not use the five up.
 
-### `missive mailto <uri> [--account <id>] [--json]`
+### `missive mailto <uri> [--account <id>] [--no-window] [--json]`
 
 Composes from a `mailto:` link (RFC 6068), as the system's handler for them: the desktop entry
 `missive-mailto.desktop` runs `missive mailto %u`. The link is saved as a **draft** (see
 `missive compose`) and, when a display is there, the draft is then opened in the compose window,
-as `compose` does; without a display, nothing is opened. For people, one line gives
+as `compose` does; without a display, or with `--no-window`, nothing is opened. For people, one line gives
 the draft's identifier and says where to find it (`missive list --folder drafts`); with `--json`,
 one object, as `compose` prints:
 

@@ -934,9 +934,29 @@ impl Model {
             .and_then(|found| {
                 reply::answering(&id, &raw, subject.as_deref(), mode, &found.address)
             });
-        match answering {
-            Ok(answering) => Some(Compose::answering(accounts, account, answering)),
-            Err(e) => {
+        match (answering, mode) {
+            (Ok(answering), Some(mode)) => {
+                // Each account's address: choosing another sending account works the recipients
+                // out again.
+                let addresses = self
+                    .sources
+                    .accounts
+                    .list()
+                    .map(|listing| {
+                        listing
+                            .accounts
+                            .into_iter()
+                            .map(|(id, found)| (id, found.address))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(
+                    Compose::answering(accounts, account, answering)
+                        .with_recipients_of(&raw, mode, addresses),
+                )
+            }
+            (Ok(answering), None) => Some(Compose::answering(accounts, account, answering)),
+            (Err(e), _) => {
                 self.notice = Some(format!("Cannot answer: {e}."));
                 None
             }
