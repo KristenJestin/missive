@@ -373,8 +373,9 @@ pub fn status(json: bool) -> Result<()> {
         }
         for message in &account.deleted_left {
             println!(
-                "\tstill marked \\Deleted: {message}, by an action that was then refused; \
-                 Missive takes the flag back at the next connection"
+                "\tstill marked \\Deleted: {message}, by an action that was then refused or \
+                 the removal of a draft's older version; Missive takes the flag back at the next \
+                 connection"
             );
         }
     }

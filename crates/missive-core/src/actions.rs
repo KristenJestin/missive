@@ -760,22 +760,7 @@ async fn one(
     copy_then_remove(server, store, action, &target_name).await
 }
 
-/// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` of the same UIDs. An expunge the
-/// server refused takes the flag back (best effort), but only from the messages that did not
-/// have it before: left there, another client's `EXPUNGE` would remove messages the copy shows,
-/// once the action is refused, and a `\Deleted` another client set is not ours to clear. Which
-/// ones had it is asked first (`UID SEARCH DELETED UID <set>`); an answer refused means the
-/// removal is not started.
-pub(crate) async fn remove(
-    server: &mut Server<'_>,
-    uids: &[u32],
-) -> std::result::Result<Done, SyncError> {
-    remove_marking(server, uids, &[], |_| Ok(())).await
-}
-
-/// [`remove`] for an action, which records the `\Deleted` it sets itself: a connection lost
-/// before the flag is taken back leaves it on the server, and the next try, which then finds it
-/// set, must still know it is Missive's own.
+/// [`remove_marking`] for an action.
 async fn removing(
     server: &mut Server<'_>,
     store: &mut Store,
@@ -788,9 +773,18 @@ async fn removing(
     .await
 }
 
-/// [`remove`]; `earlier` are the UIDs an earlier try marked itself, and `mark` records those
-/// whose flag is Missive's own, before it is set and once it is taken back.
-async fn remove_marking(
+/// `UID STORE +FLAGS.SILENT (\Deleted)`, then `UID EXPUNGE` of the same UIDs. An expunge the
+/// server refused takes the flag back (best effort), but only from the messages that did not
+/// have it before: left there, another client's `EXPUNGE` would remove messages the copy shows,
+/// once the action is refused, and a `\Deleted` another client set is not ours to clear. Which
+/// ones had it is asked first (`UID SEARCH DELETED UID <set>`); an answer refused means the
+/// removal is not started.
+///
+/// `mark` records the UIDs whose flag is Missive's own, before it is set and once it is taken
+/// back: a connection lost before the flag is taken back leaves it on the server, and the next
+/// try, which then finds it set, must still know it is Missive's own. `earlier` are the UIDs an
+/// earlier try recorded.
+pub(crate) async fn remove_marking(
     server: &mut Server<'_>,
     uids: &[u32],
     earlier: &[u32],

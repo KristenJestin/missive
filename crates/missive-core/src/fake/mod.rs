@@ -584,6 +584,15 @@ impl FakeServer {
             .push(Rule::new(command, Action::Cut(lines)));
     }
 
+    /// Answers nothing to every IMAP command that starts with `command`, as
+    /// [`Builder::stall`] does, until [`FakeServer::heal`].
+    pub fn stall(&self, command: &str) {
+        self.shared
+            .state()
+            .rules
+            .push(Rule::new(command, Action::Stall));
+    }
+
     /// Answers every IMAP command that starts with `command` with the first `lines` lines of its
     /// answer only, but still ends it with its tagged `OK`: a server that forgot part of what it
     /// should say and said it was done, as `server.truncate("EXAMINE", 3)` leaves out `EXISTS`.

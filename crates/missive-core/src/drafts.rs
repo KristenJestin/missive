@@ -32,7 +32,10 @@
 //!    the folder otherwise than the server), the folder is synced at once.
 //! 3. Only then, the older versions are removed: `UID STORE <uids> +FLAGS.SILENT (\Deleted)` and
 //!    `UID EXPUNGE <uids>`, which removes those UIDs and no other message marked deleted; an
-//!    expunge refused takes the flag back. Without UIDPLUS there is no `UID EXPUNGE`: the older
+//!    expunge refused takes the flag back. The flag Missive sets is recorded first, as an
+//!    action's: a connection lost before the flag is taken back leaves it on the server, and the
+//!    next try still knows it is Missive's own; one still left when the draft is done with the
+//!    server is taken back at the next connection ([`crate::store::Store::deleted_left`]). Without UIDPLUS there is no `UID EXPUNGE`: the older
 //!    versions are left in place, and the user is told. Never a bare `EXPUNGE`.
 //!
 //! A draft whose message was sent is removed the same way, once the server took the message
@@ -311,8 +314,16 @@ async fn one(
             },
         )
     } else {
-        match actions::remove(server, &old).await? {
-            Done::Ok(_) => (old, Left::default()),
+        // Held as `&mut`: a `&Store` cannot cross an await of a task that may move between
+        // threads.
+        let held: &mut Store = store;
+        let mark = move |uids: &[u32]| Ok(held.draft_marked_deleted(draft.id, uids)?);
+        let done = actions::remove_marking(server, &old, &draft.marked_deleted, mark).await?;
+        match done {
+            Done::Ok(_) => {
+                store.draft_marked_deleted(draft.id, &[])?;
+                (old, Left::default())
+            }
             // A removal only is tried again; a new version is in, and the older ones are found
             // again by the next save.
             _ if draft.raw.is_none() => return Ok(Step::No("expunge")),

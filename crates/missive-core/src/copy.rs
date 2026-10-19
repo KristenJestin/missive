@@ -560,9 +560,9 @@ impl Copy {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The messages an action refused for good left marked `\Deleted` on the server, by their
-    /// identifiers, oldest first: Missive set the flag itself, and takes it back at the next
-    /// connection. Empty in a copy older than them.
+    /// The messages an action refused for good, or the removal of a draft's older versions, left
+    /// marked `\Deleted` on the server, by their identifiers, oldest first: Missive set the flag
+    /// itself, and takes it back at the next connection. Empty in a copy older than them.
     pub fn deleted_left(&self, account: &str) -> Result<Vec<String>> {
         if self.version < DELETED_LEFT_VERSION {
             return Ok(Vec::new());

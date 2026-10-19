@@ -19,6 +19,9 @@ pub struct DraftRow {
     /// See the schema: the row leaves only if it is still this version.
     pub version: i64,
     pub attempts: u32,
+    /// The UIDs of its older versions it marked `\Deleted` itself, while the flag may still be
+    /// set.
+    pub marked_deleted: Vec<u32>,
 }
 
 /// A draft found to be picked up again: its latest version.
@@ -180,16 +183,20 @@ impl Store {
     pub fn drafts(&self, account: i64) -> rusqlite::Result<Vec<DraftRow>> {
         self.connection
             .prepare(
-                "SELECT id, message_id, raw, version, attempts
+                "SELECT id, message_id, raw, version, attempts, marked_deleted
                    FROM draft WHERE account = ?1 ORDER BY id",
             )?
             .query_map([account], |r| {
+                let marked: Option<String> = r.get(5)?;
                 Ok(DraftRow {
                     id: r.get(0)?,
                     message_id: r.get(1)?,
                     raw: r.get(2)?,
                     version: r.get(3)?,
                     attempts: r.get(4)?,
+                    marked_deleted: marked
+                        .and_then(|m| serde_json::from_str(&m).ok())
+                        .unwrap_or_default(),
                 })
             })?
             .collect()
@@ -239,11 +246,25 @@ impl Store {
         )
     }
 
+    /// Records the UIDs of a draft's older versions it marked `\Deleted` itself, as
+    /// [`Store::marked_deleted`] does for an action.
+    pub fn draft_marked_deleted(&self, id: i64, uids: &[u32]) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE draft SET marked_deleted = ?2 WHERE id = ?1",
+            params![
+                id,
+                (!uids.is_empty()).then(|| serde_json::to_string(uids).expect("numbers serialize"))
+            ],
+        )?;
+        Ok(())
+    }
+
     /// A draft written to the server (or removed from it), in one transaction: its row leaves,
     /// unless another version was saved meanwhile; the versions removed from the folder leave
     /// the copy; and the version appended, when its UID is known (`new`) and the copy's folder
-    /// has the UIDVALIDITY the server gave, is written to the copy at once. Returns whether the
-    /// row left.
+    /// has the UIDVALIDITY the server gave, is written to the copy at once. A `\Deleted` the row
+    /// still records as its own goes to [`Store::deleted_left`] with it, to be taken back.
+    /// Returns whether the row left.
     pub fn draft_written(
         &mut self,
         draft: &DraftRow,
@@ -253,10 +274,22 @@ impl Store {
         new: Option<NewMessage>,
     ) -> rusqlite::Result<bool> {
         let transaction = self.connection.transaction()?;
-        let left = transaction.execute(
-            "DELETE FROM draft WHERE id = ?1 AND version = ?2",
-            params![draft.id, draft.version],
-        )? > 0;
+        let row: Option<(i64, Option<String>)> = transaction
+            .query_row(
+                "DELETE FROM draft WHERE id = ?1 AND version = ?2
+                 RETURNING account, marked_deleted",
+                params![draft.id, draft.version],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let left = row.is_some();
+        if let Some((account, Some(marked))) = row {
+            transaction.execute(
+                "INSERT INTO deleted_left (account, folder, uidvalidity, uids)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![account, folder, uidvalidity, marked],
+            )?;
+        }
         let current: Option<u32> = transaction.query_row(
             "SELECT uidvalidity FROM folder WHERE id = ?1",
             [folder],
