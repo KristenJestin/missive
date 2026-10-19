@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::store::{SCHEMA_VERSION, SkippedFolder};
@@ -736,6 +736,50 @@ impl Copy {
         Ok(listed)
     }
 
+    /// The latest version of a draft of `account`, to pick it up again: `id` is its Message-ID
+    /// (with or without angle brackets), as `missive compose` prints it and as a draft waiting
+    /// for the server is listed, or a message identifier, as `list` prints it. The version
+    /// waiting in the copy comes first, else the newest of the Drafts folder. `None` when there
+    /// is no such draft, or when it was sent.
+    pub fn draft(&self, account: &str, id: &str) -> Result<Option<Vec<u8>>> {
+        if MessageId::parse(id).is_some() {
+            return Ok(self
+                .message(id)?
+                .ok()
+                .filter(|stored| stored.hit.account == account)
+                .map(|stored| stored.raw));
+        }
+        let message_id = id.trim_start_matches('<').trim_end_matches('>');
+        if self.version >= DRAFTS_VERSION {
+            let waiting: Option<Option<Vec<u8>>> = self
+                .connection
+                .query_row(
+                    "SELECT draft.raw FROM draft JOIN account ON account.key = draft.account
+                      WHERE account.id = ?1 AND draft.message_id = ?2",
+                    params![account, message_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(waiting) = waiting {
+                // Sent: no longer a draft.
+                return Ok(waiting);
+            }
+        }
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT message_raw.raw FROM message
+                   JOIN message_raw ON message_raw.message = message.id
+                   JOIN folder ON folder.id = message.folder
+                   JOIN account ON account.key = folder.account
+                  WHERE account.id = ?1 AND folder.role = 'drafts' AND message.message_id = ?2
+                  ORDER BY message.uid DESC LIMIT 1",
+                params![account, message_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// The message an identifier names, with its raw message. Whether the identifier is one, and
     /// whether it still names a message, is the answer's to say ([`NotFound`]) and not an error:
     /// the identifier of a message that has gone since it was printed is what a caller will meet.
@@ -933,6 +977,44 @@ mod tests {
         ] {
             assert_eq!(MessageId::parse(wrong), None, "{wrong:?}");
         }
+    }
+
+    #[test]
+    fn a_draft_is_found_waiting_by_its_message_id_else_in_the_drafts_folder() {
+        let (_dir, mut store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        let drafts = store.folder(alice, "Drafts", Some("drafts")).unwrap().id;
+        store.rebuild(drafts, 9).unwrap();
+        let on_server = b"Message-ID: <d@example.org>\r\nSubject: Old\r\n\r\nOld\r\n".to_vec();
+        store
+            .insert(
+                drafts,
+                &[NewMessage {
+                    uid: 3,
+                    flags: "\\Draft".to_owned(),
+                    internal_date: None,
+                    size: on_server.len() as i64,
+                    raw: on_server.clone(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(
+            copy.draft("alice", "d@example.org").unwrap(),
+            Some(on_server.clone())
+        );
+        assert_eq!(
+            copy.draft("alice", "<d@example.org>").unwrap(),
+            Some(on_server.clone())
+        );
+        let by_uid = message_id("alice", drafts, 9, 3);
+        assert_eq!(copy.draft("alice", &by_uid).unwrap(), Some(on_server));
+
+        let waiting = b"Message-ID: <d@example.org>\r\nSubject: New\r\n\r\nNew\r\n".to_vec();
+        store.save_draft(alice, "d@example.org", &waiting).unwrap();
+        assert_eq!(copy.draft("alice", "d@example.org").unwrap(), Some(waiting));
+        assert_eq!(copy.draft("alice", "x@example.org").unwrap(), None);
+        assert_eq!(copy.draft("bob", "d@example.org").unwrap(), None);
     }
 
     #[test]
