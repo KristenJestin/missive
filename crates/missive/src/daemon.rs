@@ -1960,16 +1960,41 @@ impl SmtpWorker {
                 }
                 continue;
             };
-            let tried = tokio::select! {
-                tried = outbox::send_next(
+            // What is written is whole: the outbox says where the message stopped.
+            let submitted = tokio::select! {
+                submitted = outbox::submit_next(
                     &mut self.store,
                     self.key,
                     &self.account,
                     login,
                     tls.clone(),
-                ) => tried,
-                // What is written is whole: the outbox says where the message stopped.
+                ) => submitted,
                 _ = stopped(&mut self.stop) => return,
+            };
+            let tried = match submitted {
+                Ok(Some(submission)) => {
+                    // The server's answer is known only here: a stop does not drop it, or the
+                    // message it took would stay `sending`, then `uncertain`. It is a few local
+                    // writes, given a little time, not all the time a broken disk takes.
+                    let record = outbox::record(&mut self.store, self.key, submission);
+                    tokio::pin!(record);
+                    tokio::select! {
+                        tried = &mut record => tried.map(Some),
+                        _ = async {
+                            stopped(&mut self.stop).await;
+                            tokio::time::sleep(STOP_GRACE).await;
+                        } => {
+                            log!(
+                                "account {}: the daemon stopped before the outbox could be \
+                                 written: the message is left as it was",
+                                self.key
+                            );
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
             };
             let tried = match tried {
                 Ok(Some(tried)) => tried,
@@ -1983,7 +2008,8 @@ impl SmtpWorker {
                 }
             };
             // A login that failed fails for every message: the worker waits too, so as not to log
-            // in once per message.
+            // in once per message, and a message written meanwhile does not cut the wait short:
+            // a wrong password would be tried again at each one.
             let login_failed = match &tried {
                 Tried::Login { error, .. } => {
                     if *error == ConnectError::AuthRefused {
@@ -1998,7 +2024,7 @@ impl SmtpWorker {
                 }
             };
             self.tell(tried);
-            if login_failed && !self.wait(Some(backoff.next())).await {
+            if login_failed && !self.pause(backoff.next()).await {
                 return;
             }
         }
@@ -2030,6 +2056,23 @@ impl SmtpWorker {
             woken = self.wake.recv() => woken.is_some(),
             _ = sleep => true,
             _ = stopped(&mut self.stop) => false,
+        }
+    }
+
+    /// Waits the whole of `timeout`: a message written meanwhile is for later. `false` when the
+    /// daemon stops or the account was removed.
+    async fn pause(&mut self, timeout: Duration) -> bool {
+        let until = tokio::time::Instant::now() + timeout;
+        loop {
+            tokio::select! {
+                woken = self.wake.recv() => {
+                    if woken.is_none() {
+                        return false;
+                    }
+                }
+                _ = tokio::time::sleep_until(until) => return true,
+                _ = stopped(&mut self.stop) => return false,
+            }
         }
     }
 

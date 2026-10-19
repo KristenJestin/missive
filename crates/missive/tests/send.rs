@@ -333,6 +333,18 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// SIGTERM, and waits for the daemon to end by itself, at most `seconds`.
+    async fn stop(&mut self, seconds: u64) -> ExitStatus {
+        let pid = self.child.id().unwrap();
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        tokio::time::timeout(Duration::from_secs(seconds), self.child.wait())
+            .await
+            .expect("the daemon did not stop in time")
+            .unwrap()
+    }
+
     async fn kill(&mut self) -> ExitStatus {
         self.child.kill().await.unwrap();
         self.child.wait().await.unwrap()
@@ -1245,4 +1257,180 @@ async fn a_sent_copy_refused_five_times_is_given_up_with_an_event() {
     );
     assert!(env.outbox().is_empty());
     assert!(server.uids("Sent").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_message_does_not_cut_short_the_wait_after_a_refused_login() {
+    let server = mailbox()
+        .smtp_answer("AUTH", "535 5.7.8 authentication failed")
+        .start()
+        .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    succeeded(&env.compose(&["--body", "first"]).await);
+    // The second refusal starts a wait of 2 seconds.
+    eventually(20, "two refused logins", || {
+        env.outbox()
+            .first()
+            .is_some_and(|(_, _, attempts)| *attempts >= 2)
+    })
+    .await;
+
+    succeeded(&env.compose(&["--body", "second"]).await);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let outbox = env.outbox();
+    assert_eq!(outbox.len(), 2, "{outbox:?}");
+    assert_eq!(
+        outbox[1].2, 0,
+        "the new message logged in again: {outbox:?}"
+    );
+    // Waiting is not losing: both go once the server takes the login.
+    server.heal();
+    took(&server, 2).await;
+}
+
+/// Holds the answer to the end of data for 2 seconds, then, once the server has it in hand, makes
+/// every change of the outbox fail, as a busy or a broken disk would. Returns the connection that
+/// lifts the failure (`lift`), and the time the server answers at.
+async fn blocked_at_the_answer(server: &FakeServer, env: &Env) -> (Connection, Instant) {
+    server.smtp_delay(".", Duration::from_secs(2));
+    succeeded(&env.compose(&["--body", BODY]).await);
+    eventually(20, "the end of data held", || server.smtp_delayed() == 1).await;
+    let answers_at = Instant::now() + Duration::from_secs(2);
+    let copy = Connection::open(env.copy_path()).unwrap();
+    copy.execute_batch(
+        "CREATE TRIGGER no_update BEFORE UPDATE ON outbox
+           BEGIN SELECT RAISE(ABORT, 'the copy cannot be written'); END;
+         CREATE TRIGGER no_delete BEFORE DELETE ON outbox
+           BEGIN SELECT RAISE(ABORT, 'the copy cannot be written'); END;",
+    )
+    .unwrap();
+    (copy, answers_at)
+}
+
+fn lift(copy: &Connection) {
+    copy.execute_batch("DROP TRIGGER no_update; DROP TRIGGER no_delete;")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_stopped_while_a_sent_message_is_recorded_finishes_recording_it() {
+    let server = mailbox().start().await;
+    let (env, mut daemon) = started(&Setup::of(&server)).await;
+    let (copy, answers_at) = blocked_at_the_answer(&server, &env).await;
+    // The server answered, and the first try of the record failed: it waits for the next.
+    tokio::time::sleep_until((answers_at + Duration::from_millis(400)).into()).await;
+    let stopping = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        lift(&copy);
+    });
+
+    daemon.stop(15).await;
+    stopping.await.unwrap();
+
+    assert_eq!(server.smtp_messages().len(), 1);
+    let outbox = env.outbox();
+    assert_eq!(
+        outbox.iter().map(|m| m.1.as_str()).collect::<Vec<_>>(),
+        ["sent"],
+        "{outbox:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_stopped_while_the_record_cannot_be_written_still_stops() {
+    let server = mailbox().start().await;
+    let (env, mut daemon) = started(&Setup::of(&server)).await;
+    let (_copy, answers_at) = blocked_at_the_answer(&server, &env).await;
+    tokio::time::sleep_until((answers_at + Duration::from_millis(400)).into()).await;
+
+    let started = Instant::now();
+    daemon.stop(15).await;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "{:?}",
+        started.elapsed()
+    );
+    // Not recorded: the next daemon will say the message is uncertain.
+    assert_eq!(env.outbox()[0].1, "sending");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_search_of_sent_is_not_one_of_the_tries_of_the_copy() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = env.watch().await;
+    // The first try appends the copy, and the connection drops before the answer.
+    server.cut_after_append();
+    succeeded(&env.compose(&["--body", BODY]).await);
+    watcher.next("sent").await;
+    eventually(20, "the copy taken by the server", || {
+        server.uids("Sent").len() == 1
+    })
+    .await;
+    let tries = || -> Option<i64> {
+        Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row("SELECT copy_attempts FROM outbox", [], |r| r.get(0))
+            .ok()
+    };
+    eventually(20, "the first try counted", || tries() == Some(1)).await;
+    // From now on the search of Sent fails, at more passes than the copy has tries.
+    server.heal();
+    server.cut("UID SEARCH", 0);
+    for _ in 0..7 {
+        env.run(&["sync"]).await;
+    }
+
+    assert_eq!(
+        tries(),
+        Some(1),
+        "the search was counted, or the copy given up"
+    );
+    // The search works again: the copy is found in Sent, not appended a second time.
+    server.heal();
+    for _ in 0..5 {
+        if env.outbox().is_empty() {
+            break;
+        }
+        env.run(&["sync"]).await;
+    }
+    assert!(env.outbox().is_empty());
+    assert_eq!(server.uids("Sent").len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_says_that_a_message_stays_claimed_for_good() {
+    let (_server, _relay, env) = smtp_down().await;
+    let mut daemon = env.daemon().await;
+    env.ready().await;
+    succeeded(&env.compose(&["--body", "stuck"]).await);
+    succeeded(&env.compose(&["--body", "taken"]).await);
+    daemon.kill().await;
+    // What a worker that could not put its message back in the queue leaves: claimed, since long.
+    // The other one was claimed just now: a try, as far as `status` can tell.
+    let long_ago = missive_core::outbox::now() - 2 * 60 * 60 * 1000;
+    let copy = Connection::open(env.copy_path()).unwrap();
+    copy.execute(
+        "UPDATE outbox SET state = 'claimed', next_attempt_at = ?1 WHERE id = 1",
+        [long_ago],
+    )
+    .unwrap();
+    copy.execute(
+        "UPDATE outbox SET state = 'claimed', next_attempt_at = ?1 WHERE id = 2",
+        [missive_core::outbox::now()],
+    )
+    .unwrap();
+
+    let status = env.status().await;
+    let outbox = &status["accounts"][0]["outbox"];
+    assert_eq!(outbox[0]["state"], "claimed", "{status}");
+    assert_eq!(outbox[0]["stuck"], true, "{status}");
+    assert_eq!(outbox[1]["stuck"], false, "{status}");
+    let output = env.run(&["status"]).await;
+    succeeded(&output);
+    let text = stdout(&output);
+    assert!(text.contains("message 1 claimed: stuck"), "{text}");
+    assert!(!text.contains("message 2 claimed"), "{text}");
 }

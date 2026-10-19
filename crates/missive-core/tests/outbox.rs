@@ -122,3 +122,44 @@ async fn a_message_the_server_took_while_the_copy_was_busy_is_recorded_sent() {
         .unwrap();
     assert_eq!(left, 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_the_server_took_is_recorded_sent_though_the_sent_folder_cannot_be_read() {
+    let fake = FakeServer::builder().user(USER, PASSWORD).start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("copy.sqlite");
+    let mut store = Store::open(&path).unwrap();
+    let key = store.account("alice").unwrap();
+    let id = store
+        .enqueue(
+            key,
+            &Built {
+                sender: USER.to_owned(),
+                recipients: vec!["bob@example.com".to_owned()],
+                message_id: "1@example.org".to_owned(),
+                raw: b"Subject: Folders\r\n\r\nHello\r\n".to_vec(),
+                bcc_header: None,
+            },
+            true,
+            None,
+        )
+        .unwrap();
+    // The folders cannot be read: what the account's Sent folder is stays unknown.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE folder RENAME TO folder_gone")
+        .unwrap();
+    let account = account(&fake);
+    let password = Password::new(PASSWORD.to_owned());
+    let tls = client_config(Some(fake.certificate_der()));
+
+    let tried = send_next(&mut store, key, &account, &password, tls).await;
+
+    assert_eq!(fake.smtp_messages().len(), 1);
+    assert!(matches!(tried, Ok(Some(Tried::Sent { .. }))), "{tried:?}");
+    let state: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT state FROM outbox WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state, "sent");
+}
