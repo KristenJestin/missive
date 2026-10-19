@@ -39,25 +39,31 @@ pub async fn connect(socket: &Path, program: &Path) -> Result<UnixStream, String
             ));
         }
     }
-    let log = log_path()?;
-    let mut child = start(program, &log)?;
+    start_and_wait(socket, program, &log_path()?).await
+}
+
+/// Starts `program daemon` and waits until it answers on `socket`.
+async fn start_and_wait(socket: &Path, program: &Path, log: &Path) -> Result<UnixStream, String> {
+    let mut child = start(program, log)?;
     let started = Instant::now();
-    loop {
+    let connected = loop {
         if let Ok(stream) = UnixStream::connect(socket).await {
-            return Ok(stream);
+            break Ok(stream);
         }
         // Another `sync` may have started one first: this one then stops, and that one answers.
         let exited = child.try_wait().ok().flatten().is_some();
         if (exited && started.elapsed() > Duration::from_secs(2))
             || started.elapsed() > Duration::from_secs(10)
         {
-            return Err(format!(
+            break Err(format!(
                 "the daemon did not start (its log is {})",
                 log.display()
             ));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
+    reap(child);
+    connected
 }
 
 /// Starts `program daemon` in its own process group, so that the terminal's Ctrl-C does not reach
@@ -124,6 +130,16 @@ async fn ask_within(
         .map_err(|e| e.to_string())?;
     serde_json::from_str(&line)
         .map_err(|_| "the daemon gave an answer this missive cannot read".to_owned())
+}
+
+/// Waits for `child` on a thread of its own: a daemon that exits while its client lives on (the
+/// window) would stay a zombie otherwise. The thread ends with the daemon.
+fn reap(mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name("daemon-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 #[cfg(test)]
@@ -193,5 +209,53 @@ mod tests {
         .await
         .unwrap();
         assert!(answer.ok);
+    }
+
+    /// The pids of this process's children that have exited and were not waited for.
+    fn zombies() -> Vec<u32> {
+        let mut children = String::new();
+        for task in std::fs::read_dir("/proc/self/task").unwrap() {
+            let file = task.unwrap().path().join("children");
+            children.push_str(&std::fs::read_to_string(file).unwrap_or_default());
+            children.push(' ');
+        }
+        children
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<u32>().ok())
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|stat| stat.rsplit(") ").next().is_some_and(|r| r.starts_with('Z')))
+            })
+            .collect()
+    }
+
+    async fn until_none_is_left_over() {
+        let started = Instant::now();
+        while !zombies().is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a daemon the client started stays a zombie"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_daemon_the_client_started_is_reaped_when_it_exits() {
+        // `sleep daemon` is refused at once, as a daemon that dies right after its start: this
+        // process keeps no zombie of it, whether it came up (a socket answers) or not.
+        let folder = tempfile::tempdir().unwrap();
+        let log = folder.path().join("daemon.log");
+        let socket = folder.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let connected = start_and_wait(&socket, Path::new("sleep"), &log).await;
+        assert!(connected.is_ok());
+        until_none_is_left_over().await;
+
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+        let never = start_and_wait(&socket, Path::new("sleep"), &log).await;
+        assert!(never.is_err());
+        until_none_is_left_over().await;
     }
 }
