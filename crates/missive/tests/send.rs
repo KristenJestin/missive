@@ -1801,3 +1801,56 @@ async fn a_stop_does_not_wait_for_a_keyring_read_during_the_wait_after_a_refused
         "a worker was cut off"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_does_not_wait_for_the_keyring_read_at_the_top_of_the_imap_worker() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    // The keyring waits for a passphrase nobody types from the start: the IMAP worker's first
+    // read never ends.
+    env.keyring.stall_secret_reads();
+    let mut daemon = env.daemon().await;
+    // Time for the worker to be in the read (the stalled keyring counts none).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let stopping = Instant::now();
+    daemon.stop(15).await;
+
+    assert!(
+        stopping.elapsed() < Duration::from_secs(3),
+        "the stop waited {:?}",
+        stopping.elapsed()
+    );
+    assert!(
+        !env.logs().contains("did not stop in time"),
+        "a worker was cut off"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_copy_is_tried_again_when_its_time_comes_without_any_sync() {
+    let server = mailbox().start().await;
+    let env = Env::new().await;
+    env.add_account(&Setup::of(&server)).await;
+    // The tries are 2 seconds apart; the check of every folder is an hour away, and the worker
+    // sits in IDLE: only the time of the copy can wake it.
+    let _daemon = env.daemon_spaced(2_000).await;
+    env.ready().await;
+    let mut watcher = env.watch().await;
+    server.refuse("APPEND");
+    succeeded(&env.compose(&["--body", BODY]).await);
+    watcher.next("sent").await;
+    eventually(20, "the first try counted", || {
+        first_row(&env, "copy_attempts") == Some(1)
+    })
+    .await;
+
+    eventually(30, "the second try, with no sync asked", || {
+        first_row(&env, "copy_attempts") >= Some(2)
+    })
+    .await;
+    // The server takes the copy once it stops refusing it: the next try puts it in Sent.
+    server.heal();
+    eventually(30, "the copy in Sent", || server.uids("Sent").len() == 1).await;
+}
