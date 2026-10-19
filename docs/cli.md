@@ -203,9 +203,13 @@ the daemon runs.
       "drafts": [
         { "id": "4b2e…@example.org", "state": "waiting", "saved_at": 1792220300, "attempts": 0,
           "last_error": null }
+      ],
+      "half_moved": [
+        { "message": "alice/1/1745112/4", "copy": "alice/2/1745113/9", "folder": "inbox",
+          "target": "archive" }
       ] },
     { "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0,
-      "skipped": [], "outbox": [], "drafts": [] }
+      "skipped": [], "outbox": [], "drafts": [], "half_moved": [] }
   ]
 }
 ```
@@ -234,6 +238,10 @@ the daemon runs.
 | `accounts[].drafts[].saved_at` | number | when its version was saved, in seconds since the epoch |
 | `accounts[].drafts[].attempts` | number | the tries that failed (tried again at the next pass) |
 | `accounts[].drafts[].last_error` | string or `null` | the last kind of error |
+| `accounts[].half_moved` | array | the messages a move left in two folders: the server refused to remove them after it had copied them (a server without `MOVE`; see [Changing messages](#changing-messages)), oldest first, `[]` when none |
+| `accounts[].half_moved[].message` | string | the message's identifier, in the folder it was to leave |
+| `accounts[].half_moved[].copy` | string or `null` | the identifier of its copy in the target; `null` when the server did not tell its UID (the copy is in the target all the same) |
+| `accounts[].half_moved[].folder`, `.target` | string | the folder it was to leave and its target: their roles, else their names |
 
 `ready` does not mean the copy is complete: a folder the server refuses is skipped, the others are
 synced, and the account is `ready` all the same. `skipped` is what keeps that from being silent. It
@@ -262,7 +270,11 @@ A line reads `unknown (the daemon is not running)` in the place of the state whe
 `	outbox: 1 queued, 1 failed`, and one line for each failed or uncertain message, with why. An
 account whose drafts wait in the copy has a line more too, `	drafts: 1 to write to the Drafts
 folder` (or `kept in the local copy: the account has no Drafts folder`), and one line for each
-draft whose last try failed.
+draft whose last try failed. Each message of `half_moved` has a line: `	half moved:
+alice/1/1745112/4 is in both inbox and archive, since the server refused to remove it after
+copying it; delete or move one of the two`. A message leaves `half_moved` once one of the two is
+gone from the copy (the user deleted or moved it, or another client did); a copy written before
+this field existed says `[]`.
 
 ### `missive unread [--json]`
 
@@ -623,7 +635,10 @@ several. They ask the daemon (starting one when none answers, as `sync` does), w
 
 `missive watch` tells what became of each action (an `action` event, `docs/events.md`): applied,
 tried again later, or refused. A refused action is taken back from the copy: the message shows as
-the server has it.
+the server has it. A move the server refused after it had copied the messages (a server without
+`MOVE`) leaves them in both folders: the event says so (`copied`), and `status` lists them
+(`half_moved`) until the user deletes or moves one of the two; nothing is removed without the
+user.
 
 While a move waits for the server, the message is shown in its new folder, but its identifier
 still names the folder the server has it in; once moved, it has a new identifier there (its UID in

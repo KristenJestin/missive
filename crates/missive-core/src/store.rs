@@ -6,7 +6,7 @@
 //! is ever held across a wait on the network: a process killed at any point leaves a copy that is
 //! whole as of its last commit.
 //!
-//! The schema, version 9 (`PRAGMA user_version`). Version 1 is the copy itself:
+//! The schema, version 10 (`PRAGMA user_version`). Version 1 is the copy itself:
 //!
 //! ```sql
 #![doc = include_str!("store/schema-1.sql")]
@@ -65,6 +65,12 @@
 #![doc = include_str!("store/schema-9.sql")]
 //! ```
 //!
+//! Version 10 adds the moves the server refused after it had copied the messages:
+//!
+//! ```sql
+#![doc = include_str!("store/schema-10.sql")]
+//! ```
+//!
 //! The index is contentless: it keeps the words and where they are, not the text, so a message
 //! costs its words and their places beside its raw message, and no text is stored twice. The text it is built from is read by `mail-parser`: the text parts of a message, and,
 //! for a message with only HTML, that HTML reduced to its text (markup, styles and scripts
@@ -81,7 +87,7 @@ use serde::{Deserialize, Serialize};
 
 /// The schema version this build writes. A copy written by a later version is refused rather
 /// than misread.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Each step brings the schema from the version before it: `MIGRATIONS[0]` from nothing to 1.
 const MIGRATIONS: &[&str] = &[
@@ -94,6 +100,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("store/schema-7.sql"),
     include_str!("store/schema-8.sql"),
     include_str!("store/schema-9.sql"),
+    include_str!("store/schema-10.sql"),
 ];
 
 mod drafts;
@@ -102,6 +109,7 @@ mod queue;
 
 pub use drafts::{DraftRow, Stored};
 pub use outbox::{Left, Retaken, SentCopy, ToSend};
+pub(crate) use queue::HALF_MOVE_LEFT;
 pub use queue::{Action, ActionFolder, Fingerprint};
 
 /// The local copy, opened for writing.

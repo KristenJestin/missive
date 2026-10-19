@@ -110,6 +110,10 @@ pub struct ActionEvent {
     /// For `refused`: why, for people.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// For a refused move only, `true` when the server had copied the messages to the target
+    /// first: they are in both folders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied: Option<bool>,
 }
 
 /// What became of a draft at the server (`docs/events.md`).
@@ -373,6 +377,7 @@ mod tests {
             reason: None,
             attempts: None,
             message: None,
+            copied: None,
         });
         assert_eq!(
             applied.line(),
@@ -386,6 +391,7 @@ mod tests {
             reason: Some("refused".to_owned()),
             attempts: Some(2),
             message: None,
+            copied: None,
         });
         assert_eq!(
             retried.line(),

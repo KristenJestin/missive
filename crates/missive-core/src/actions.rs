@@ -34,6 +34,10 @@
 //! A removal whose `UID EXPUNGE` was refused takes its `\Deleted` back, so that no other
 //! client's `EXPUNGE` removes the message later.
 //!
+//! A move refused once its `UID COPY` was made leaves the messages in both folders. Nothing is
+//! removed to fix it: the copy shows both, the outcome says so, and the messages are recorded as
+//! half moved ([`crate::copy::Copy::half_moved`]) until the user removes one of the two.
+//!
 //! A `UID COPY` whose answer was never read (the connection was cut) may or may not have
 //! copied: before copying again, the target's UIDNEXT tells whether anything arrived there since,
 //! and if so, each message is looked for there by its `Message-ID`, and a message found counts as
@@ -186,10 +190,12 @@ pub enum Result {
     },
     /// It was dropped and its change taken back from the copy. `reason` is `renumbered`,
     /// `no-such-folder`, `unsupported`, `refused` or `connection` (it failed that way
-    /// [`MAX_ATTEMPTS`] times).
+    /// [`MAX_ATTEMPTS`] times). `copied`: a move the server refused once it had copied the
+    /// messages, which are in both folders now; nothing is removed to fix it but by the user.
     Refused {
         reason: &'static str,
         message: String,
+        copied: bool,
     },
 }
 
@@ -357,14 +363,15 @@ async fn round(
                         reason: "connection",
                     }));
                 } else {
-                    refuse(store, &action, applied)?;
-                    applied.outcomes.push(outcome(Result::Refused {
-                        reason: "connection",
-                        message: format!(
+                    let copied = refuse(store, &action, applied)?;
+                    applied.outcomes.push(outcome(refused(
+                        "connection",
+                        format!(
                             "it failed {attempts} times: the connection was lost, the server's \
                              answer could not be used, or none came in time"
                         ),
-                    }));
+                        copied,
+                    )));
                 }
                 return Err(error);
             }
@@ -385,33 +392,52 @@ async fn round(
                     // The actions after it wait, so that they are applied in order.
                     return Ok(());
                 }
-                refuse(store, &action, applied)?;
-                Result::Refused {
-                    reason: "refused",
-                    message: format!("the server refused it {attempts} times ({why})"),
-                }
+                let copied = refuse(store, &action, applied)?;
+                refused(
+                    "refused",
+                    format!("the server refused it {attempts} times ({why})"),
+                    copied,
+                )
             }
             Step::Refused(reason, message) => {
-                refuse(store, &action, applied)?;
-                Result::Refused {
-                    reason,
-                    message: message.to_owned(),
-                }
+                let copied = refuse(store, &action, applied)?;
+                refused(reason, message.to_owned(), copied)
             }
         };
         applied.outcomes.push(outcome(result));
     }
 }
 
-/// Drops an action and takes its change back from the copy; the folder is synced again.
+/// Drops an action and takes its change back from the copy; the folder is synced again, and the
+/// target too when the move had copied the messages there. Returns whether it had.
 fn refuse(
     store: &mut Store,
     action: &Action,
     applied: &mut Applied,
-) -> std::result::Result<(), SyncError> {
-    store.refused(action)?;
+) -> std::result::Result<bool, SyncError> {
+    let copied = store.refused(action)?;
     applied.resync.insert(action.folder.id);
-    Ok(())
+    if copied && let Some(target) = &action.target {
+        applied.resync.insert(target.id);
+    }
+    Ok(copied)
+}
+
+/// What a refused action says, for people: `why`, and for a move that had copied the messages,
+/// where they are now.
+fn refused(reason: &'static str, why: String, copied: bool) -> Result {
+    let message = if copied {
+        format!(
+            "{why}; the server had copied the messages to the target first, so they are in both              folders now: nothing was removed, delete or move one of the two"
+        )
+    } else {
+        why
+    };
+    Result::Refused {
+        reason,
+        message,
+        copied,
+    }
 }
 
 /// What one try of an action came to.

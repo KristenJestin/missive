@@ -1605,3 +1605,110 @@ async fn a_copy_whose_answer_never_came_is_not_trusted_to_another_message_with_i
         assert_eq!(env.uids("INBOX"), [1, 2, 4]);
     }
 }
+
+impl Env {
+    /// `missive status --json`, the account `alice`.
+    async fn status_of_alice(&self) -> serde_json::Value {
+        let output = self.act(&["status", "--json"]).await;
+        succeeded(&output);
+        let status: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        status["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "alice")
+            .unwrap()
+            .clone()
+    }
+}
+
+/// A subscription to the daemon's events.
+struct Events(tokio::io::Lines<BufReader<UnixStream>>);
+
+impl Events {
+    async fn subscribe(env: &Env) -> Events {
+        let mut stream = UnixStream::connect(env.socket()).await.unwrap();
+        stream
+            .write_all(b"{\"protocol\":1,\"request\":\"subscribe\"}\n")
+            .await
+            .unwrap();
+        Events(BufReader::new(stream).lines())
+    }
+
+    /// The next `action` event.
+    async fn action(&mut self) -> serde_json::Value {
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(30), self.0.next_line())
+                .await
+                .expect("an event in time")
+                .unwrap()
+                .unwrap();
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if event["event"] == "action" {
+                return event;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_refused_after_its_copy_says_the_message_is_in_both_folders_and_removes_nothing() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    for pass in 1..=5 {
+        let event = events.action().await;
+        assert_eq!(
+            event["outcome"],
+            if pass < 5 { "retried" } else { "refused" }
+        );
+        if pass < 5 {
+            succeeded(&sync_soon(&env).await);
+        } else {
+            assert_eq!(event["copied"], true, "{event}");
+            let message = event["message"].as_str().unwrap();
+            assert!(message.contains("both"), "{message}");
+        }
+    }
+
+    // Nothing was removed: the message is in both folders, on the server and in the copy.
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(server.flags("INBOX", 3), Some(Vec::new()));
+    assert_eq!(server.uids("Archive"), [1]);
+    eventually(10, "the copy in the archive", || env.uids("Archive") == [1]).await;
+    assert_eq!(env.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(env.shown_uids("INBOX"), [1, 2, 3, 4]);
+
+    // `status` says so, until the user removed one of the two.
+    let copy = env.id("Archive", 1);
+    assert_eq!(
+        env.status_of_alice().await["half_moved"],
+        serde_json::json!([{
+            "message": three, "copy": copy, "folder": "inbox", "target": "archive",
+        }])
+    );
+    let text = stdout(&env.act(&["status"]).await);
+    assert!(text.contains("in both inbox and archive"), "{text}");
+    // A pass does not forget it.
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(
+        env.status_of_alice().await["half_moved"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The user deletes the copy in the archive: nothing is left half moved.
+    server.heal();
+    succeeded(&env.act(&["delete", &copy]).await);
+    eventually(20, "the queue empty", || env.queue() == 0).await;
+    succeeded(&sync_soon(&env).await);
+    assert_eq!(server.uids("Archive"), Vec::<u32>::new());
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(
+        env.status_of_alice().await["half_moved"],
+        serde_json::json!([])
+    );
+}

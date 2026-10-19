@@ -1639,14 +1639,22 @@ impl Worker {
 
     /// Logs what became of an action, and tells the watchers.
     fn tell_outcome(&mut self, outcome: &Outcome) {
-        let (name, reason, attempts, message) = match &outcome.result {
-            actions::Result::Applied => ("applied", None, None, None),
+        let (name, reason, attempts, message, copied) = match &outcome.result {
+            actions::Result::Applied => ("applied", None, None, None, None),
             actions::Result::Retried { attempts, reason } => {
-                ("retried", Some(*reason), Some(*attempts), None)
+                ("retried", Some(*reason), Some(*attempts), None, None)
             }
-            actions::Result::Refused { reason, message } => {
-                ("refused", Some(*reason), None, Some(message.clone()))
-            }
+            actions::Result::Refused {
+                reason,
+                message,
+                copied,
+            } => (
+                "refused",
+                Some(*reason),
+                None,
+                Some(message.clone()),
+                copied.then_some(true),
+            ),
         };
         log!(
             "account {}: action {} ({}, {} messages) {name}{}",
@@ -1668,6 +1676,7 @@ impl Worker {
             reason: reason.map(str::to_owned),
             attempts,
             message,
+            copied,
         }));
     }
 

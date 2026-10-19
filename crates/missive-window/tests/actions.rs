@@ -300,6 +300,7 @@ async fn a_refused_event_shows_the_notice_and_the_message_comes_back() {
         reason: Some("no-such-folder".to_owned()),
         attempts: None,
         message: Some("the server has no such target folder".to_owned()),
+        copied: None,
     }));
     let notice = model.notice.clone().expect("a notice");
     assert!(notice.contains("no-such-folder"), "{notice}");
@@ -319,6 +320,7 @@ async fn an_applied_or_retried_action_shows_no_notice() {
             reason: reason.map(str::to_owned),
             attempts: reason.map(|_| 1),
             message: None,
+            copied: None,
         }));
         assert!(model.notice.is_none(), "{outcome}");
     }
