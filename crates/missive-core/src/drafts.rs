@@ -18,7 +18,9 @@
 //!
 //! 1. `SELECT` the Drafts folder, and `UID SEARCH HEADER Message-ID "<id>" HEADER
 //!    X-Missive-Draft "1"`: the versions it already holds, one from an `APPEND` whose answer was
-//!    lost included.
+//!    lost included. A Message-ID that is not ASCII cannot be written as a quoted string, and a
+//!    server answers `BAD` to it: it is not searched for, and only the versions the copy holds
+//!    are known.
 //! 2. `APPEND <drafts> (\Draft \Seen)` of the new version. Its UID comes from `APPENDUID`
 //!    (UIDPLUS), else from the same search, made again. A version tried before is first looked
 //!    for among those found (`UID FETCH <uids> (UID BODY.PEEK[])`): one identical byte for byte
@@ -247,8 +249,12 @@ async fn one(
     let Some(uidvalidity) = server.select(name).await? else {
         return Ok(Step::No("select"));
     };
-    // With its angle brackets: `3@` does not match `13@`.
-    let search = sync::quote(&format!("<{}>", draft.message_id))
+    // With its angle brackets: `3@` does not match `13@`. A quoted string holds ASCII only, and a
+    // server answers `BAD` to more, at every pass: such a Message-ID (another client's) is not
+    // looked for, and the versions the copy holds stand for what the server holds.
+    let search = Some(&draft.message_id)
+        .filter(|id| id.is_ascii())
+        .and_then(|id| sync::quote(&format!("<{id}>")))
         .map(|id| format!("HEADER Message-ID {id} HEADER {OWN_DRAFT} \"1\""));
     let mut old = BTreeSet::new();
     if let Some(search) = &search {
@@ -256,9 +262,9 @@ async fn one(
             return Ok(Step::No("search"));
         };
         old.extend(found);
-        if in_copy == Some(uidvalidity) {
-            old.extend(store.draft_uids(folder, &draft.message_id)?);
-        }
+    }
+    if in_copy == Some(uidvalidity) {
+        old.extend(store.draft_uids(folder, &draft.message_id)?);
     }
 
     // A version tried before may be there already, from an `APPEND` whose answer was lost: it is

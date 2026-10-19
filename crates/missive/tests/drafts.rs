@@ -1156,6 +1156,39 @@ async fn without_uidplus_a_sent_draft_left_in_drafts_is_not_sent_a_second_time()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_non_ascii_message_id_is_not_put_in_a_quoted_search_and_the_draft_settles() {
+    // A server that answers BAD to a quoted string holding more than ASCII.
+    let server = with_drafts(
+        Folder::new("Drafts")
+            .special_use(SpecialUse::Drafts)
+            .message(
+                Message::new(
+                    "From: Alice Example <alice@example.org>\r\nTo: zoe.recipient@example.com\r\n\
+                     Subject: Elsewhere\r\nMessage-ID: <café-1@example.com>\r\n\
+                     X-Missive-Draft: 1\r\n\r\nA body.\r\n",
+                )
+                .flag("\\Draft"),
+            ),
+    )
+    .bad("UID SEARCH HEADER Message-ID \"<caf\u{e9}")
+    .start()
+    .await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = env.drafts().await[0]["id"].as_str().unwrap().to_owned();
+
+    env.save(&["--draft", &id, "--subject", "Changed"]).await;
+
+    settled(&env).await;
+    drafts_on_server(&server, &["Changed"]).await;
+    let appends = server
+        .imap_log()
+        .iter()
+        .filter(|line| line.starts_with("APPEND"))
+        .count();
+    assert_eq!(appends, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn without_a_drafts_folder_the_draft_stays_local_and_status_says_so() {
     let server = FakeServer::builder()
         .user(USER, PASSWORD)
