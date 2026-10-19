@@ -152,7 +152,7 @@ the daemon tried it on the server.
 
 ```json
 {"protocol": 1, "event": "action", "account": "alice", "action": "read",
- "outcome": "applied", "messages": ["alice/1/1745112/4"]}
+ "outcome": "applied", "messages": ["alice/1/1745112/4"], "id": 12}
 ```
 
 | Field | Type | |
@@ -161,9 +161,11 @@ the daemon tried it on the server.
 | `action` | string | `read`, `unread`, `flagged`, `unflagged`, `answered` (set once a reply is sent), `move`, `delete` (a move to the trash) or `delete-permanently` |
 | `outcome` | string | `applied`, `retried` or `refused` |
 | `messages` | array of strings | the identifiers of the messages, as they were when the action was asked |
+| `id` | number | the action's number, as the answer to its request gave it (`actions`, `docs/protocol.md`): no other action ever has it |
 | `reason` | string | with `retried` and `refused` only: why, for programs (below) |
 | `attempts` | number | with `retried` only: how many times it failed so far |
 | `message` | string | with `refused` only: why, for people |
+| `copied` | `true` | with a refused `move` or `delete` only, and only when the server had copied the messages to the target before the move was refused: they are in both folders (below) |
 
 An action on messages of several folders is one action per folder, each with its event.
 
@@ -184,6 +186,13 @@ An action on messages of several folders is one action per folder, each with its
   malformed) or `connection` (it failed 5 times that way). A move or a permanent delete whose
   `UID EXPUNGE` the server refused takes its `\Deleted` flag back on the server, so that another
   client's `EXPUNGE` does not remove the message later.
+
+A move on a server without `MOVE` is a `UID COPY`, then the removal of the messages from their
+folder. When the removal is refused for good (or the folder renumbered) once the copy was made,
+the messages are in both folders: the event has `copied` `true`, its `message` says so, the copy
+shows both (the copy in the target too, when the server told its UID), and `missive status` lists
+each message in `half_moved` until the user deletes or moves one of the two. Nothing is removed to
+fix it without the user.
 
 ### `sent`
 

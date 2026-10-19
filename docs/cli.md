@@ -203,9 +203,13 @@ the daemon runs.
       "drafts": [
         { "id": "4b2e…@example.org", "state": "waiting", "saved_at": 1792220300, "attempts": 0,
           "last_error": null }
+      ],
+      "half_moved": [
+        { "message": "alice/1/1745112/4", "copy": "alice/2/1745113/9", "folder": "inbox",
+          "target": "archive" }
       ] },
     { "id": "bob", "state": null, "syncing": false, "last_sync": null, "messages": 0,
-      "skipped": [], "outbox": [], "drafts": [] }
+      "skipped": [], "outbox": [], "drafts": [], "half_moved": [] }
   ]
 }
 ```
@@ -236,6 +240,10 @@ the daemon runs.
 | `accounts[].drafts[].saved_at` | number | when its version was saved, in seconds since the epoch |
 | `accounts[].drafts[].attempts` | number | the tries that failed (tried again at the next pass) |
 | `accounts[].drafts[].last_error` | string or `null` | the last kind of error |
+| `accounts[].half_moved` | array | the messages a move left in two folders: the server refused to remove them after it had copied them (a server without `MOVE`; see [Changing messages](#changing-messages)), oldest first, `[]` when none |
+| `accounts[].half_moved[].message` | string | the message's identifier, in the folder it was to leave |
+| `accounts[].half_moved[].copy` | string or `null` | the identifier of its copy in the target; `null` when the server did not tell its UID (the copy is in the target all the same) |
+| `accounts[].half_moved[].folder`, `.target` | string | the folder it was to leave and its target: their roles, else their names |
 
 `ready` does not mean the copy is complete: a folder the server refuses is skipped, the others are
 synced, and the account is `ready` all the same. `skipped` is what keeps that from being silent. It
@@ -265,7 +273,11 @@ A line reads `unknown (the daemon is not running)` in the place of the state whe
 each stuck one (`stuck` above) and for each sent one whose copy could not be looked for in Sent
 (`copy_search_failures` above). An account whose drafts wait in the copy has a line more too,
 `	drafts: 1 to write to the Drafts folder` (or `kept in the local copy: the account has no
-Drafts folder`), and one line for each draft whose last try failed.
+Drafts folder`), and one line for each draft whose last try failed. Each message of `half_moved`
+has a line: `	half moved: alice/1/1745112/4 is in both inbox and archive, since the server refused to
+remove it after copying it; delete or move one of the two`. A message leaves `half_moved` once one
+of the two is gone from the copy (the user deleted or moved it, or another client did); a copy
+written before this field existed says `[]`.
 
 ### `missive unread [--json]`
 
@@ -619,25 +631,28 @@ several. They ask the daemon (starting one when none answers, as `sync` does), w
 1. records the action in the local copy, in a queue, together with its effect: the message reads
    as seen, shows in its new folder, or is gone, in `list`, `search`, `show` and `unread` at once;
 2. answers: the command returns as soon as the action is recorded, whether the server can be
-   reached or not;
+   reached or not (with `--wait`, once the server applied or refused it: see below);
 3. applies it on the server when the account is connected, in the order the actions were asked,
    and reconciles the copy with what the server answered. Offline, the queue waits for the
    connection; a daemon stopped or killed in between applies it when it starts again.
 
 `missive watch` tells what became of each action (an `action` event, `docs/events.md`): applied,
 tried again later, or refused. A refused action is taken back from the copy: the message shows as
-the server has it.
+the server has it. A move the server refused after it had copied the messages (a server without
+`MOVE`) leaves them in both folders: the event says so (`copied`), and `status` lists them
+(`half_moved`) until the user deletes or moves one of the two; nothing is removed without the
+user.
 
 While a move waits for the server, the message is shown in its new folder, but its identifier
 still names the folder the server has it in; once moved, it has a new identifier there (its UID in
 that folder), as it would if another client had moved it. A message whose move waits takes no
 other action until the server moved it (`busy`).
 
-### `missive mark <message id>… --read | --unread | --flagged | --unflagged [--json]`
+### `missive mark <message id>… --read | --unread | --flagged | --unflagged [--wait [--timeout <seconds>]] [--json]`
 
 Adds or removes the `\Seen` or the `\Flagged` flag.
 
-### `missive move <message id>… --to <role or folder name> [--json]`
+### `missive move <message id>… --to <role or folder name> [--wait [--timeout <seconds>]] [--json]`
 
 Moves the messages to another folder of their account: a role (`inbox`, `sent`, `drafts`,
 `trash`, `junk`, `archive`) or a folder's name as the server gives it (`unread` shows them). A
@@ -645,9 +660,12 @@ role is looked for first, then a name. A message already in that folder is left 
 
 The server must have `MOVE`, or else `UIDPLUS` (the move is then a copy, followed by the removal
 of exactly those messages). A server with neither refuses the move: removing a message there
-would also remove every message another client marked deleted in the same folder.
+would also remove every message another client marked deleted in the same folder. The daemon
+records what the server can do at each connection: once it knows, such a move is refused when it
+is asked, and nothing is recorded; before the account's first connection, it is recorded and
+refused when it is tried.
 
-### `missive delete <message id>… [--permanently] [--json]`
+### `missive delete <message id>… [--permanently] [--wait [--timeout <seconds>]] [--json]`
 
 Without `--permanently`, moves the messages to their account's trash (the folder with the
 `trash` role). A message already in the trash is refused, and so is a message of an account that
@@ -668,11 +686,42 @@ connected.`. With `--json`, one object:
 
 `messages` holds the identifiers the action was recorded for, each once, in the order given.
 
+#### `--wait`
+
+With `--wait`, the command answers once the server applied or refused the actions, rather than
+once they are recorded. The wait is bounded: it ends when an account of the request is offline
+(`no-login`, `auth-refused`, `certificate-refused` or `unreachable`: its queue waits for the
+connection, so waiting would only end at the timeout), when the daemon stops, or after
+`--timeout` seconds (60 by default). An action left in the queue then is not lost: the daemon
+applies it as it would without `--wait`.
+
+For people, the line ends with what became of them: `1 message marked read; applied on the
+server.`, `…; refused by the server: <why>.` or `…; still queued: the account is unreachable.`
+With `--json`, the object has two fields more:
+
+```json
+{"messages": ["alice/1/1745112/4"], "outcome": "applied",
+ "actions": [{"id": 12, "outcome": "applied"}]}
+```
+
+| Field | Type | |
+|---|---|---|
+| `outcome` | string | `applied` (every action), `refused` (one at least was refused) or `queued` (one at least is still in the queue, none refused) |
+| `actions` | array | one per action recorded (one per folder of the messages), in the order of the answer |
+| `actions[].id` | number | the action's number, as the `action` events give it (`docs/events.md`) |
+| `actions[].outcome` | string | `applied`, `refused` or `queued` |
+| `actions[].reason` | string | with `refused`: the `reason` of the `action` event; with `queued`: the state of the account that is offline (`unreachable`…), `timeout` or `gone` (the daemon stopped) |
+| `actions[].message` | string | with `refused`: why, for people |
+| `actions[].copied` | `true` | with a refused move that left the messages in two folders (`docs/events.md`) |
+
+The exit status tells them apart: 0 when every action was applied, 5 when one was refused, 4 when
+one is still queued (and none refused). The line or the object is printed in every case.
+
 A request is checked whole before anything is recorded: when one identifier names no message, or
 the action cannot apply to one of them, nothing is recorded and the command fails, saying why on
 standard error. The exit status is 3 when an identifier names no message (as for `show`), 1 for
 every other refusal: a folder that does not exist, `--permanently` outside the trash, a message
-whose move waits, an account that is not configured.
+whose move waits, an account that is not configured, an action the server cannot apply.
 
 ## Sending
 
@@ -710,6 +759,12 @@ one line says the draft is saved, with its identifier. With `--json`, one object
 ```json
 {"id": "4b2e…@example.org"}
 ```
+
+When a display is there (`WAYLAND_DISPLAY` or `DISPLAY` is set), the draft, once saved, is also
+opened in the **compose window**: `missive-window compose --account <id> --draft <draft id>`,
+the `missive-window` beside `missive`, else the one on the `PATH`, started on its own (the
+command returns at once). The output is the same; a window that cannot start is said on standard
+error, and the draft stays saved. Without a display, nothing is opened.
 
 #### Replying and forwarding
 
@@ -857,8 +912,9 @@ one a killed daemon left) first looks for the message in Sent by its `Message-ID
 ### `missive mailto <uri> [--account <id>] [--json]`
 
 Composes from a `mailto:` link (RFC 6068), as the system's handler for them: the desktop entry
-`missive-mailto.desktop` runs `missive mailto %u`. Until the compose window exists, the link is
-saved as a **draft** (see `missive compose`), and nothing is opened. For people, one line gives
+`missive-mailto.desktop` runs `missive mailto %u`. The link is saved as a **draft** (see
+`missive compose`) and, when a display is there, the draft is then opened in the compose window,
+as `compose` does; without a display, nothing is opened. For people, one line gives
 the draft's identifier and says where to find it (`missive list --folder drafts`); with `--json`,
 one object, as `compose` prints:
 

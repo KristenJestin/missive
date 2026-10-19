@@ -201,22 +201,7 @@ async fn portal<B>(connection: &Connection, method: &str, body: &B) -> zbus::Res
 where
     B: Serialize + DynamicType,
 {
-    let sender = connection
-        .unique_name()
-        .map(|name| name.trim_start_matches(':').replace('.', "_"))
-        .unwrap_or_default();
-    // Listened to before the call, as the portal documents, so that no answer is missed.
-    let request = format!(
-        "/org/freedesktop/portal/desktop/request/{sender}/{}",
-        token()
-    );
-    let rule = MatchRule::builder()
-        .msg_type(Type::Signal)
-        .interface("org.freedesktop.portal.Request")?
-        .member("Response")?
-        .path(request.as_str())?
-        .build();
-    let mut answers = MessageStream::for_match_rule(rule, connection, Some(1)).await?;
+    let mut answers = responses(connection, &token()).await?;
     connection
         .call_method(
             Some("org.freedesktop.portal.Desktop"),
@@ -232,6 +217,23 @@ where
     // 0: opened; 1: the user cancelled, which is their answer; 2: the portal could not.
     let (code, _): (u32, HashMap<String, OwnedValue>) = answer?.body().deserialize()?;
     Ok(code != 2)
+}
+
+/// The `Response` of the portal request that a call with `token` as its `handle_token` makes:
+/// listened to before the call, as the portal documents, so that no answer is missed.
+pub(crate) async fn responses(connection: &Connection, token: &str) -> zbus::Result<MessageStream> {
+    let sender = connection
+        .unique_name()
+        .map(|name| name.trim_start_matches(':').replace('.', "_"))
+        .unwrap_or_default();
+    let request = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
+    let rule = MatchRule::builder()
+        .msg_type(Type::Signal)
+        .interface("org.freedesktop.portal.Request")?
+        .member("Response")?
+        .path(request.as_str())?
+        .build();
+    MessageStream::for_match_rule(rule, connection, Some(1)).await
 }
 
 /// Starts `xdg-open` and returns at once: the browser may live long. It gets exactly the

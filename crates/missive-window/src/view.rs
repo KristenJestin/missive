@@ -19,8 +19,9 @@ use missive_core::copy::{Person, local_time};
 use missive_core::opener::followable;
 use missive_core::protocol::{Answer, Command};
 
+use crate::compose_view::{self, Chooser};
 use crate::images::MessageImages;
-use crate::model::{Body, Daemon, Model, Opened, Reader};
+use crate::model::{Body, Daemon, Model, Opened, Reader, Start};
 
 actions!(
     missive_window,
@@ -33,7 +34,12 @@ actions!(
         ToggleFlag,
         Archive,
         MoveTo,
-        Delete
+        Delete,
+        NewMessage,
+        Reply,
+        ReplyAll,
+        Forward,
+        EditDraft
     ]
 );
 
@@ -42,6 +48,7 @@ const CONTEXT: &str = "MissiveWindow";
 
 /// Up and down in the list, Enter to open, Escape back; U, S, A, M and Delete act on the open
 /// message. In the folder picker and the confirmation, up, down, Enter and Escape are theirs.
+/// N writes a new message; R, Shift+R and F answer the open message; E picks a draft up again.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("up", SelectPrevious, Some(CONTEXT)),
@@ -53,7 +60,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("a", Archive, Some(CONTEXT)),
         KeyBinding::new("m", MoveTo, Some(CONTEXT)),
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
+        KeyBinding::new("n", NewMessage, Some(CONTEXT)),
+        KeyBinding::new("r", Reply, Some(CONTEXT)),
+        KeyBinding::new("shift-r", ReplyAll, Some(CONTEXT)),
+        KeyBinding::new("f", Forward, Some(CONTEXT)),
+        KeyBinding::new("e", EditDraft, Some(CONTEXT)),
     ]);
+    crate::compose_view::bind_keys(cx);
 }
 
 /// What the window asks the system to open, only ever on the user's click.
@@ -85,6 +98,8 @@ pub struct MailWindow {
     asking: bool,
     /// The system's sans-serif family, when it is installed.
     font: Option<SharedString>,
+    /// The file chooser of the compose windows this window opens.
+    chooser: Chooser,
 }
 
 impl MailWindow {
@@ -114,7 +129,25 @@ impl MailWindow {
             opener,
             asker,
             asking: false,
+            chooser: Arc::new(|| Err("the file chooser is not available".to_owned())),
         }
+    }
+
+    /// The file chooser the compose windows ask for files to attach.
+    pub fn with_chooser(mut self, chooser: Chooser) -> Self {
+        self.chooser = chooser;
+        self
+    }
+
+    /// Opens a compose window for `start`, when the model has something to start from.
+    pub fn compose(&mut self, start: Start, cx: &mut Context<Self>) {
+        if let Some(compose) = self.model.compose(start)
+            && let Err(e) =
+                compose_view::open(compose, self.asker.clone(), self.chooser.clone(), cx)
+        {
+            self.model.notice = Some(format!("The compose window cannot open: {e}."));
+        }
+        self.changed(cx);
     }
 
     /// After the model changed: the open message is reduced off this thread, its read timer
@@ -218,6 +251,26 @@ impl MailWindow {
         self.changed(cx);
     }
 
+    fn new_message(&mut self, _: &NewMessage, _: &mut Window, cx: &mut Context<Self>) {
+        self.compose(Start::New, cx);
+    }
+
+    fn reply(&mut self, _: &Reply, _: &mut Window, cx: &mut Context<Self>) {
+        self.compose(Start::Reply, cx);
+    }
+
+    fn reply_all(&mut self, _: &ReplyAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.compose(Start::ReplyAll, cx);
+    }
+
+    fn forward(&mut self, _: &Forward, _: &mut Window, cx: &mut Context<Self>) {
+        self.compose(Start::Forward, cx);
+    }
+
+    fn edit_draft(&mut self, _: &EditDraft, _: &mut Window, cx: &mut Context<Self>) {
+        self.compose(Start::Draft, cx);
+    }
+
     fn back(&mut self, _: &Back, _: &mut Window, cx: &mut Context<Self>) {
         self.model.back();
         self.changed(cx);
@@ -231,7 +284,7 @@ fn images_of(model: &Model) -> Arc<MessageImages> {
     })
 }
 
-fn is_dark(appearance: WindowAppearance) -> bool {
+pub(crate) fn is_dark(appearance: WindowAppearance) -> bool {
     matches!(
         appearance,
         WindowAppearance::Dark | WindowAppearance::VibrantDark
@@ -313,6 +366,11 @@ impl Render for MailWindow {
             .on_action(cx.listener(Self::archive))
             .on_action(cx.listener(Self::move_to))
             .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::new_message))
+            .on_action(cx.listener(Self::reply))
+            .on_action(cx.listener(Self::reply_all))
+            .on_action(cx.listener(Self::forward))
+            .on_action(cx.listener(Self::edit_draft))
             .size_full()
             .flex()
             .flex_col()
@@ -366,7 +424,13 @@ impl MailWindow {
             .bg(palette.pane)
             .border_r_1()
             .border_color(palette.line)
-            .py_2();
+            .py_2()
+            .child(
+                div().px_3().pb_1().flex().child(
+                    button("new-message", "New message", Some("N"), palette)
+                        .on_click(cx.listener(|this, _, _, cx| this.compose(Start::New, cx))),
+                ),
+            );
         if self.model.accounts.is_empty() {
             pane = pane.child(
                 div()
@@ -628,11 +692,27 @@ impl MailWindow {
             ("flag", "Flag")
         };
         let forever = self.model.deletes_for_good();
+        let start = |start: Start| {
+            cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| this.compose(start, cx))
+        };
+        let draft = opened.folder.role.as_deref() == Some("drafts");
         div()
             .mt_2()
             .flex()
             .flex_wrap()
             .gap_2()
+            .when(draft, |row| {
+                row.child(
+                    button("edit-draft", "Edit draft", Some("E"), palette)
+                        .on_click(start(Start::Draft)),
+                )
+            })
+            .child(button("reply", "Reply", Some("R"), palette).on_click(start(Start::Reply)))
+            .child(
+                button("reply-all", "Reply all", Some("Shift+R"), palette)
+                    .on_click(start(Start::ReplyAll)),
+            )
+            .child(button("forward", "Forward", Some("F"), palette).on_click(start(Start::Forward)))
             .when(!opened.unread, |row| {
                 row.child(
                     button("mark-unread", "Mark unread", Some("U"), palette)
@@ -746,7 +826,7 @@ impl MailWindow {
 }
 
 /// A button of the reader, with the key that does the same.
-fn button(
+pub(crate) fn button(
     id: &'static str,
     label: &'static str,
     key: Option<&'static str>,

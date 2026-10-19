@@ -60,7 +60,8 @@
 //! a client pinning [`FakeServer::certificate_pem`] accepts it.
 //!
 //! [`FakeKeyring`] is the keyring's counterpart: a fake Secret Service on a private session bus;
-//! [`FakePortal`], a fake desktop portal that opens files, on another.
+//! [`FakePortal`], a fake desktop portal that opens files, on another; [`FakeFileChooser`], its
+//! file chooser, on a third.
 
 mod bus;
 mod imap;
@@ -69,7 +70,7 @@ mod portal;
 mod smtp;
 
 pub use keyring::{FakeItem, FakeKeyring, PromptAnswer};
-pub use portal::{FakePortal, PortalAnswer, PortalCall};
+pub use portal::{ChooserCall, Chosen, FakeFileChooser, FakePortal, PortalAnswer, PortalCall};
 
 use std::future::Future;
 use std::net::SocketAddr;

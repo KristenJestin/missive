@@ -114,6 +114,10 @@ pub struct SaveDraft {
     /// server took the message.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub send: bool,
+    /// With `send`: the identifier of the message the draft is a reply to, marked answered once
+    /// the server took the reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<String>,
 }
 
 /// A message to send: addresses as `name@example.org` or `Name <name@example.org>`.
@@ -195,6 +199,9 @@ pub struct Answer {
     /// The messages an action was recorded for, by identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<String>>,
+    /// The numbers of the actions recorded, as their `action` events give them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<i64>>,
     /// The number of a message put in the outbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbox: Option<i64>,
@@ -498,6 +505,23 @@ mod tests {
             command: Command::Draft(SaveDraft {
                 account: "alice".to_owned(),
                 in_reply_to: Some("1@example.org".to_owned()),
+                ..SaveDraft::default()
+            }),
+        };
+        assert_eq!(read_request(line), Ok(request.clone()));
+        assert_eq!(serde_json::to_string(&request).unwrap(), line);
+    }
+
+    #[test]
+    fn a_draft_sent_may_name_the_message_it_is_a_reply_to() {
+        let line = r#"{"protocol":1,"request":"draft","account":"alice","draft":"1@example.org","send":true,"answers":"alice/1/2/3"}"#;
+        let request = Request {
+            protocol: 1,
+            command: Command::Draft(SaveDraft {
+                account: "alice".to_owned(),
+                draft: Some("1@example.org".to_owned()),
+                send: true,
+                answers: Some("alice/1/2/3".to_owned()),
                 ..SaveDraft::default()
             }),
         };

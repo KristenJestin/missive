@@ -58,6 +58,7 @@ An answer with `"ok": false` says why in `error`, for programs, and in `message`
 | `no-trash` | a `delete` without `permanently`, in an account that has no trash |
 | `in-trash` | a `delete` without `permanently` of a message already in the trash |
 | `not-in-trash` | a `delete` with `permanently` of a message outside the trash, in an account that has one |
+| `unsupported` | a `move`, `delete` or `delete` with `permanently` the account's server cannot apply safely: it has neither `MOVE` nor `UIDPLUS` (a move), or no `UIDPLUS` (a permanent delete). Known from the server's capabilities, recorded at each connection; before the first one, the action is recorded, and refused when tried (`docs/events.md`) |
 | `busy` | a message whose move waits for the server: it takes no other action until then; or a `draft` naming a draft whose message waits in the outbox |
 | `uncertain` | a `resend` without `yes` of an `uncertain` message: the server may have taken it already |
 | `not-failed` | a `resend` or a `discard` of a message that is neither `failed` nor `uncertain` (`message` says its state) |
@@ -107,8 +108,14 @@ the copy, in one transaction, and answered: nothing waits for the server, which 
 unreachable. The answer gives the identifiers recorded, each once, in the order of the request:
 
 ```json
-{"protocol": 1, "answer": "mark", "ok": true, "messages": ["alice/1/1745112/4"]}
+{"protocol": 1, "answer": "mark", "ok": true, "messages": ["alice/1/1745112/4"], "actions": [12]}
 ```
+
+`actions` gives the numbers of the actions recorded, one per folder of the messages: the `id` of
+their `action` events. A number names one action for ever, never another one later. To follow a
+request until the server applied it (as `missive mark --wait` does), a client subscribes, then
+sends the request on the same connection: the events that come before the answer are kept and
+matched once the answer gives the numbers.
 
 A request that cannot apply to one of its messages records nothing, and is answered with one of
 the errors above. The daemon then applies the queue on the server, in order, when the account is
@@ -186,8 +193,9 @@ Saves a draft: a new one, or a new version of the draft `draft` names. With `sen
 | `draft` | string, absent for a new draft | the draft to pick up again: its identifier (its `Message-ID`), or the identifier of a message of the account's Drafts folder, as `list` prints it |
 | `to`, `cc`, `bcc`, `subject`, `body`, `attachments` | as for `send`, each absent to keep the draft's own | the fields that replace the draft's; for a new draft, those absent are empty. No recipient is needed |
 | `in_reply_to` | string, absent to keep the draft's own | the `Message-ID`, without angle brackets, of the message the draft answers |
-| `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered, sent or not |
+| `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered unless `answers` names it |
 | `send` | boolean, `false` when absent | send the draft, as it is once changed (at least one recipient then); it is removed from the Drafts folder once the server took the message |
+| `answers` | string, optional | with `send`: the identifier of the message the draft is a reply to, as for `send`; marked answered once the server took the reply |
 
 The daemon saves the draft in the local copy (and, with `send`, puts the message in the outbox),
 and answers: nothing waits for the server. It then writes the draft to the account's Drafts
@@ -200,12 +208,15 @@ it went.
 
 `message_id` is the draft's identifier, its `Message-ID` without angle brackets, the same for
 every version of the draft. With `send`, the answer also has `outbox`, as for `send`. A `draft`
-that names no draft of the account is answered `no-such-message`.
+that names no draft of the account is answered `no-such-message`. A `draft` naming a draft whose
+message still waits in the outbox is answered `busy`: a client that lost the answer to its `send`
+and asks again sends nothing twice.
 
 A `draft` naming a draft another client wrote (one without Missive's `X-Missive-Draft` header)
 does not replace it: the daemon makes a new draft from it, under a new `message_id`, and the
 answer also has `kept`, the `draft` given, which stays on the server as it is (and is not removed
-once the message is sent).
+once the message is sent). It is answered `busy` too while a message sent from it waits in the
+outbox, whether it is named by its identifier in `list` or by its `Message-ID`.
 
 ### `subscribe`
 

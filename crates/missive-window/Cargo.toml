@@ -23,6 +23,8 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
+# The message the fake SMTP server took, read back (`tests/daemon.rs`).
+mail-parser.workspace = true
 gpui-kit = { version = "=0.7.3", default-features = false, features = ["test-support"] }
 missive-core = { workspace = true, features = ["fake"] }
 tempfile.workspace = true

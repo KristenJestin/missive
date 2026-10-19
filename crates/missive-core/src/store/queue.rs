@@ -4,8 +4,8 @@
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use super::Store;
-use crate::actions::{Kind, Queued, Refused, Wanted, with_flag};
+use super::{NewMessage, Store};
+use crate::actions::{Kind, Queued, Refused, Wanted, unsupported, with_flag};
 use crate::copy::{MessageId, NotFound};
 use crate::sync::CopyUid;
 
@@ -39,6 +39,16 @@ pub struct Action {
     pub target_uidnext: Option<u32>,
     pub copied: Option<CopyUid>,
     pub attempts: u32,
+}
+
+/// What the copy kept of a message that a copy of it on the server has too: `UID COPY` keeps the
+/// raw message, so its size, and the INTERNALDATE (RFC 3501, 6.4.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// Without its angle brackets.
+    pub message_id: Option<String>,
+    pub size: i64,
+    pub internal_date: Option<i64>,
 }
 
 /// The messages of one folder a request names.
@@ -201,20 +211,42 @@ pub(super) fn queue_in(
                 (Kind::DeletePermanently, None)
             }
         };
+        let capabilities: (Option<bool>, Option<bool>) = transaction.query_row(
+            "SELECT can_move, can_uidplus FROM account WHERE key = ?1",
+            [group.account],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if let (Some(moves), Some(uidplus)) = capabilities
+            && let Some(why) = unsupported(kind, moves, uidplus)
+        {
+            return Ok(Err(Refused::new(
+                "unsupported",
+                format!("{}: {why}", group.first),
+            )));
+        }
         actions.push((&*group, kind, target));
     }
 
     for (group, kind, target) in actions {
+        let id: i64 = transaction.query_row(
+            "UPDATE action_sequence
+                SET last = max(last, (SELECT coalesce(max(id), 0) FROM action)) + 1
+             RETURNING last",
+            [],
+            |r| r.get(0),
+        )?;
+        queued.actions.push(id);
         transaction.execute(
-            "INSERT INTO action (account, folder, uidvalidity, uids, kind, target)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO action (id, account, folder, uidvalidity, uids, kind, target)
+                 VALUES (?7, ?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 group.account,
                 group.folder,
                 group.uidvalidity,
                 serde_json::to_string(&group.uids).expect("numbers serialize"),
                 kind.name(),
-                target
+                target,
+                id
             ],
         )?;
         for uid in &group.uids {
@@ -324,17 +356,27 @@ impl Store {
         Ok(())
     }
 
-    /// The `Message-ID` of each of a folder's `uids`, in their order (`None` without one).
-    pub fn message_ids(&self, folder: i64, uids: &[u32]) -> rusqlite::Result<Vec<Option<String>>> {
-        let mut statement = self
-            .connection
-            .prepare_cached("SELECT message_id FROM message WHERE folder = ?1 AND uid = ?2")?;
+    /// What tells each of a folder's `uids` from another message, in their order (`None` for a
+    /// UID the copy does not have).
+    pub fn fingerprints(
+        &self,
+        folder: i64,
+        uids: &[u32],
+    ) -> rusqlite::Result<Vec<Option<Fingerprint>>> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT message_id, size, internal_date FROM message WHERE folder = ?1 AND uid = ?2",
+        )?;
         uids.iter()
             .map(|uid| {
                 statement
-                    .query_row(params![folder, uid], |r| r.get(0))
+                    .query_row(params![folder, uid], |r| {
+                        Ok(Fingerprint {
+                            message_id: r.get(0)?,
+                            size: r.get(1)?,
+                            internal_date: r.get(2)?,
+                        })
+                    })
                     .optional()
-                    .map(Option::flatten)
             })
             .collect()
     }
@@ -382,7 +424,14 @@ impl Store {
             [target.id],
             |r| r.get(0),
         )?;
-        let copied = copied.filter(|c| Some(c.uidvalidity) == uidvalidity);
+        let source_uidvalidity: Option<u32> = transaction.query_row(
+            "SELECT uidvalidity FROM folder WHERE id = ?1",
+            [action.folder.id],
+            |r| r.get(0),
+        )?;
+        let copied = copied
+            .filter(|c| Some(c.uidvalidity) == uidvalidity)
+            .filter(|_| source_uidvalidity == Some(action.uidvalidity));
         let mut resync = false;
         for uid in &action.uids {
             let new = copied.and_then(|c| c.pairs.iter().find(|(old, _)| old == uid).map(|p| p.1));
@@ -419,9 +468,20 @@ impl Store {
     /// shown in its new folder is shown where the server has it again; flags are read again whole
     /// at the next sync of the folder (its HIGHESTMODSEQ is forgotten); a message deleted for
     /// good comes back with the next sync, which no longer skips it.
-    pub fn refused(&mut self, action: &Action) -> rusqlite::Result<()> {
+    ///
+    /// A move refused once the server had copied its messages (without MOVE) leaves them in both
+    /// folders: each is recorded as half moved, and its copy written to the target in the copy
+    /// when its new UID is known. Returns whether it was so.
+    pub fn refused(&mut self, action: &Action) -> rusqlite::Result<bool> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM action WHERE id = ?1", [action.id])?;
+        let row: Option<(i64, String, Option<String>)> = transaction
+            .query_row(
+                "DELETE FROM action WHERE id = ?1 RETURNING account, state, copied",
+                [action.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let mut half_moved = false;
         if action.kind.flag().is_some() {
             transaction.execute(
                 "UPDATE folder SET highest_modseq = NULL WHERE id = ?1",
@@ -434,9 +494,108 @@ impl Store {
                     params![action.folder.id, uid],
                 )?;
             }
+            if let Some((account, state, copied)) = row
+                && state == "copied"
+            {
+                let copied: Option<CopyUid> = copied.and_then(|c| serde_json::from_str(&c).ok());
+                half_move(&transaction, account, action, copied.as_ref())?;
+                half_moved = true;
+            }
         }
-        transaction.commit()
+        transaction.commit()?;
+        Ok(half_moved)
     }
+}
+
+/// Whether the half move `half_move` names still has its message in both folders, as far as the
+/// copy knows: once the user removed one of them, it is settled.
+pub(crate) const HALF_MOVE_LEFT: &str = "
+    EXISTS (SELECT 1 FROM message JOIN folder ON folder.id = message.folder
+             WHERE message.folder = half_move.folder AND message.uid = half_move.uid
+               AND folder.uidvalidity = half_move.uidvalidity)
+    AND (half_move.target_uid IS NULL
+         OR EXISTS (SELECT 1 FROM message JOIN folder ON folder.id = message.folder
+                     WHERE message.folder = half_move.target AND message.uid = half_move.target_uid
+                       AND folder.uidvalidity = half_move.target_uidvalidity))";
+
+/// Records the messages of a move refused after their copy as half moved, and writes each copy
+/// whose UID `copied` gives to the target in the copy (unless the target has another
+/// UIDVALIDITY there, or a message at that UID already, or the source folder has another
+/// UIDVALIDITY than the action's: its UIDs then name other messages, and the next sync of the
+/// target finds the copy).
+fn half_move(
+    transaction: &Transaction,
+    account: i64,
+    action: &Action,
+    copied: Option<&CopyUid>,
+) -> rusqlite::Result<()> {
+    let target = action.target.as_ref().expect("a move has a target");
+    let uidvalidity: Option<u32> = transaction.query_row(
+        "SELECT uidvalidity FROM folder WHERE id = ?1",
+        [target.id],
+        |r| r.get(0),
+    )?;
+    let source_uidvalidity: Option<u32> = transaction.query_row(
+        "SELECT uidvalidity FROM folder WHERE id = ?1",
+        [action.folder.id],
+        |r| r.get(0),
+    )?;
+    let copied = copied
+        .filter(|c| Some(c.uidvalidity) == uidvalidity)
+        .filter(|_| source_uidvalidity == Some(action.uidvalidity));
+    // Those the user settled since are let go.
+    transaction.execute(
+        &format!("DELETE FROM half_move WHERE account = ?1 AND NOT ({HALF_MOVE_LEFT})"),
+        [account],
+    )?;
+    for uid in &action.uids {
+        let new = copied.and_then(|c| c.pairs.iter().find(|(old, _)| old == uid).map(|p| p.1));
+        if let Some(new) = new {
+            let source: Option<NewMessage> = transaction
+                .query_row(
+                    "SELECT message.flags, message.internal_date, message.size, message_raw.raw
+                       FROM message JOIN message_raw ON message_raw.message = message.id
+                      WHERE message.folder = ?1 AND message.uid = ?2",
+                    params![action.folder.id, uid],
+                    |r| {
+                        Ok(NewMessage {
+                            uid: new,
+                            flags: r.get(0)?,
+                            internal_date: r.get(1)?,
+                            size: r.get(2)?,
+                            raw: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let taken = transaction
+                .query_row(
+                    "SELECT 1 FROM message WHERE folder = ?1 AND uid = ?2",
+                    params![target.id, new],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if let (Some(source), false) = (source, taken) {
+                super::insert(transaction, target.id, &source)?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO half_move (account, folder, uidvalidity, uid, target, target_uidvalidity,
+                                    target_uid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                account,
+                action.folder.id,
+                action.uidvalidity,
+                uid,
+                target.id,
+                new.and(copied.map(|c| c.uidvalidity)),
+                new
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn not_found(id: &str, why: NotFound) -> Refused {
@@ -973,5 +1132,74 @@ mod tests {
             .unwrap();
         assert_eq!(queued.messages.len(), 1);
         assert_eq!(f.actions(), 0);
+    }
+
+    #[test]
+    fn a_move_refused_after_its_copy_is_half_moved_until_one_of_the_two_is_gone() {
+        let mut f = fixture();
+        f.queue(
+            &[f.id(f.inbox, 2), f.id(f.inbox, 3)],
+            Wanted::Move("archive".to_owned()),
+        )
+        .unwrap();
+        let moved = f.next();
+        // The COPY told the new UID of 2 only.
+        f.store
+            .copy_state(
+                moved.id,
+                "copied",
+                None,
+                Some(&CopyUid {
+                    uidvalidity: 20,
+                    pairs: vec![(2, 41)],
+                }),
+            )
+            .unwrap();
+
+        assert!(f.store.refused(&moved).unwrap());
+
+        let half = |f: &Fixture| -> Vec<(String, Option<String>)> {
+            f.copy
+                .half_moved("alice")
+                .unwrap()
+                .into_iter()
+                .map(|h| {
+                    assert_eq!((h.folder.as_str(), h.target.as_str()), ("inbox", "archive"));
+                    (h.message, h.copy)
+                })
+                .collect()
+        };
+        assert_eq!(
+            half(&f),
+            [
+                (f.id(f.inbox, 2), Some(f.id(f.archive, 41))),
+                (f.id(f.inbox, 3), None),
+            ]
+        );
+        // Shown where the server has them: both in the inbox, and the copy of 2 in the archive.
+        assert_eq!(
+            f.listed(),
+            [
+                ("Archive".to_owned(), f.id(f.archive, 41)),
+                ("INBOX".to_owned(), f.id(f.inbox, 1)),
+                ("INBOX".to_owned(), f.id(f.inbox, 2)),
+                ("INBOX".to_owned(), f.id(f.inbox, 3)),
+            ]
+        );
+
+        // The copy of 2 removed, and 3 removed from the inbox: nothing is left half moved.
+        f.store.apply_listing(f.archive, &[41], &[], None).unwrap();
+        f.store.apply_listing(f.inbox, &[3], &[], None).unwrap();
+        assert!(half(&f).is_empty());
+    }
+
+    #[test]
+    fn a_move_refused_before_its_copy_is_not_half_moved() {
+        let mut f = fixture();
+        f.queue(&[f.id(f.inbox, 2)], Wanted::Move("archive".to_owned()))
+            .unwrap();
+        let moved = f.next();
+        assert!(!f.store.refused(&moved).unwrap());
+        assert!(f.copy.half_moved("alice").unwrap().is_empty());
     }
 }

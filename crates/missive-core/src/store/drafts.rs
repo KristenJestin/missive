@@ -149,6 +149,17 @@ impl Store {
         )
     }
 
+    /// Whether a message of the outbox sent from the draft of another client, `source`, is still
+    /// to be sent.
+    pub fn source_sending(&self, account: i64, source: &str) -> rusqlite::Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM outbox WHERE account = ?1 AND source = ?2
+                              AND state IN ('queued', 'claimed', 'sending'))",
+            params![account, source],
+            |r| r.get(0),
+        )
+    }
+
     /// The account's drafts to write or remove, oldest first.
     pub fn drafts(&self, account: i64) -> rusqlite::Result<Vec<DraftRow>> {
         self.connection

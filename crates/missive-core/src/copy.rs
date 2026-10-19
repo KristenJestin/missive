@@ -20,10 +20,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{SCHEMA_VERSION, SkippedFolder};
+use crate::store::{HALF_MOVE_LEFT, SCHEMA_VERSION, SkippedFolder};
 
 /// Roles whose unread messages are left out of every total: nobody wants a badge for spam.
 const NOT_COUNTED: [&str; 2] = ["trash", "junk"];
@@ -56,8 +56,11 @@ const DRAFTS_VERSION: i64 = 7;
 /// one, when it was claimed).
 const RETRY_VERSION: i64 = 9;
 
+/// The first schema version that records the moves refused after their copy.
+const HALF_MOVE_VERSION: i64 = 10;
+
 /// The first schema version that counts the searches of Sent that failed.
-const SENT_SEARCH_VERSION: i64 = 10;
+const SENT_SEARCH_VERSION: i64 = 12;
 
 /// A message identifier read back, strictly: exactly what [`message_id`] writes. A number written
 /// another way (`+1`, `01`, ` 1`) names no message, so that one message has one identifier.
@@ -190,6 +193,19 @@ pub struct WaitingDraft {
     /// The tries that failed, and the last error.
     pub attempts: u32,
     pub last_error: Option<String>,
+}
+
+/// A message whose move the server refused after it had copied it: it is in both folders until
+/// the user removes one of them (`missive status`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HalfMoved {
+    /// Its identifier, in the folder it was to leave.
+    pub message: String,
+    /// The identifier of its copy in the target, when the server told its UID.
+    pub copy: Option<String>,
+    /// The folder it was to leave and its target: their roles, else their names.
+    pub folder: String,
+    pub target: String,
 }
 
 /// A folder of an account.
@@ -508,6 +524,39 @@ impl Copy {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The messages of an account left in both folders by a move refused after their copy,
+    /// oldest first; empty in a copy older than them.
+    pub fn half_moved(&self, account: &str) -> Result<Vec<HalfMoved>> {
+        if self.version < HALF_MOVE_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare_cached(&format!(
+            "SELECT half_move.folder, half_move.uidvalidity, half_move.uid, half_move.target,
+                    half_move.target_uidvalidity, half_move.target_uid,
+                    coalesce(source.role, source.name), coalesce(target.role, target.name)
+               FROM half_move JOIN account ON account.key = half_move.account
+                    JOIN folder AS source ON source.id = half_move.folder
+                    JOIN folder AS target ON target.id = half_move.target
+              WHERE account.id = ?1 AND {HALF_MOVE_LEFT}
+              ORDER BY half_move.id"
+        ))?;
+        let rows = statement.query_map([account], |r| {
+            let copy = match (r.get::<_, Option<u32>>(4)?, r.get::<_, Option<u32>>(5)?) {
+                (Some(uidvalidity), Some(uid)) => {
+                    Some(message_id(account, r.get(3)?, uidvalidity, uid))
+                }
+                _ => None,
+            };
+            Ok(HalfMoved {
+                message: message_id(account, r.get(0)?, r.get(1)?, r.get(2)?),
+                copy,
+                folder: r.get(6)?,
+                target: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The outbox of an account, oldest first; empty in a copy older than the outbox.
     pub fn outbox(&self, account: &str) -> Result<Vec<Outgoing>> {
         if self.version < OUTBOX_VERSION {
@@ -767,6 +816,50 @@ impl Copy {
         Ok(listed)
     }
 
+    /// The latest version of a draft of `account`, to pick it up again: `id` is its Message-ID
+    /// (with or without angle brackets), as `missive compose` prints it and as a draft waiting
+    /// for the server is listed, or a message identifier, as `list` prints it. The version
+    /// waiting in the copy comes first, else the newest of the Drafts folder. `None` when there
+    /// is no such draft, or when it was sent.
+    pub fn draft(&self, account: &str, id: &str) -> Result<Option<Vec<u8>>> {
+        if MessageId::parse(id).is_some() {
+            return Ok(self
+                .message(id)?
+                .ok()
+                .filter(|stored| stored.hit.account == account)
+                .map(|stored| stored.raw));
+        }
+        let message_id = id.trim_start_matches('<').trim_end_matches('>');
+        if self.version >= DRAFTS_VERSION {
+            let waiting: Option<Option<Vec<u8>>> = self
+                .connection
+                .query_row(
+                    "SELECT draft.raw FROM draft JOIN account ON account.key = draft.account
+                      WHERE account.id = ?1 AND draft.message_id = ?2",
+                    params![account, message_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(waiting) = waiting {
+                // Sent: no longer a draft.
+                return Ok(waiting);
+            }
+        }
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT message_raw.raw FROM message
+                   JOIN message_raw ON message_raw.message = message.id
+                   JOIN folder ON folder.id = message.folder
+                   JOIN account ON account.key = folder.account
+                  WHERE account.id = ?1 AND folder.role = 'drafts' AND message.message_id = ?2
+                  ORDER BY message.uid DESC LIMIT 1",
+                params![account, message_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// The message an identifier names, with its raw message. Whether the identifier is one, and
     /// whether it still names a message, is the answer's to say ([`NotFound`]) and not an error:
     /// the identifier of a message that has gone since it was printed is what a caller will meet.
@@ -964,6 +1057,44 @@ mod tests {
         ] {
             assert_eq!(MessageId::parse(wrong), None, "{wrong:?}");
         }
+    }
+
+    #[test]
+    fn a_draft_is_found_waiting_by_its_message_id_else_in_the_drafts_folder() {
+        let (_dir, mut store, copy) = open();
+        let alice = store.account("alice").unwrap();
+        let drafts = store.folder(alice, "Drafts", Some("drafts")).unwrap().id;
+        store.rebuild(drafts, 9).unwrap();
+        let on_server = b"Message-ID: <d@example.org>\r\nSubject: Old\r\n\r\nOld\r\n".to_vec();
+        store
+            .insert(
+                drafts,
+                &[NewMessage {
+                    uid: 3,
+                    flags: "\\Draft".to_owned(),
+                    internal_date: None,
+                    size: on_server.len() as i64,
+                    raw: on_server.clone(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(
+            copy.draft("alice", "d@example.org").unwrap(),
+            Some(on_server.clone())
+        );
+        assert_eq!(
+            copy.draft("alice", "<d@example.org>").unwrap(),
+            Some(on_server.clone())
+        );
+        let by_uid = message_id("alice", drafts, 9, 3);
+        assert_eq!(copy.draft("alice", &by_uid).unwrap(), Some(on_server));
+
+        let waiting = b"Message-ID: <d@example.org>\r\nSubject: New\r\n\r\nNew\r\n".to_vec();
+        store.save_draft(alice, "d@example.org", &waiting).unwrap();
+        assert_eq!(copy.draft("alice", "d@example.org").unwrap(), Some(waiting));
+        assert_eq!(copy.draft("alice", "x@example.org").unwrap(), None);
+        assert_eq!(copy.draft("bob", "d@example.org").unwrap(), None);
     }
 
     #[test]
