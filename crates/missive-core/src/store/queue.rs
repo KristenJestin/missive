@@ -424,7 +424,14 @@ impl Store {
             [target.id],
             |r| r.get(0),
         )?;
-        let copied = copied.filter(|c| Some(c.uidvalidity) == uidvalidity);
+        let source_uidvalidity: Option<u32> = transaction.query_row(
+            "SELECT uidvalidity FROM folder WHERE id = ?1",
+            [action.folder.id],
+            |r| r.get(0),
+        )?;
+        let copied = copied
+            .filter(|c| Some(c.uidvalidity) == uidvalidity)
+            .filter(|_| source_uidvalidity == Some(action.uidvalidity));
         let mut resync = false;
         for uid in &action.uids {
             let new = copied.and_then(|c| c.pairs.iter().find(|(old, _)| old == uid).map(|p| p.1));
@@ -513,7 +520,9 @@ pub(crate) const HALF_MOVE_LEFT: &str = "
 
 /// Records the messages of a move refused after their copy as half moved, and writes each copy
 /// whose UID `copied` gives to the target in the copy (unless the target has another
-/// UIDVALIDITY there, or a message at that UID already).
+/// UIDVALIDITY there, or a message at that UID already, or the source folder has another
+/// UIDVALIDITY than the action's: its UIDs then name other messages, and the next sync of the
+/// target finds the copy).
 fn half_move(
     transaction: &Transaction,
     account: i64,
@@ -526,7 +535,14 @@ fn half_move(
         [target.id],
         |r| r.get(0),
     )?;
-    let copied = copied.filter(|c| Some(c.uidvalidity) == uidvalidity);
+    let source_uidvalidity: Option<u32> = transaction.query_row(
+        "SELECT uidvalidity FROM folder WHERE id = ?1",
+        [action.folder.id],
+        |r| r.get(0),
+    )?;
+    let copied = copied
+        .filter(|c| Some(c.uidvalidity) == uidvalidity)
+        .filter(|_| source_uidvalidity == Some(action.uidvalidity));
     // Those the user settled since are let go.
     transaction.execute(
         &format!("DELETE FROM half_move WHERE account = ?1 AND NOT ({HALF_MOVE_LEFT})"),

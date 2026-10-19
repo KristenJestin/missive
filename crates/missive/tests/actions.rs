@@ -280,6 +280,20 @@ impl Env {
             .map(|(_, _, flags)| flags)
     }
 
+    /// The raw message of the copy, by the server's folder name and UID.
+    fn raw(&self, folder: &str, uid: u32) -> Option<Vec<u8>> {
+        self.copy()?
+            .query_row(
+                "SELECT message_raw.raw FROM message_raw
+                   JOIN message ON message.id = message_raw.message
+                   JOIN folder ON folder.id = message.folder
+                  WHERE folder.name = ?1 AND message.uid = ?2",
+                rusqlite::params![folder, uid],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
     /// An account's connection state in the copy.
     fn state(&self, id: &str) -> Option<String> {
         self.copy()?
@@ -1715,6 +1729,43 @@ async fn a_move_refused_after_its_copy_says_the_message_is_in_both_folders_and_r
     assert_eq!(
         env.status_of_alice().await["half_moved"],
         serde_json::json!([])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_move_whose_source_was_renumbered_writes_no_copy_of_another_message() {
+    let (server, env, _daemon) = started(mailbox().without_move().refuse("UID EXPUNGE")).await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    // The copy is made, the removal refused: the action waits for its next try.
+    assert_eq!(events.action().await["outcome"], "retried");
+    assert_eq!(server.uids("Archive"), [1]);
+    let copy_on_the_server = server.raw("Archive", 1).unwrap();
+
+    // The server renumbers the inbox before that try; the UID 3 now names another message.
+    server.expunge("INBOX", 1);
+    server.bump_uidvalidity("INBOX");
+    let other = server.raw("INBOX", 3).unwrap();
+    assert!(other != copy_on_the_server);
+    succeeded(&sync_soon(&env).await);
+    let event = loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            break event;
+        }
+        succeeded(&sync_soon(&env).await);
+    };
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(event["reason"], "renumbered", "{event}");
+    assert_eq!(event["copied"], true, "{event}");
+
+    // The archive of the copy is the one the server has, never the other message.
+    succeeded(&sync_soon(&env).await);
+    eventually(20, "the archive in the copy", || env.uids("Archive") == [1]).await;
+    assert!(
+        env.raw("Archive", 1).unwrap() == copy_on_the_server,
+        "the copy of the archive is not the one the server has"
     );
 }
 
