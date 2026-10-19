@@ -1355,3 +1355,47 @@ async fn a_daemon_stopped_while_the_record_cannot_be_written_still_stops() {
     // Not recorded: the next daemon will say the message is uncertain.
     assert_eq!(env.outbox()[0].1, "sending");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_search_of_sent_is_not_one_of_the_tries_of_the_copy() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let mut watcher = env.watch().await;
+    // The first try appends the copy, and the connection drops before the answer.
+    server.cut_after_append();
+    succeeded(&env.compose(&["--body", BODY]).await);
+    watcher.next("sent").await;
+    eventually(20, "the copy taken by the server", || {
+        server.uids("Sent").len() == 1
+    })
+    .await;
+    let tries = || -> Option<i64> {
+        Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row("SELECT copy_attempts FROM outbox", [], |r| r.get(0))
+            .ok()
+    };
+    eventually(20, "the first try counted", || tries() == Some(1)).await;
+    // From now on the search of Sent fails, at more passes than the copy has tries.
+    server.heal();
+    server.cut("UID SEARCH", 0);
+    for _ in 0..7 {
+        env.run(&["sync"]).await;
+    }
+
+    assert_eq!(
+        tries(),
+        Some(1),
+        "the search was counted, or the copy given up"
+    );
+    // The search works again: the copy is found in Sent, not appended a second time.
+    server.heal();
+    for _ in 0..5 {
+        if env.outbox().is_empty() {
+            break;
+        }
+        env.run(&["sync"]).await;
+    }
+    assert!(env.outbox().is_empty());
+    assert_eq!(server.uids("Sent").len(), 1);
+}

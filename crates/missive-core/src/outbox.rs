@@ -35,7 +35,8 @@
 //! path (`APPEND` counts only with its tagged `OK`), flagged `\Seen`, with the message's Bcc
 //! recipients in it (see [`crate::compose`]). A try whose answer was lost, or that a killed daemon
 //! left, may have appended it: each try is counted before its `APPEND`, and every try after the
-//! first searches the Sent folder for its `Message-ID` first. Missive never creates a Sent folder.
+//! first searches the Sent folder for its `Message-ID` first (a search that fails is not a try).
+//! Missive never creates a Sent folder.
 //! After [`MAX_ATTEMPTS`] tries the copy is given up (the message was sent).
 
 use std::sync::Arc;
@@ -310,14 +311,33 @@ async fn copy_each(
             });
             continue;
         };
-        let attempts = store.copy_trying(id)?;
-        let tried = tokio::time::timeout(timeout, async {
-            if copy.attempts > 0 && already_there(session, &name, &copy.message_id).await? {
-                return Ok(Done::Ok(None));
+        // Only an append started counts: a search that fails (the connection dropped) says
+        // nothing of the copy, and the next pass searches again.
+        if copy.attempts > 0 {
+            let searched =
+                tokio::time::timeout(timeout, already_there(session, &name, &copy.message_id))
+                    .await;
+            match searched {
+                Ok(Ok(true)) => {
+                    store.copy_done(id)?;
+                    copies.copied.push(Copied::Appended { id });
+                    copies.resync = Some(folder);
+                    continue;
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    copies.timed_out = true;
+                    return Err(SyncError::Connection(ConnectError::Unreachable(
+                        "the IMAP server did not answer SEARCH in time".to_owned(),
+                    )));
+                }
             }
-            sync::append(session, &quoted, "\\Seen", &copy.raw).await
-        })
-        .await;
+        }
+        let attempts = store.copy_trying(id)?;
+        let tried =
+            tokio::time::timeout(timeout, sync::append(session, &quoted, "\\Seen", &copy.raw))
+                .await;
         let done = match tried {
             Ok(Ok(done)) => done,
             Ok(Err(error)) => {
