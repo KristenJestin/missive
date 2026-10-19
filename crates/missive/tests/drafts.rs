@@ -474,6 +474,25 @@ fn removals(server: &FakeServer) -> Vec<String> {
         .collect()
 }
 
+/// Waits until no draft of the account waits in the copy: each one is done with the server.
+async fn settled(env: &Env) {
+    let started = Instant::now();
+    loop {
+        let status = env.status().await;
+        if status["accounts"][0]["drafts"]
+            .as_array()
+            .is_none_or(|drafts| drafts.is_empty())
+        {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the drafts did not settle within 60 seconds: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Waits until the server's Drafts folder holds these subjects, in this order, then a little
 /// longer, and checks it holds no more.
 async fn drafts_on_server(server: &FakeServer, subjects: &[&str]) {
@@ -923,9 +942,19 @@ async fn an_append_whose_answer_never_came_leaves_one_draft_on_the_server_not_tw
 
     let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
     eventually(20, "the cut append", || !server.uids("Drafts").is_empty()).await;
+    // A retry may still be on its way: only a draft that left the copy is done with the server.
+    settled(&env).await;
     server.heal();
 
     drafts_on_server(&server, &["First"]).await;
+    assert_eq!(
+        server
+            .imap_log()
+            .iter()
+            .filter(|line| line.starts_with("APPEND"))
+            .count(),
+        1
+    );
     assert_eq!(server_drafts(&server)[0].2.as_deref(), Some(id.as_str()));
     let search = format!("UID SEARCH HEADER Message-ID \"<{id}>\" HEADER X-Missive-Draft \"1\"");
     assert!(
@@ -933,6 +962,59 @@ async fn an_append_whose_answer_never_came_leaves_one_draft_on_the_server_not_tw
         "{:?}",
         server.imap_log()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_appends_cut_in_a_row_converge_to_one_draft_on_the_server() {
+    let server = mailbox().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    server.cut_after_append();
+
+    let id = env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    eventually(20, "the first cut append", || {
+        !server.uids("Drafts").is_empty()
+    })
+    .await;
+    env.save(&["--draft", &id, "--subject", "Second"]).await;
+    eventually(20, "the second cut append", || {
+        server_drafts(&server)
+            .iter()
+            .any(|(_, subject, _)| subject.as_deref() == Some("Second"))
+    })
+    .await;
+
+    // Still cut: a version the server already holds is not appended again, and the others go.
+    settled(&env).await;
+    drafts_on_server(&server, &["Second"]).await;
+    assert_eq!(server_drafts(&server)[0].2.as_deref(), Some(id.as_str()));
+    server.heal();
+    succeeded(&env.run(&["sync"]).await);
+    drafts_on_server(&server, &["Second"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_uidplus_an_append_whose_answer_never_came_is_not_appended_again() {
+    let server = mailbox().without_uidplus().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    server.cut_after_append();
+
+    env.save(&["--to", RECIPIENT, "--subject", "First"]).await;
+    eventually(20, "the cut append", || !server.uids("Drafts").is_empty()).await;
+
+    settled(&env).await;
+    drafts_on_server(&server, &["First"]).await;
+    server.heal();
+    succeeded(&env.run(&["sync"]).await);
+    drafts_on_server(&server, &["First"]).await;
+    assert_eq!(
+        server
+            .imap_log()
+            .iter()
+            .filter(|line| line.starts_with("APPEND"))
+            .count(),
+        1
+    );
+    assert!(removals(&server).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
