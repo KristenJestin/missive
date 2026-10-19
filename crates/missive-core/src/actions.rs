@@ -38,8 +38,9 @@
 //!
 //! A removal records the `\Deleted` it sets itself before it sets it: when the connection is lost
 //! before the flag is taken back, the next try still knows it is its own. An action refused for
-//! good that leaves it there keeps it in [`Store::deleted_left`], and it is taken back at the
-//! next connection.
+//! good that leaves it there keeps it in [`Store::deleted_left`], and it is taken back at once,
+//! then at the next connection. Until then, a move of those messages is refused: `UID MOVE` and
+//! `UID COPY` keep the flags, and the copy in the target would keep a `\Deleted` nothing records.
 //!
 //! An action asked while a move of its messages waits is recorded on them as the server still has
 //! them, apart from the messages that are not moving, and follows them to their new UIDs once the
@@ -251,7 +252,7 @@ pub enum Result {
         reason: &'static str,
     },
     /// It was dropped and its change taken back from the copy. `reason` is `renumbered`,
-    /// `no-such-folder`, `unsupported`, `refused` or `connection` (it failed that way
+    /// `no-such-folder`, `unsupported`, `deleted-left`, `refused` or `connection` (it failed that way
     /// [`MAX_ATTEMPTS`] times). `copied`: a move the server refused once it had copied the
     /// messages, which are in both folders now; nothing is removed to fix it but by the user.
     Refused {
@@ -446,6 +447,7 @@ async fn round(
             Err(error) => return Err(error),
         };
         let mut behind = (Vec::new(), NOT_MOVED);
+        let mut left = 0;
         let result = match result {
             Step::Applied { resync, moved } => {
                 applied.resync.extend(resync);
@@ -464,6 +466,7 @@ async fn round(
                 }
                 let dropped = refuse(store, &action, applied)?;
                 behind.0 = dropped.behind.clone();
+                left = dropped.deleted_left;
                 refused(
                     "refused",
                     format!("the server refused it {attempts} times ({why})"),
@@ -473,6 +476,7 @@ async fn round(
             Step::Refused(reason, message) => {
                 let dropped = refuse(store, &action, applied)?;
                 behind.0 = dropped.behind.clone();
+                left = dropped.deleted_left;
                 refused(reason, message.to_owned(), &dropped)
             }
             Step::Skipped => {
@@ -483,6 +487,10 @@ async fn round(
         };
         applied.outcomes.push(outcome(result));
         refuse_behind(store, account_id, &behind.0, behind.1, applied)?;
+        // Before anything else is asked of its messages: a move would carry the flag along.
+        if left > 0 {
+            take_back(server, store, account, applied).await?;
+        }
     }
 }
 
@@ -636,6 +644,12 @@ const RENUMBERED: Step = Step::Refused(
 const NO_SUCH_FOLDER: Step =
     Step::Refused("no-such-folder", "the server has no such target folder");
 const BAD: Step = Step::Refused("refused", "the server refused the command as malformed");
+const DELETED_LEFT: Step = Step::Refused(
+    "deleted-left",
+    "a refused action left the \\Deleted flag Missive set on these messages and it could not be \
+     taken back yet: moving them would carry it to the target, where any client's EXPUNGE would \
+     remove them, so nothing was moved",
+);
 
 async fn one(
     server: &mut Server<'_>,
@@ -656,6 +670,12 @@ async fn one(
             resync: Vec::new(),
             moved: Vec::new(),
         });
+    }
+    // `UID MOVE` and `UID COPY` keep the flags, and the target keeps no record of this one.
+    if action.kind.moves()
+        && store.deleted_left_on(action.folder.id, action.uidvalidity, &action.uids)?
+    {
+        return Ok(DELETED_LEFT);
     }
     // Refused before anything is sent.
     if let Some(why) = unsupported(action.kind, capabilities.moves, capabilities.uidplus) {

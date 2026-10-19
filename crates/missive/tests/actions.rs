@@ -2406,3 +2406,52 @@ async fn a_deleted_flag_left_by_a_cut_connection_is_reported_and_taken_back_at_t
     assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
     assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_after_a_refusal_that_left_its_deleted_flag_does_not_carry_it_to_another_folder() {
+    // The removal is refused, and taking its flag back too, until the limit refuses the move.
+    let (server, env, _daemon) = started(
+        mailbox()
+            .without_move()
+            .refuse("UID EXPUNGE")
+            .refuse("UID STORE 3 -FLAGS"),
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let three = env.id("INBOX", 3);
+    succeeded(&env.act(&["move", &three, "--to", "archive"]).await);
+    // Asked while the first waits: once that one is refused, it applies where the message is.
+    succeeded(&env.act(&["move", &three, "--to", PRIVATE_FOLDER]).await);
+    let first = loop {
+        let event = events.action().await;
+        if event["outcome"] != "retried" {
+            break event;
+        }
+        succeeded(&sync_soon(&env).await);
+    };
+    assert_eq!(first["outcome"], "refused", "{first}");
+    assert_eq!(first["copied"], true, "{first}");
+    assert_eq!(server.flags("INBOX", 3), flags(&["\\Deleted"]));
+
+    // `UID COPY` keeps the flags: copied now, the message would carry the `\Deleted` Missive set
+    // into a folder where no record of it is kept, and any client's EXPUNGE would remove it.
+    let second = events.action().await;
+    assert_eq!(second["outcome"], "refused", "{second}");
+    assert_eq!(second["reason"], "deleted-left", "{second}");
+    let message = second["message"].as_str().unwrap();
+    assert!(message.contains("\\Deleted"), "{message}");
+    assert_eq!(server.uids(PRIVATE_FOLDER), [1]);
+    assert_eq!(tries(&server, "UID COPY"), 1);
+    assert_eq!(env.queue(), 0);
+
+    // The flag is taken back at the next connection, and still nothing was moved.
+    server.heal();
+    succeeded(&sync_soon(&env).await);
+    eventually(20, "the flag taken back", || {
+        server.flags("INBOX", 3) == Some(Vec::new())
+    })
+    .await;
+    assert_eq!(server.uids(PRIVATE_FOLDER), [1]);
+    assert_eq!(server.uids("INBOX"), [1, 2, 3, 4]);
+    assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
+}

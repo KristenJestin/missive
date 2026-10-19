@@ -468,6 +468,26 @@ impl Store {
         rows.collect()
     }
 
+    /// Whether a refused action left a `\Deleted` Missive set on one of these messages.
+    pub fn deleted_left_on(
+        &self,
+        folder: i64,
+        uidvalidity: u32,
+        uids: &[u32],
+    ) -> rusqlite::Result<bool> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT uids FROM deleted_left WHERE folder = ?1 AND uidvalidity = ?2",
+        )?;
+        let rows = statement.query_map(params![folder, uidvalidity], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let left: Vec<u32> = serde_json::from_str(&row?).unwrap_or_default();
+            if left.iter().any(|uid| uids.contains(uid)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The flags of [`Store::deleted_left`] taken back, or that name other messages now.
     pub fn taken_back(&self, id: i64) -> rusqlite::Result<()> {
         self.connection
