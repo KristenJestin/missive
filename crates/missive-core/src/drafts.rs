@@ -21,12 +21,13 @@
 //!    lost included. A Message-ID that is not ASCII cannot be written as a quoted string, and a
 //!    server answers `BAD` to it: it is not searched for, and only the versions the copy holds
 //!    are known.
-//! 2. `APPEND <drafts> (\Draft \Seen)` of the new version. Its UID comes from `APPENDUID`
-//!    (UIDPLUS), else from the same search, made again. A version tried before is first looked
-//!    for among those found (`UID FETCH <uids> (UID BODY.PEEK[])`): one identical byte for byte
-//!    landed from an `APPEND` whose answer was lost, and is taken as the new version instead of
-//!    a second copy. So cut answers, however many in a row, never add more than one copy of a
-//!    version, with or without UIDPLUS.
+//! 2. `APPEND <drafts> (\Draft \Seen)` of the new version, given a timeout that grows with its
+//!    size (a large draft on a slow link would otherwise time out at every pass). Its UID comes
+//!    from `APPENDUID` (UIDPLUS), else from the same search, made again. A version tried before
+//!    is first looked for among those found (`UID FETCH <uids> (UID BODY.PEEK[])`): one
+//!    identical byte for byte landed from an `APPEND` whose answer was lost, and is taken as the
+//!    new version instead of a second copy. So cut answers, however many in a row, never add
+//!    more than one copy of a version, with or without UIDPLUS.
 //! 3. Only then, the older versions are removed: `UID STORE <uids> +FLAGS.SILENT (\Deleted)` and
 //!    `UID EXPUNGE <uids>`, which removes those UIDs and no other message marked deleted; an
 //!    expunge refused takes the flag back. Without UIDPLUS there is no `UID EXPUNGE`: the older

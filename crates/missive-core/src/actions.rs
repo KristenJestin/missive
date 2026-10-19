@@ -64,6 +64,20 @@ pub const MAX_ATTEMPTS: u32 = 5;
 /// would hold the worker for ever. Moving many large messages can take a server a while.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The slowest link an `APPEND` is waited for, in bytes per second (about 256 kbit/s).
+const APPEND_RATE: u64 = 32 * 1024;
+
+/// The longest an `APPEND` is waited for, whatever its size.
+const APPEND_TIMEOUT_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// How long to wait for an `APPEND` of `size` bytes: the timeout of a command, and the time its
+/// message takes on a slow link, up to a bound. A large message on a slow link would otherwise
+/// time out at every pass and be uploaded again. A timeout asked beyond the bound is kept.
+fn append_timeout(timeout: Duration, size: usize) -> Duration {
+    let upload = Duration::from_secs(size as u64 / APPEND_RATE);
+    (timeout + upload).min(APPEND_TIMEOUT_MAX.max(timeout))
+}
+
 /// What an action does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -320,8 +334,9 @@ impl Server<'_> {
         flags: &str,
         raw: &[u8],
     ) -> std::result::Result<Done, SyncError> {
+        let timeout = append_timeout(self.timeout, raw.len());
         let result =
-            tokio::time::timeout(self.timeout, sync::append(self.session, name, flags, raw)).await;
+            tokio::time::timeout(timeout, sync::append(self.session, name, flags, raw)).await;
         self.timed(result)
     }
 }
@@ -857,6 +872,23 @@ async fn uid_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_append_is_given_a_timeout_that_grows_with_its_size_up_to_a_bound() {
+        let base = Duration::from_secs(30);
+        // A small message gets the usual timeout.
+        assert_eq!(append_timeout(base, 1_000), base);
+        // A large one on a slow link gets longer, in proportion.
+        let ten = append_timeout(base, 10 * 1024 * 1024);
+        let twenty = append_timeout(base, 20 * 1024 * 1024);
+        assert!(ten > base * 4, "{ten:?}");
+        assert!(twenty > ten, "{twenty:?}");
+        // Bounded: a connection that never answers is not waited for for ever.
+        assert_eq!(append_timeout(base, usize::MAX), APPEND_TIMEOUT_MAX);
+        // A timeout asked beyond the bound is kept.
+        let long = Duration::from_secs(3600);
+        assert_eq!(append_timeout(long, 100 * 1024 * 1024), long);
+    }
 
     #[test]
     fn a_refused_move_that_copied_says_the_messages_are_in_both_folders() {
