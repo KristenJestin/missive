@@ -318,6 +318,12 @@ pub fn status(json: bool) -> Result<()> {
                             .as_deref()
                             .unwrap_or("no reason recorded")
                     );
+                } else if message.stuck {
+                    println!(
+                        "\t\tmessage {} claimed: stuck, the daemon could not put it back in the \
+                         queue; it is queued again when the daemon starts",
+                        message.id
+                    );
                 }
             }
         }

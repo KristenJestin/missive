@@ -232,6 +232,7 @@ the daemon runs.
 | `accounts[].outbox[].queued_at` | number | when it was written, in seconds since the epoch |
 | `accounts[].outbox[].attempts` | number | the tries that failed before the end of its data (tried again later) |
 | `accounts[].outbox[].last_error` | string or `null` | the last error, for people |
+| `accounts[].outbox[].stuck` | boolean | the message has been `claimed` for more than an hour: the daemon's worker could not write the outbox to put it back in the queue (five tries), and it stays so until the daemon starts again, which queues it again. `false` for any other state, and for a claim that is being tried |
 | `accounts[].drafts` | array | the drafts the copy keeps until the server holds them, oldest first (see [Drafts](#drafts)) |
 | `accounts[].drafts[].id` | string | the draft's identifier (its `Message-ID`, without angle brackets), as `compose --json` printed it |
 | `accounts[].drafts[].state` | string | `waiting` (to write to the Drafts folder), `removing` (its message was sent: to remove from the Drafts folder) or `no-drafts-folder` (the account has no Drafts folder: the draft stays in the copy) |
@@ -267,8 +268,8 @@ bob	never synced	0 messages
 
 A line reads `unknown (the daemon is not running)` in the place of the state when `state` is
 `null` for the second reason above. An account whose outbox holds messages has a line more,
-`	outbox: 1 queued, 1 failed`, and one line for each failed or uncertain message, with why. An
-account whose drafts wait in the copy has a line more too, `	drafts: 1 to write to the Drafts
+`	outbox: 1 queued, 1 failed`, and one line for each failed or uncertain message, with why, and
+for each stuck one (`stuck` above). An account whose drafts wait in the copy has a line more too, `	drafts: 1 to write to the Drafts
 folder` (or `kept in the local copy: the account has no Drafts folder`), and one line for each
 draft whose last try failed. Each message of `half_moved` has a line: `	half moved:
 alice/1/1745112/4 is in both inbox and archive, since the server refused to remove it after
@@ -846,7 +847,7 @@ A message stays in the outbox until its server took it, in one of these states:
 | State | |
 |---|---|
 | `queued` | to send. A try that fails before the end of its data (a `4xx` answer, the server unreachable, the login or the certificate refused) leaves it here: the server took nothing, and it is tried again later, waiting longer each time (1 second, then twice as long, up to 5 minutes). Each message waits for its own time |
-| `claimed` | the daemon is sending it, and has not yet written its end of data: the server cannot have taken it. A daemon killed then puts it back in `queued` when it starts again |
+| `claimed` | the daemon is sending it, and has not yet written its end of data: the server cannot have taken it. A daemon killed then puts it back in `queued` when it starts again; so does one whose worker could not put it back itself (`status` says `stuck`) |
 | `sending` | its end of data is being written |
 | `sent` | the server took it (its `250` to the end of data); only its copy in Sent is left to append. Without one to append, the message leaves the outbox at once |
 | `failed` | the server refused it for good (`5xx` to `MAIL FROM`, a `RCPT TO`, `DATA` or the end of data). It stays, shown by `status` and `missive outbox`, and is sent again only by `missive outbox resend` |
