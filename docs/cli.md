@@ -806,7 +806,11 @@ the text above the quote.
   queue of actions, as `missive mark` does. A reply that is only saved as a draft marks nothing,
   and neither does one the server refuses. A message that was moved or deleted meanwhile is not
   marked. The flag goes to the account that owns the message, which wakes at once even when
-  another account sends the reply.
+  another account sends the reply. A reply or a forward saved as a draft keeps the link to its
+  original (an `X-Missive-Answers` or `X-Missive-Forwards` header of the draft, which the message
+  sent never carries): picked up later and sent, from the command line or the window, it marks the
+  original all the same. The message answered must be in the local copy when the reply is saved
+  or sent (a message identifier that names none is refused, `no-such-message`).
 - A message that is odd is answered all the same, and one line on the error output says what was
   changed (counts and kinds, never what the message says): line breaks in its subject (an
   encoded subject can decode to some) become spaces, and the identifiers (`Message-ID`,

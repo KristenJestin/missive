@@ -150,8 +150,8 @@ reached:
 | `attachments` | array, empty when absent | each a file's `name` (no folder) and its content, `data`, in base64 |
 | `in_reply_to` | string, absent for none | the `Message-ID`, without angle brackets, of the message this one answers, written as its `In-Reply-To` header |
 | `references` | array of strings, empty when absent | the thread's `Message-ID`s without angle brackets, written as the `References` header |
-| `answers` | string, absent for none | the identifier of the message this one is a reply to: once the server took the reply (never before), that message is marked answered (`\Answered`), through the queue of actions, and the `action` event `answered` tells it. A message gone since is not an error |
-| `forwards` | string, absent for none | the identifier of the message this one forwards: once the server took the forward (never before), that message is marked forwarded (`$Forwarded`), through the queue of actions, and the `action` event `forwarded` tells it; a server whose folder keeps no keywords is not asked, and nothing is said. A message gone since is not an error |
+| `answers` | string, absent for none | the identifier of the message this one is a reply to: once the server took the reply (never before), that message is marked answered (`\Answered`), through the queue of actions, and the `action` event `answered` tells it. It must name a message of the local copy now (of any account: a reply may be written from another one), else the request is answered `no-such-message`; a message gone since is not an error |
+| `forwards` | string, absent for none | the identifier of the message this one forwards: once the server took the forward (never before), that message is marked forwarded (`$Forwarded`), through the queue of actions, and the `action` event `forwarded` tells it; a server whose folder keeps no keywords is not asked, and nothing is said. Checked as `answers` is; a message gone since is not an error |
 
 The daemon builds the message (see `missive compose` in `docs/cli.md`), writes it to the outbox
 in the local copy, and answers: nothing waits for the server.
@@ -203,10 +203,10 @@ Saves a draft: a new one, or a new version of the draft `draft` names. With `sen
 | `draft` | string, absent for a new draft | the draft to pick up again: its identifier (its `Message-ID`), or the identifier of a message of the account's Drafts folder, as `list` prints it |
 | `to`, `cc`, `bcc`, `subject`, `body`, `attachments` | as for `send`, each absent to keep the draft's own | the fields that replace the draft's; for a new draft, those absent are empty. No recipient is needed. An empty list (`"to": []`) clears the field: that is what `compose --no-to` asks. The draft's HTML alternative is kept, unless `body` gives another text (line ends aside): then it is dropped |
 | `in_reply_to` | string, absent to keep the draft's own | the `Message-ID`, without angle brackets, of the message the draft answers |
-| `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered unless `answers` names it |
+| `references` | array of strings, absent to keep the draft's own | the draft's `References`: `Message-ID`s without angle brackets. A draft marks nothing answered unless `answers` names it, or the draft already holds that link |
 | `send` | boolean, `false` when absent | send the draft, as it is once changed (at least one recipient then); it is removed from the Drafts folder once the server took the message |
-| `answers` | string, optional | with `send`: the identifier of the message the draft is a reply to, as for `send`; marked answered once the server took the reply |
-| `forwards` | string, optional | with `send`: the identifier of the message the draft forwards, as for `send`; marked forwarded once the server took the forward |
+| `answers` | string, optional | the identifier of the message the draft is a reply to, as for `send`, checked as there. The draft keeps it (an `X-Missive-Answers` header of the draft, which the message sent never carries), so that a draft picked up later and sent still marks the original: asked again without it, the draft's own is used. With `send`, marked answered once the server took the reply. A draft of another client has none |
+| `forwards` | string, optional | the same for the message the draft forwards (`X-Missive-Forwards`); marked forwarded once the server took the forward. A request names `answers` or `forwards`, not both (`bad-request`); naming one replaces what the draft kept |
 
 The daemon saves the draft in the local copy (and, with `send`, puts the message in the outbox),
 and answers: nothing waits for the server. It then writes the draft to the account's Drafts

@@ -249,8 +249,8 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         in_reply_to: draft.in_reply_to.first().cloned(),
         references: draft.references,
         send: args.send,
-        answers: None,
-        forwards: None,
+        answers: a.answers,
+        forwards: a.forwards,
     }))
     .await?;
     let answer = answered(answer)?;

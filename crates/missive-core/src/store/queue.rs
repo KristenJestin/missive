@@ -82,6 +82,43 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Whether `id` names a message of the copy now, as an action would find it: the refusal
+    /// says why when it does not. For a request that names a message without acting on it.
+    pub fn check_message(&self, id: &str) -> rusqlite::Result<Result<(), Refused>> {
+        let Some(parsed) = MessageId::parse(id) else {
+            return Ok(Err(not_found(id, NotFound::Invalid)));
+        };
+        let folder: Option<(Option<u32>, String)> = self
+            .connection
+            .query_row(
+                "SELECT folder.uidvalidity, folder.name FROM folder
+                   JOIN account ON account.key = folder.account
+                  WHERE account.id = ?1 AND folder.id = ?2",
+                params![parsed.account, parsed.folder],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((uidvalidity, name)) = folder else {
+            return Ok(Err(not_found(id, NotFound::Unknown)));
+        };
+        if uidvalidity.unwrap_or(0) != parsed.uidvalidity {
+            return Ok(Err(not_found(id, NotFound::Renumbered(name))));
+        }
+        let found: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM message WHERE folder = ?1 AND uid = ?2",
+                params![parsed.folder, parsed.uid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found
+            .map(drop)
+            .ok_or_else(|| not_found(id, NotFound::Unknown)))
+    }
+}
+
 /// [`Store::queue`] inside a transaction the caller commits, when the request was recorded.
 pub(super) fn queue_in(
     transaction: &Transaction,
@@ -1028,6 +1065,19 @@ mod tests {
             .apply_listing(f.inbox, &[], &[(2, String::new())], None)
             .unwrap();
         assert_eq!(f.flags(f.inbox)[&2], "");
+    }
+
+    #[test]
+    fn a_message_is_checked_without_acting_on_it() {
+        let f = fixture();
+        assert!(f.store.check_message(&f.id(f.inbox, 2)).unwrap().is_ok());
+        let id = f.id(f.inbox, 99);
+        for bad in [id.as_str(), "alice/999/1/1", "not an id", "other/1/1/1"] {
+            let refused = f.store.check_message(bad).unwrap().unwrap_err();
+            assert_eq!(refused.error, "no-such-message", "{bad}");
+            assert!(refused.message.starts_with(bad), "{}", refused.message);
+        }
+        assert_eq!(f.actions(), 0);
     }
 
     #[test]
