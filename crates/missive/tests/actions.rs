@@ -2742,3 +2742,55 @@ async fn a_deleted_flag_left_in_a_folder_since_deleted_on_the_server_is_let_go()
     // What another client marked is left alone.
     assert_eq!(server.flags("INBOX", 4), flags(&["\\Deleted"]));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_flag_left_is_kept_while_the_server_lists_no_folder_at_all() {
+    let (server, env, _daemon) = started(
+        mailbox()
+            .without_move()
+            .refuse("UID EXPUNGE")
+            .refuse("UID STORE 1 -FLAGS"),
+    )
+    .await;
+    let mut events = Events::subscribe(&env).await;
+    let one = env.id(PRIVATE_FOLDER, 1);
+    succeeded(&env.act(&["move", &one, "--to", "archive"]).await);
+    let event = until_settled(&env, &mut events).await;
+    assert_eq!(event["outcome"], "refused", "{event}");
+    assert_eq!(
+        env.status_of_alice().await["deleted_left"],
+        serde_json::json!([one])
+    );
+
+    // A bridge still syncing: the folder cannot be selected, and LIST answers OK with nothing,
+    // not even the inbox. That does not tell the folder is gone.
+    server.heal();
+    server.refuse(&format!("SELECT \"{PRIVATE_FOLDER}\""));
+    server.truncate("LIST", 0);
+    // The folder is asked for only once it cannot be selected.
+    let started = Instant::now();
+    while tries(&server, &format!("LIST \"\" \"{PRIVATE_FOLDER}\"")) < 1 {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the folder was not asked for"
+        );
+        succeeded(&sync_soon(&env).await);
+    }
+    assert_eq!(
+        env.status_of_alice().await["deleted_left"],
+        serde_json::json!([one])
+    );
+
+    // Once the server lists its folders again without this one, it is let go.
+    server.heal();
+    server.delete_folder(PRIVATE_FOLDER);
+    succeeded(&sync_soon(&env).await);
+    let started = Instant::now();
+    while env.status_of_alice().await["deleted_left"] != serde_json::json!([]) {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the flag of a deleted folder is still listed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}

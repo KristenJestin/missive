@@ -615,7 +615,11 @@ async fn take_back(
         match server.select(&left.folder.name).await? {
             None => {
                 // A folder deleted since has none of its messages left to take the flag from.
-                if listed(server, &left.folder.name).await? == Some(false) {
+                // But a server that lists nothing at all, not even the inbox every account has
+                // (a bridge still syncing), does not tell that it is gone.
+                if listed(server, &left.folder.name).await? == Some(false)
+                    && listed(server, "INBOX").await? == Some(true)
+                {
                     store.taken_back(left.id)?;
                 }
                 continue;
