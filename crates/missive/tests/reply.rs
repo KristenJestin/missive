@@ -838,6 +838,51 @@ async fn a_forward_marks_the_original_forwarded_once_it_is_sent_and_not_answered
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_keyword_a_server_cannot_keep_is_taken_back_in_the_copy_without_reading_the_folder_again()
+{
+    let server = mailbox().without_keywords().start().await;
+    let (env, _daemon) = started(&Setup::of(&server)).await;
+    let id = original(&env).await;
+    let log_before = server.imap_log().len();
+
+    succeeded(
+        &env.run(&[
+            "compose",
+            "--forward",
+            &id,
+            "--to",
+            "ina@example.net",
+            "--send",
+        ])
+        .await,
+    );
+    took(&server, 1).await;
+    eventually(30, "the action dropped", || {
+        let copy =
+            Connection::open_with_flags(env.copy_path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        copy.query_row("SELECT count(*) FROM action", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+            == 0
+    })
+    .await;
+    // Let a resync, if one were asked for, happen.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // The copy forgot the flag at once, and the folder's flags were not read again for it.
+    let shown = env.run(&["show", "--json", &id]).await;
+    succeeded(&shown);
+    assert!(!String::from_utf8_lossy(&shown.stdout).contains("Forwarded"));
+    let log = server.imap_log();
+    assert!(
+        !log[log_before..]
+            .iter()
+            .any(|line| line == "UID FETCH 1:* (FLAGS)"),
+        "{:?}",
+        &log[log_before..]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_server_that_keeps_no_keywords_is_not_asked_to_and_nothing_is_said() {
     let server = mailbox().without_keywords().start().await;
     let (env, _daemon) = started(&Setup::of(&server)).await;

@@ -460,8 +460,9 @@ async fn round(
                 refused(reason, message.to_owned(), copied)
             }
             Step::Skipped => {
-                // The copy took its flag at once: the folder is read again to forget it.
-                refuse(store, &action, applied)?;
+                // The copy took its flag at once: it takes it back at once too, the server
+                // having been told nothing, and the folder is not read again for it.
+                store.skipped(&action)?;
                 continue;
             }
         };

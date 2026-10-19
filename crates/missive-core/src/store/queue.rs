@@ -510,6 +510,17 @@ impl Store {
     /// folders: each is recorded as half moved, and its copy written to the target in the copy
     /// when its new UID is known. Returns whether it was so.
     pub fn refused(&mut self, action: &Action) -> rusqlite::Result<bool> {
+        self.drop_action(action, true)
+    }
+
+    /// Drops a flag action the server cannot keep (a keyword in a folder that says no keyword
+    /// stays), and takes its flag back from the copy's messages there and then: the server was
+    /// never asked, so nothing in the folder changed and it is not read again.
+    pub fn skipped(&mut self, action: &Action) -> rusqlite::Result<()> {
+        self.drop_action(action, false).map(drop)
+    }
+
+    fn drop_action(&mut self, action: &Action, resync: bool) -> rusqlite::Result<bool> {
         let transaction = self.connection.transaction()?;
         let row: Option<(i64, String, Option<String>)> = transaction
             .query_row(
@@ -519,11 +530,29 @@ impl Store {
             )
             .optional()?;
         let mut half_moved = false;
-        if action.kind.flag().is_some() {
-            transaction.execute(
-                "UPDATE folder SET highest_modseq = NULL WHERE id = ?1",
-                [action.folder.id],
-            )?;
+        if let Some((flag, add)) = action.kind.flag() {
+            if resync {
+                transaction.execute(
+                    "UPDATE folder SET highest_modseq = NULL WHERE id = ?1",
+                    [action.folder.id],
+                )?;
+            } else {
+                for uid in &action.uids {
+                    let flags: Option<String> = transaction
+                        .query_row(
+                            "SELECT flags FROM message WHERE folder = ?1 AND uid = ?2",
+                            params![action.folder.id, uid],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if let Some(flags) = flags {
+                        transaction.execute(
+                            "UPDATE message SET flags = ?3 WHERE folder = ?1 AND uid = ?2",
+                            params![action.folder.id, uid, with_flag(&flags, flag, !add)],
+                        )?;
+                    }
+                }
+            }
         } else if action.kind.moves() {
             for uid in &action.uids {
                 transaction.execute(
@@ -887,6 +916,29 @@ mod tests {
 
         assert_eq!(f.flags(f.inbox)[&2], "$Label \\Flagged \\Seen");
         assert_eq!(f.next().kind, Kind::Flagged);
+    }
+
+    #[test]
+    fn a_keyword_the_server_cannot_keep_is_taken_back_at_once_and_the_folder_is_left_alone() {
+        let mut f = fixture();
+        f.store.apply_listing(f.inbox, &[], &[], Some(9)).unwrap();
+        f.queue(&[f.id(f.inbox, 2)], Wanted::Mark(Kind::Forwarded))
+            .unwrap();
+        assert_eq!(f.flags(f.inbox)[&2], "$Forwarded");
+        let forwarded = f.next();
+
+        f.store.skipped(&forwarded).unwrap();
+
+        assert_eq!(f.actions(), 0);
+        assert_eq!(f.flags(f.inbox)[&2], "");
+        assert_eq!(
+            f.flags(f.inbox)[&1],
+            "\\Seen",
+            "the other messages are untouched"
+        );
+        // Nothing asks for the folder to be read again.
+        let row = f.store.folder(1, "INBOX", Some("inbox")).unwrap();
+        assert_eq!(row.highest_modseq, Some(9));
     }
 
     #[test]
