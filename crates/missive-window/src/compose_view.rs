@@ -80,8 +80,9 @@ pub struct ComposeWindow {
     /// Whether a request waits for the daemon's answer.
     asking: bool,
     font: Option<SharedString>,
-    /// The draft's lock, held while this window is open (see [`ComposeWindow::holding`]).
-    lock: Option<DraftLock>,
+    /// The draft's lock, held while this window is open (see [`ComposeWindow::holding`]), with
+    /// the `Message-ID` it was taken under.
+    lock: Option<(String, DraftLock)>,
     locker: Option<Locker>,
 }
 
@@ -176,22 +177,26 @@ impl ComposeWindow {
     /// Holds `lock`, the lock of the draft this window was opened on, until the window closes;
     /// a new message takes `locker`'s once the daemon has saved it and given it a `Message-ID`.
     pub fn holding(mut self, lock: Option<DraftLock>, locker: Locker) -> Self {
-        self.lock = lock;
+        self.lock = self.model.draft_key().map(str::to_owned).zip(lock);
         self.locker = Some(locker);
         self
     }
 
-    /// Takes the lock of the draft once it has a `Message-ID` and the window holds none. Nobody
-    /// else knows the draft before its first save, so it is free; if it is not, the window goes
-    /// on without: the text is safe in the draft.
+    /// Holds the lock of the draft the window works on now. A new message has none until its
+    /// first save gives it a `Message-ID`, and a save can make another draft (the other client's
+    /// draft is kept as it is and the changes go to a new one; so does a message already sent):
+    /// the lock then moves to the new `Message-ID`, or `missive compose --draft <new id>` would
+    /// open a second window on it. The new draft is known to nobody else, so it is free; if it is
+    /// not, the window goes on with the lock it has: the text is safe in the draft.
     fn lock_draft(&mut self) {
-        if self.lock.is_some() {
+        let (Some(locker), Some(key)) = (&self.locker, self.model.draft_key()) else {
+            return;
+        };
+        if self.lock.as_ref().is_some_and(|(held, _)| held == key) {
             return;
         }
-        if let (Some(locker), Some(key)) = (&self.locker, self.model.draft_key())
-            && let Taking::Ours(lock) = locker(&self.model.account, key)
-        {
-            self.lock = Some(lock);
+        if let Taking::Ours(lock) = locker(&self.model.account, key) {
+            self.lock = Some((key.to_owned(), lock));
         }
     }
 

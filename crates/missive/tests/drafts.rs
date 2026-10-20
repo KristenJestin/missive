@@ -2207,7 +2207,7 @@ async fn taking_the_attachments_off_a_draft_whose_html_draws_from_one_keeps_the_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_draft_open_in_a_window_is_not_opened_a_second_time_from_the_shell() {
+async fn a_draft_open_in_a_window_is_refused_from_the_shell_and_nothing_is_saved() {
     let server = mailbox().start().await;
     let (env, _daemon) = started(&Setup::of(&server)).await;
     let (missive, path, args) = fake_window(&env);
@@ -2224,27 +2224,38 @@ async fn a_draft_open_in_a_window_is_not_opened_a_second_time_from_the_shell() {
     std::fs::remove_file(&args).unwrap();
 
     // A compose window of another process holds the draft's lock (the runtime folder is the
-    // test's own): no second window, the draft is saved all the same, and the command says so.
+    // test's own): the command refuses, with status 6 and a clear message, before it saves
+    // anything: a new version the window does not know about would be overwritten by its next
+    // save. With no display, `--no-window` or `--send` it is the same: the draft is the window's.
     let runtime = env.path("runtime").join("missive");
     let missive_core::draft_lock::Taking::Ours(window) =
         missive_core::draft_lock::take_in(&runtime, "alice", &id)
     else {
         panic!("the draft is free");
     };
-    let output = with_display(&env, &missive, &path)
-        .args(["compose", "--draft", &id, "--subject", "Third"])
-        .output()
-        .await
-        .unwrap();
-    succeeded(&output);
-    assert!(
-        stderr(&output).contains("already open") && stderr(&output).contains(&id),
-        "{}",
-        stderr(&output)
-    );
+    for extra in [&[][..], &["--no-window"], &["--send", "--to", RECIPIENT]] {
+        let output = with_display(&env, &missive, &path)
+            .args(["compose", "--draft", &id, "--subject", "Third"])
+            .args(extra)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(6),
+            "{extra:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("open in a compose window") && stderr(&output).contains(&id),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), "");
+    }
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!args.exists(), "no second window");
-    drafts_on_server(&server, &["Third"]).await;
+    drafts_on_server(&server, &["Second"]).await;
 
     // The window closes (or crashes): the next one opens.
     drop(window);
@@ -2255,4 +2266,57 @@ async fn a_draft_open_in_a_window_is_not_opened_a_second_time_from_the_shell() {
         .unwrap();
     succeeded(&output);
     eventually(10, "the window started", || written(&args)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_of_another_client_open_in_a_window_is_refused_by_either_of_its_names() {
+    let (server, env, _daemon, id) = with_a_foreign_draft().await;
+    // A window on it holds the lock of its `Message-ID`, whichever name it was opened by.
+    let runtime = env.path("runtime").join("missive");
+    let missive_core::draft_lock::Taking::Ours(_window) =
+        missive_core::draft_lock::take_in(&runtime, "alice", "other@example.com")
+    else {
+        panic!("the draft is free");
+    };
+    for name in [id.as_str(), "other@example.com"] {
+        let output = env
+            .run(&["compose", "--draft", name, "--subject", "Changed"])
+            .await;
+        assert_eq!(output.status.code(), Some(6), "{name}: {}", stderr(&output));
+        assert!(
+            stderr(&output).contains("open in a compose window"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    drafts_on_server(&server, &["Re: Other client"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_named_by_a_bracketed_message_id_open_in_a_window_is_refused() {
+    let (server, env, _daemon, _id) = with_a_foreign_draft().await;
+    // The window holds the lock of the bare `Message-ID`; the shell names it with its brackets,
+    // as a header writes it, and the daemon finds the same draft under that name.
+    let runtime = env.path("runtime").join("missive");
+    let missive_core::draft_lock::Taking::Ours(_window) =
+        missive_core::draft_lock::take_in(&runtime, "alice", "other@example.com")
+    else {
+        panic!("the draft is free");
+    };
+    let output = env
+        .run(&[
+            "compose",
+            "--draft",
+            "<other@example.com>",
+            "--subject",
+            "Changed",
+        ])
+        .await;
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("open in a compose window"),
+        "{}",
+        stderr(&output)
+    );
+    drafts_on_server(&server, &["Re: Other client"]).await;
 }

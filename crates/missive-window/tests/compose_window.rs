@@ -485,3 +485,95 @@ fn a_draft_open_in_another_process_is_not_opened_a_second_time(cx: &mut TestAppC
     assert_eq!(compose_windows(cx).len(), 1);
     assert!(draft_lock::is_held_in(folder.path(), ID, "one@example.org"));
 }
+
+/// An asker whose `n`th request is answered by `answers[n]` (the last one answers the rest).
+fn asker_answering(answers: Vec<Answer>) -> Asker {
+    let next = Arc::new(Mutex::new(0usize));
+    Arc::new(move |_| {
+        let mut next = next.lock().unwrap();
+        let answer = answers[(*next).min(answers.len() - 1)].clone();
+        *next += 1;
+        Ok(answer)
+    })
+}
+
+fn saved_as(message_id: &str) -> Answer {
+    Answer {
+        protocol: PROTOCOL,
+        answer: Some("draft".to_owned()),
+        ok: true,
+        message_id: Some(message_id.to_owned()),
+        ..Answer::default()
+    }
+}
+
+#[gpui_kit::test]
+fn the_lock_follows_the_new_draft_made_from_another_clients_draft(cx: &mut TestAppContext) {
+    let folder = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        gpui_kit::base::init(cx);
+        view::bind_keys(cx);
+    });
+    let raw = b"From: alice@example.org\r\nTo: zoe@example.com\r\nSubject: Plans\r\n\
+        Message-ID: <theirs@example.org>\r\n\r\nHello\r\n";
+    let compose = Compose::draft(
+        vec![ID.to_owned()],
+        ID.to_owned(),
+        "alice/3/1/5".to_owned(),
+        raw,
+        Default::default(),
+    )
+    .unwrap();
+    let draft_lock::Taking::Ours(lock) =
+        draft_lock::take_in(folder.path(), ID, "theirs@example.org")
+    else {
+        panic!("free to take");
+    };
+    // The daemon keeps the other client's draft as it is and saves a new one beside it.
+    let asker = asker_answering(vec![saved_as("ours@example.org")]);
+    let locks = locker(&folder);
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        ComposeWindow::new(compose, asker, no_chooser(), window, cx).holding(Some(lock), locks)
+    });
+    cx.run_until_parked();
+    let held = |id| draft_lock::is_held_in(folder.path(), ID, id);
+    assert!(held("theirs@example.org"));
+
+    cx.simulate_input(" more");
+    advance(cx, SAVE_AFTER);
+    // The draft the window works on now is the new one: a second window on it is refused.
+    assert!(held("ours@example.org"), "the new draft is locked");
+    assert!(!held("theirs@example.org"), "the lock moved");
+
+    cx.simulate_keystrokes("ctrl-w");
+    cx.run_until_parked();
+    assert!(!held("ours@example.org"));
+}
+
+#[gpui_kit::test]
+fn the_lock_follows_the_new_draft_made_when_the_message_was_already_sent(cx: &mut TestAppContext) {
+    let folder = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        gpui_kit::base::init(cx);
+        view::bind_keys(cx);
+    });
+    let mut already_sent = Answer::error(Some("draft"), "already-sent", "already sent");
+    already_sent.message_id = Some("new@example.org".to_owned());
+    let asker = asker_answering(vec![saved_as("d@example.org"), already_sent]);
+    let locks = locker(&folder);
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        ComposeWindow::new(new_message(), asker, no_chooser(), window, cx).holding(None, locks)
+    });
+    cx.run_until_parked();
+    let held = |id| draft_lock::is_held_in(folder.path(), ID, id);
+
+    cx.simulate_input("zoe@example.com");
+    advance(cx, SAVE_AFTER);
+    assert!(held("d@example.org"));
+
+    cx.simulate_keystrokes("ctrl-enter");
+    cx.run_until_parked();
+    assert!(open(cx), "nothing was sent: the window stays");
+    assert!(held("new@example.org"), "the new draft is locked");
+    assert!(!held("d@example.org"), "the lock moved");
+}

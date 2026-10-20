@@ -17,6 +17,7 @@ use missive_core::account::AccountStore;
 use missive_core::actions::ORIGINAL_GONE;
 use missive_core::compose::{Attachment, Draft, Mailbox};
 use missive_core::copy::MessageId;
+use missive_core::draft_lock;
 use missive_core::protocol::{Answer, Attached, Command, SaveDraft, Send};
 use missive_core::reply::{self, Answering, Mode};
 use serde::Serialize;
@@ -126,6 +127,9 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
         (named, _, _) => named.clone(),
     };
     let account = account(named)?;
+    if let Some(draft) = &args.draft {
+        refuse_if_open(&account, draft)?;
+    }
     let answering = match (stored, mode) {
         (Some(stored), Some(mode)) => Some(answering(&account, stored, mode)?),
         _ => None,
@@ -289,6 +293,33 @@ pub async fn run(args: ComposeArgs) -> Result<(), ActError> {
              as the server can be reached (missive compose --draft {message_id} picks it up \
              again)."
         );
+    }
+    Ok(())
+}
+
+/// Refuses to change a draft that is open in a compose window, before anything is saved: the
+/// window does not know of a new version, and its next save would overwrite it. It never waits
+/// for the window and never takes its lock. The draft is named by its `Message-ID`, or by the
+/// identifier of its message in the copy, whose `Message-ID` is the one its window locked.
+fn refuse_if_open(account: &str, draft: &str) -> Result<(), ActError> {
+    let key = match read::message(draft) {
+        Ok(stored) => missive_core::compose::draft_message_id(&stored.raw),
+        // The name the daemon finds the draft by: its brackets go, as `find_draft` strips them.
+        Err(_) if MessageId::parse(draft).is_none() => Some(
+            draft
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_owned(),
+        ),
+        Err(_) => None,
+    };
+    if key.is_some_and(|key| draft_lock::is_held(account, &key)) {
+        eprintln!(
+            "missive: the draft {draft} is open in a compose window: nothing was changed or sent. \
+             Work on it there, or close the window first."
+        );
+        return Err(ActError::Exit(act::OPEN_IN_WINDOW));
     }
     Ok(())
 }

@@ -16,6 +16,7 @@
 use mail_builder::MessageBuilder;
 use mail_builder::headers::Header;
 use mail_builder::headers::address::Address;
+use mail_builder::headers::content_type::ContentType;
 use mail_builder::mime::MimePart;
 use mail_parser::{HeaderValue, MessageParser, MimeHeaders, PartType};
 
@@ -105,6 +106,11 @@ pub struct Inline {
     /// The part's `Content-ID`, without angle brackets.
     pub content_id: String,
     pub media_type: String,
+    /// The file name the part came with, as a client shows it under the image.
+    pub name: Option<String>,
+    /// The charset of a text part, which [`Inline::data`] is written in (not always UTF-8).
+    pub charset: Option<String>,
+    /// The part's content, as it was before the message's transfer encoding.
     pub data: Vec<u8>,
 }
 
@@ -314,6 +320,18 @@ impl Draft {
                         .is_some_and(|html| crate::body::references(html, &id.to_ascii_lowercase()))
                 });
             if let Some(content_id) = drawn {
+                // mail-parser turns a text part into UTF-8: its own charset is read back from
+                // the message, or the part would be written again with a label that is not its.
+                let (charset, data) = match (&part.body, part.content_type()) {
+                    (PartType::Text(_), Some(t)) => t
+                        .attribute("charset")
+                        .zip(transfer_decoded(parsed.raw_message(), part))
+                        .map_or_else(
+                            || (None, part.contents().to_vec()),
+                            |(charset, data)| (Some(charset.to_owned()), data),
+                        ),
+                    _ => (None, part.contents().to_vec()),
+                };
                 inline.push(Inline {
                     content_id: content_id.to_owned(),
                     media_type: part
@@ -323,7 +341,9 @@ impl Draft {
                             None => t.ctype().to_owned(),
                         })
                         .unwrap_or_else(|| "application/octet-stream".to_owned()),
-                    data: part.contents().to_vec(),
+                    name: part.attachment_name().map(str::to_owned),
+                    charset,
+                    data,
                 });
                 continue;
             }
@@ -349,6 +369,22 @@ impl Draft {
             in_reply_to: ids(parsed.in_reply_to()),
             references: ids(parsed.references()),
         })
+    }
+}
+
+/// The body of `part` with its transfer encoding undone and its charset left alone.
+fn transfer_decoded(raw: &[u8], part: &mail_parser::MessagePart) -> Option<Vec<u8>> {
+    let body = raw.get(part.raw_body_offset() as usize..part.raw_end_offset() as usize)?;
+    match part
+        .content_transfer_encoding()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("base64") => mail_parser::decoders::base64::base64_decode(body),
+        Some("quoted-printable") => {
+            mail_parser::decoders::quoted_printable::quoted_printable_decode(body)
+        }
+        _ => Some(body.to_vec()),
     }
 }
 
@@ -500,9 +536,18 @@ fn related<'x>(draft: &'x Draft, html: &'x str) -> MimePart<'x> {
         ],
     )];
     for part in &draft.inline {
+        let mut content_type = ContentType::new(part.media_type.as_str());
+        let mut disposition = ContentType::new("inline");
+        if let Some(charset) = &part.charset {
+            content_type = content_type.attribute("charset", charset.as_str());
+        }
+        if let Some(name) = &part.name {
+            content_type = content_type.attribute("name", name.as_str());
+            disposition = disposition.attribute("filename", name.as_str());
+        }
         together.push(
-            MimePart::new(part.media_type.as_str(), part.data.as_slice())
-                .inline()
+            MimePart::new(content_type, part.data.as_slice())
+                .header("Content-Disposition", disposition)
                 .cid(part.content_id.as_str()),
         );
     }
@@ -976,6 +1021,59 @@ mod tests {
         // A text that replaces the HTML takes the image with it: nothing draws it any more.
         assert!(draft.set_body("Another text".to_owned()));
         assert_eq!((draft.html, draft.inline), (None, Vec::new()));
+    }
+
+    #[test]
+    fn inline_parts_keep_their_file_name_and_their_charset_when_written_again() {
+        // A picture with a name, and a text in Latin-1 (a caf\u{e9}), both drawn by the HTML.
+        let mut raw = b"From: a@example.org\r\nSubject: Parts\r\nMIME-Version: 1.0\r\n\
+            Content-Type: multipart/related; boundary=\"r\"\r\n\r\n\
+            --r\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+            <img src=\"cid:logo@example.org\"><img src=\"cid:menu@example.org\">\r\n\
+            --r\r\nContent-Type: image/png; name=\"logo.png\"\r\n\
+            Content-Disposition: inline; filename=\"logo.png\"\r\n\
+            Content-ID: <logo@example.org>\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+            iVBORw0KGgo=\r\n\
+            --r\r\nContent-Type: text/plain; charset=iso-8859-1; name=\"menu.txt\"\r\n\
+            Content-Disposition: inline; filename=\"menu.txt\"\r\n\
+            Content-ID: <menu@example.org>\r\nContent-Transfer-Encoding: 8bit\r\n\r\n\
+            caf"
+        .to_vec();
+        raw.extend_from_slice(b"\xe9\r\n--r--\r\n");
+        let draft = Draft::read(&raw).unwrap();
+        assert_eq!(draft.inline.len(), 2);
+        assert!(draft.attachments.is_empty());
+
+        let built = write(&account(), &draft, 0, None).unwrap();
+        let parsed = MessageParser::default().parse(&built.raw).unwrap();
+        let part = |id: &str| {
+            parsed
+                .attachments()
+                .find(|part| {
+                    part.content_id()
+                        .is_some_and(|c| c.trim_matches(['<', '>']) == id)
+                })
+                .unwrap_or_else(|| {
+                    panic!("no part {id} in {}", String::from_utf8_lossy(&built.raw))
+                })
+        };
+        let logo = part("logo@example.org");
+        assert_eq!(logo.attachment_name(), Some("logo.png"));
+        assert_eq!(
+            logo.contents(),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+        let menu = part("menu@example.org");
+        assert_eq!(menu.attachment_name(), Some("menu.txt"));
+        assert_eq!(
+            menu.content_type().and_then(|t| t.attribute("charset")),
+            Some("iso-8859-1")
+        );
+        assert_eq!(menu.text_contents(), Some("caf\u{e9}"));
+
+        // Written once more, nothing moves.
+        let twice = Draft::read(&built.raw).unwrap();
+        assert_eq!(twice.inline, draft.inline);
     }
 
     #[test]
